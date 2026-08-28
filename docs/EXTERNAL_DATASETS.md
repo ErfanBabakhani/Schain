@@ -9,16 +9,23 @@ CC BY 4.0.
 
 **Status: no public download location was found, so nothing is downloaded automatically.**
 
-Searches performed (August 2026), all without a hit for a dataset or organisation of that
-name:
+Searches performed (August 2026), none returning a dataset or organisation of that name:
 
 - `Sectivia open supply chain dataset supplier customer relationships CC BY 4.0 download`
 - `Sectivia supply chain dataset github 350 supplier relations 214 companies`
 - `"Sectivia" company open dataset supply chain`
+- `Sectivia dataset zenodo OR figshare OR huggingface supply chain supplier customer graph open data`
+- `open access supplier customer relationship network dataset listed companies CC BY download zenodo`
 
-No URL has been guessed or invented here. If you have the original reference (a paper,
-a Zenodo/figshare record, or a vendor page), add it to this file and place the files as
-described below.
+No URL has been guessed or invented, and **no other dataset has been silently substituted
+for it**. The nearest open candidate the searches surfaced, the TheyBuyForYou procurement
+knowledge graph on Zenodo, is public-sector tender data in RDF rather than a
+company-to-company supplier list for listed firms, so it does not answer the same question
+and swapping it in would be a scope change rather than a fix.
+
+If you have the original reference (a paper, a Zenodo/figshare record, or a vendor page),
+add it to this file and place the files as described below. Nothing else in the pipeline
+depends on it: only `python -m schain validate` reads it.
 
 ### How to use it once obtained
 
