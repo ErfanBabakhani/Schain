@@ -91,7 +91,8 @@ def run_expand(
                 return summary
             try:
                 document = make_document(
-                    result.document_text(), source_url=result.url, title=result.title
+                    result.document_text(), source_url=result.url, title=result.title,
+                    content_source=result.content_source,
                 )
             except ValueError:
                 continue

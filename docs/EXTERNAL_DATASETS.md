@@ -2,14 +2,28 @@
 
 ## Sectivia supply-chain dataset (validation reference)
 
-The architecture brief names the Sectivia open supply-chain dataset as the external
-reference for sanity-checking supplier-customer relationships: roughly 350 directed
-supplier-to-customer relations across ~214 listed companies, released as CSV/JSON under
-CC BY 4.0.
+**Status, plainly:**
 
-**Status: no public download location was found, so nothing is downloaded automatically.**
+- Sectivia was selected **conceptually** as V1's auxiliary supplier-customer validation
+  dataset, on the strength of the architecture brief's citation (roughly 350 directed
+  supplier-to-customer relations across ~214 listed companies, CSV/JSON, CC BY 4.0).
+- Its **current official public download source could not be verified.** Five searches
+  (below) found no dataset, repository record or organisation of that name.
+- **No dataset was fabricated, and none was silently substituted for it.** No URL, file or
+  record has been invented, and no other dataset has been wired in as a stand-in. The
+  nearest open candidate the searches surfaced, the TheyBuyForYou procurement knowledge
+  graph on Zenodo, is public-tender RDF rather than a company-to-company supplier list for
+  listed firms; it answers a different question, so using it would be a scope change
+  requiring an explicit decision, not a fix.
+- `data/external/sectivia/` is the **expected location** if the dataset is obtained later.
+  The directory is gitignored, so nothing gets committed.
+- The validator accepts the **documented supplier/customer CSV or JSON schema** below, so
+  the dataset (or any equivalent edge list) plugs in without code changes.
 
-Searches performed (August 2026), none returning a dataset or organisation of that name:
+Nothing else in the pipeline depends on this file: only `python -m schain validate` reads
+it. INGEST, EXPAND and the graph output are unaffected by its absence.
+
+Searches performed (August 2026), none returning a match:
 
 - `Sectivia open supply chain dataset supplier customer relationships CC BY 4.0 download`
 - `Sectivia supply chain dataset github 350 supplier relations 214 companies`
@@ -17,15 +31,9 @@ Searches performed (August 2026), none returning a dataset or organisation of th
 - `Sectivia dataset zenodo OR figshare OR huggingface supply chain supplier customer graph open data`
 - `open access supplier customer relationship network dataset listed companies CC BY download zenodo`
 
-No URL has been guessed or invented, and **no other dataset has been silently substituted
-for it**. The nearest open candidate the searches surfaced, the TheyBuyForYou procurement
-knowledge graph on Zenodo, is public-sector tender data in RDF rather than a
-company-to-company supplier list for listed firms, so it does not answer the same question
-and swapping it in would be a scope change rather than a fix.
-
 If you have the original reference (a paper, a Zenodo/figshare record, or a vendor page),
-add it to this file and place the files as described below. Nothing else in the pipeline
-depends on it: only `python -m schain validate` reads it.
+add it here and place the files as described below. Replacing Sectivia with a different
+dataset should be an explicit decision, recorded in PROJECT_DECISIONS.md.
 
 ### How to use it once obtained
 

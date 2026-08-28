@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 
 USER_AGENT = "schain-kg/0.1 (supply-chain knowledge graph research pipeline)"
 
+# Values of SearchResult.content_source, recorded as document provenance.
+FULL_TEXT = "full_text"
+TITLE_SNIPPET = "title_snippet"
+
 
 @dataclass
 class SearchResult:
@@ -37,11 +41,25 @@ class SearchResult:
         default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
     )
 
+    @property
+    def content_source(self) -> str:
+        """Whether the document text is a fetched article body or the fallback.
+
+        Computed rather than stored, so it cannot drift from the actual content and is
+        still correct for results reloaded from the search-results Parquet layer.
+        """
+        return FULL_TEXT if self.text else TITLE_SNIPPET
+
     def as_row(self) -> dict[str, Any]:
-        return asdict(self)
+        return {**asdict(self), "content_source": self.content_source}
 
     def document_text(self) -> str:
-        """Best available text: the full body if fetched, otherwise title and snippet."""
+        """Best available text: the fetched body, otherwise title and snippet.
+
+        The fallback is normal, not an error. Google News RSS links are redirect
+        wrappers, so an article body is often unavailable; a title plus snippet is still
+        a usable document, and content_source records which one this is.
+        """
         if self.text:
             return self.text
         parts = [self.title, self.snippet]
