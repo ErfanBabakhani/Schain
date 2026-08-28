@@ -1,13 +1,15 @@
 """Prompt 2 - entity disambiguation into canonical identifiers.
 
-Three stages, cheapest first:
+Four stages, cheapest first:
 
 1. Cache. Any mention resolved in an earlier run is reused from the state database, so
    the same disambiguation is never paid for twice.
 2. Deterministic grouping on a normalization key - casing, punctuation, whitespace and
    company legal suffixes. "BMW AG" and "bmw ag." collapse here with no LLM call.
-3. One LLM call per entity type over what is left, which is what catches "CATL" vs
-   "Contemporary Amperex Technology Co. Limited". Entity types are never mixed.
+3. Known aliases from config/ontology.yaml, also deterministic: a configured alias is
+   grouped with its canonical name, so "CATL" needs no LLM call once it is listed.
+4. One LLM call per entity type over whatever is left, which is what catches alias pairs
+   nobody configured. Entity types are never mixed.
 
 Two stability rules keep repeated runs from producing duplicate graph nodes:
 
@@ -92,6 +94,12 @@ def _llm_groups(llm: LLMInterface, label: str, names: list[str]) -> list[list[st
     return [group for group in groups if group]
 
 
+def alias_lookup(aliases: Optional[dict[str, Any]], label: str) -> dict[str, str]:
+    """Configured aliases for one entity type, keyed by the alias' normalization key."""
+    for_label = ((aliases or {}).get(label) or {})
+    return {normalization_key(alias): canonical for alias, canonical in for_label.items()}
+
+
 def _known_canonical(cache: dict[str, dict[str, Any]], label: str) -> dict[str, dict[str, Any]]:
     """Known canonical entities of one label, keyed by canonical name."""
     known: dict[str, dict[str, Any]] = {}
@@ -105,6 +113,7 @@ def resolve_entities(
     graph: Neo4jGraph,
     llm: Optional[LLMInterface] = None,
     cache: Optional[dict[str, dict[str, Any]]] = None,
+    aliases: Optional[dict[str, Any]] = None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Resolve every extracted node to a canonical entity.
 
@@ -112,7 +121,7 @@ def resolve_entities(
     ``node_id -> {canonical_id, canonical_name, label, aliases, mention, method}`` and
     ``new_entries`` are the mentions that were not in the cache and should be persisted.
 
-    Pass ``llm=None`` to run cache and deterministic normalization only.
+    Pass ``llm=None`` to run the cache, normalization and alias stages only.
     """
     cache = cache or {}
     resolution: dict[str, dict[str, Any]] = {}
@@ -143,11 +152,23 @@ def resolve_entities(
             logger.info("%s: all %d mention(s) served from cache", label, len(nodes))
             continue
 
-        # Stage 2: deterministic grouping of the remaining mentions.
+        # Stages 2 and 3: deterministic grouping, with configured aliases folded in by
+        # grouping an alias under its canonical name's key.
+        known_aliases = alias_lookup(aliases, label)
         by_key: dict[str, list[str]] = defaultdict(list)
+        configured_name: dict[str, str] = {}
         for name in fresh_nodes.values():
-            by_key[normalization_key(name)].append(name)
-        representatives = [pick_canonical_name(names) for names in by_key.values()]
+            alias_target = known_aliases.get(normalization_key(name))
+            key = normalization_key(alias_target or name)
+            by_key[key].append(name)
+            if alias_target:
+                configured_name[key] = alias_target
+
+        def representative_of(key: str) -> str:
+            """A configured canonical name wins over the longest mention."""
+            return configured_name.get(key) or pick_canonical_name(by_key[key])
+
+        representatives = [representative_of(key) for key in by_key]
 
         # Stage 3: LLM grouping. Known canonical names are offered as candidates so a new
         # alias attaches to an existing entity instead of creating a second one.
@@ -165,9 +186,12 @@ def resolve_entities(
 
         group_of = {name: index for index, group in enumerate(groups) for name in group}
         members: dict[int, list[str]] = defaultdict(list)
-        for names in by_key.values():
-            representative = pick_canonical_name(names)
-            members[group_of.get(representative, -1)].extend(names)
+        group_configured: dict[int, str] = {}
+        for key, names in by_key.items():
+            index = group_of.get(representative_of(key), -1)
+            members[index].extend(names)
+            if key in configured_name:
+                group_configured[index] = configured_name[key]
 
         for index, names in members.items():
             # Reuse an existing canonical entity if this group reached one.
@@ -177,7 +201,7 @@ def resolve_entities(
                 canonical_name = existing["canonical_name"]
                 entity_id = existing["canonical_id"]
             else:
-                canonical_name = pick_canonical_name(names)
+                canonical_name = group_configured.get(index) or pick_canonical_name(names)
                 entity_id = canonical_id(label, canonical_name)
 
             entry = {

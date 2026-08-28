@@ -33,6 +33,23 @@ ontology:
   expandable_types:
     - Company
 
+  # Known aliases, applied deterministically before any LLM call: a mention matching an
+  # alias is grouped with its canonical name, so Prompt 2 is never asked about it.
+  #
+  # Only put pairs here that are unambiguously the same real-world entity. Do NOT map a
+  # subsidiary onto its parent (Panasonic Energy is not Panasonic) - that is over-merging,
+  # and the whole point of the static ontology is that suppliesTo carries the role.
+  # Case, punctuation and company legal suffixes are already handled by normalization, so
+  # "BYD" / "BYD Co., Ltd." need no entry here.
+  aliases:
+    Company:
+      CATL: Contemporary Amperex Technology Co. Limited
+      Tesla Motors: Tesla Inc.
+      Nornickel: Norilsk Nickel
+      MMC Norilsk Nickel: Norilsk Nickel
+      Ganfeng: Ganfeng Lithium Co Ltd
+      Tianqi: Tianqi Lithium
+
   # Allowed (source, relation, target) combinations. The frozen decisions fix the type
   # lists but not the combinations, so they are stated explicitly here.
   patterns:
