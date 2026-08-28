@@ -159,3 +159,64 @@ def test_nodes_without_a_name_are_skipped():
     bad = Neo4jGraph(nodes=[Neo4jNode(id="c:0", label="Company", properties={})])
     resolution, new = resolve_entities(bad, llm=None)
     assert resolution == {} and new == []
+
+
+# --- configured known aliases ------------------------------------------------------
+
+
+ALIASES = {"Company": {"CATL": "Contemporary Amperex Technology Co. Limited",
+                       "Nornickel": "Norilsk Nickel"}}
+
+
+class ExplodingLLM:
+    """Any call is a failure: the alias stage must be purely deterministic."""
+
+    def invoke(self, prompt):
+        raise AssertionError("Prompt 2 must not be called for a configured alias")
+
+
+def test_configured_alias_collapses_without_any_llm_call():
+    resolution, _ = resolve_entities(
+        graph(("Company", "CATL"),
+              ("Company", "Contemporary Amperex Technology Co. Limited")),
+        llm=ExplodingLLM(), aliases=ALIASES,
+    )
+    assert len({entry["canonical_id"] for entry in resolution.values()}) == 1
+    assert all(entry["method"] == "deterministic" for entry in resolution.values())
+
+
+def test_alias_alone_still_resolves_to_the_configured_canonical_name():
+    resolution, _ = resolve_entities(graph(("Company", "CATL")), llm=None, aliases=ALIASES)
+    entry = list(resolution.values())[0]
+    assert entry["canonical_name"] == "Contemporary Amperex Technology Co. Limited"
+    assert entry["canonical_id"] == "company:contemporary-amperex-technology"
+    assert entry["mention"] == "CATL"          # the raw mention is still recorded
+
+
+def test_alias_matching_ignores_case_and_punctuation():
+    resolution, _ = resolve_entities(graph(("Company", "catl.")), llm=None, aliases=ALIASES)
+    assert list(resolution.values())[0]["canonical_id"] == (
+        "company:contemporary-amperex-technology"
+    )
+
+
+def test_aliases_are_scoped_to_their_entity_type():
+    """A Company alias must not rewrite a Location of the same name."""
+    resolution, _ = resolve_entities(graph(("Location", "CATL")), llm=None, aliases=ALIASES)
+    assert list(resolution.values())[0]["canonical_id"] == "location:catl"
+
+
+def test_unaliased_names_still_reach_the_llm():
+    llm = GroupingLLM([["Bosch"], ["Continental"]])
+    resolve_entities(graph(("Company", "Bosch"), ("Company", "Continental")),
+                     llm=llm, aliases=ALIASES)
+    assert llm.calls == 1
+
+
+def test_the_shipped_alias_map_is_conservative(ontology):
+    """Guard against someone mapping a subsidiary onto its parent."""
+    aliases = ontology.get("aliases", {}).get("Company", {})
+    assert aliases, "the shipped ontology should carry some aliases"
+    forbidden = {"Panasonic Energy": "Panasonic", "CATL Ningde": "CATL"}
+    for alias, target in forbidden.items():
+        assert aliases.get(alias) != target

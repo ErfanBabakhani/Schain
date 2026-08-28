@@ -197,7 +197,9 @@ def process_document(
                 graph, chunk_index = load_extraction(config, doc_id)
                 logger.info("doc %s: reusing stored Prompt 1 output", doc_id)
             cache = state.load_resolution_cache(connection)
-            resolution, new_entries = resolve_entities(graph, llm=llm, cache=cache)
+            resolution, new_entries = resolve_entities(
+                graph, llm=llm, cache=cache, aliases=ontology.get("aliases")
+            )
             if new_entries:
                 state.save_resolution(connection, new_entries)
             _write_resolution_parquet(config, doc_id, resolution)
