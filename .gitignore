@@ -70,5 +70,5 @@ build/
 dist/
 *.egg-info/
 
-# Starter pack archive (its contents are tracked unpacked at the repo root)
-SChain_Claude_Starter_Final_With_PDF.zip
+# Archives (the starter pack's contents are tracked unpacked at the repo root)
+*.zip
