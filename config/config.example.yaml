@@ -7,11 +7,18 @@ runtime:
 mode: ingest  # ingest | expand
 
 llm:
-  provider: local
+  provider: local            # local = vLLM OpenAI-compatible server | api = hosted API
   model: Qwen/Qwen3.8-27B
   backend: vllm
-  enable_thinking: false
+  base_url: http://localhost:8000/v1
+  enable_thinking: false     # sent to vLLM as chat_template_kwargs.enable_thinking
+  temperature: 0.0
   max_model_len: 16384
+
+ingest:
+  chunk_size: 2000
+  chunk_overlap: 200
+  on_error: IGNORE           # IGNORE = log and skip a failed chunk | RAISE = stop
 
 ontology:
   dynamic: false
@@ -92,6 +99,7 @@ storage:
   raw_documents: data/raw/documents.jsonl
   normalized_documents: data/processed/documents.parquet
   extracted_facts: data/processed/facts.parquet
+  entity_resolution: data/processed/entity_resolution.parquet
   search_results: data/processed/search_results.parquet
   state_db: data/state/state.db
 
