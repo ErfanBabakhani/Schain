@@ -1,11 +1,14 @@
-"""The V1 static ontology, expressed as a neo4j-graphrag ``GraphSchema``.
+"""The V1 static ontology and Prompt 1.
 
-Entity and relation types are frozen for V1 (see PROJECT_DECISIONS.md section 4).
-The schema object is what constrains the extraction prompt, so this module is also
-where Prompt 1 lives.
+Entity types, relation types and the allowed (source, relation, target) patterns are
+declared in ``config/ontology.yaml`` so they are stated once, in one readable place.
+They are static for V1: nothing here grows the ontology at runtime.
 """
 
 from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Optional
 
 from neo4j_graphrag.components.schema import (
     GraphSchema,
@@ -15,68 +18,45 @@ from neo4j_graphrag.components.schema import (
 )
 from neo4j_graphrag.generation.prompts import ERExtractionTemplate
 
-ENTITY_TYPES = ("Company", "Location", "Material", "Person", "Product", "Mine")
-RELATION_TYPES = ("suppliesTo", "locatedIn", "owns", "produces")
+from .config import REPO_ROOT, _read_yaml, resolve_path
 
-# Which (source, relation, target) combinations are accepted. The frozen decisions fix
-# the type lists but not the combinations, so these are stated explicitly here rather
-# than left implicit in the prompt. Edit this list to widen or narrow extraction.
-PATTERNS: tuple[tuple[str, str, str], ...] = (
-    ("Company", "suppliesTo", "Company"),
-    ("Mine", "suppliesTo", "Company"),
-    ("Company", "produces", "Product"),
-    ("Company", "produces", "Material"),
-    ("Mine", "produces", "Material"),
-    ("Company", "locatedIn", "Location"),
-    ("Mine", "locatedIn", "Location"),
-    ("Company", "owns", "Company"),
-    ("Company", "owns", "Mine"),
-    ("Person", "owns", "Company"),
-)
+DEFAULT_ONTOLOGY_PATH = REPO_ROOT / "config" / "ontology.yaml"
 
 
-def build_graph_schema() -> GraphSchema:
-    """Build the static schema handed to the extractor.
+def load_ontology(config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Load the ontology block, from the path named in ``config.ontology_file``."""
+    if config and config.get("ontology"):
+        ontology = config["ontology"]
+    else:
+        path = resolve_path((config or {}).get("ontology_file", DEFAULT_ONTOLOGY_PATH))
+        ontology = _read_yaml(Path(path)).get("ontology", {})
 
-    Every entity carries only ``name``; every relation carries ``evidence``, the verbatim
-    sentence that supports it, which is what makes an extracted fact auditable later.
+    missing = [key for key in ("entity_types", "relation_types") if not ontology.get(key)]
+    if missing:
+        raise ValueError(f"ontology is missing {', '.join(missing)}")
+    return ontology
+
+
+def build_graph_schema(ontology: dict[str, Any]) -> GraphSchema:
+    """Build the schema handed to the extractor.
+
+    Every entity carries ``name``; every relation carries ``evidence``, the verbatim
+    sentence supporting it, which is what makes an extracted fact auditable later.
     """
     node_types = [
-        NodeType(
-            label=label,
-            properties=[PropertyType(name="name", type="STRING", required=True)],
-        )
-        for label in ENTITY_TYPES
+        NodeType(label=label, properties=[PropertyType(name="name", type="STRING", required=True)])
+        for label in ontology["entity_types"]
     ]
     relationship_types = [
-        RelationshipType(
-            label=label,
-            properties=[PropertyType(name="evidence", type="STRING")],
-        )
-        for label in RELATION_TYPES
+        RelationshipType(label=label, properties=[PropertyType(name="evidence", type="STRING")])
+        for label in ontology["relation_types"]
     ]
+    patterns = tuple(tuple(pattern) for pattern in ontology.get("patterns", []) or [])
     return GraphSchema(
         node_types=node_types,
         relationship_types=relationship_types,
-        patterns=PATTERNS,
+        patterns=patterns,
     )
-
-
-# Worked example from the architecture brief, shown to the model so the expected shape
-# (including evidence) is unambiguous.
-EXTRACTION_EXAMPLES = """\
-Input text: "CATL supplies battery cells to BMW. The plant is located in Germany."
-Output:
-{"nodes": [
-  {"id": "0", "label": "Company", "properties": {"name": "CATL"}},
-  {"id": "1", "label": "Company", "properties": {"name": "BMW"}},
-  {"id": "2", "label": "Location", "properties": {"name": "Germany"}}
-],
-"relationships": [
-  {"type": "suppliesTo", "start_node_id": "0", "end_node_id": "1",
-   "properties": {"evidence": "CATL supplies battery cells to BMW."}}
-]}\
-"""
 
 
 def render_schema(schema: dict) -> str:
@@ -85,6 +65,7 @@ def render_schema(schema: dict) -> str:
     The library passes ``schema.model_dump()`` into the prompt, which is verbose and
     hard to read. Compacting it keeps the prompt reviewable by a human and shorter.
     """
+
     def props(entry: dict) -> str:
         names = [p["name"] for p in entry.get("properties", [])]
         return f"({', '.join(names)})" if names else ""
@@ -112,8 +93,25 @@ def render_schema(schema: dict) -> str:
     return "\n".join(lines)
 
 
+# Worked example from the architecture brief, shown to the model so the expected shape
+# (including evidence) is unambiguous.
+EXTRACTION_EXAMPLES = """\
+Input text: "CATL supplies battery cells to BMW. The plant is located in Germany."
+Output:
+{"nodes": [
+  {"id": "0", "label": "Company", "properties": {"name": "CATL"}},
+  {"id": "1", "label": "Company", "properties": {"name": "BMW"}},
+  {"id": "2", "label": "Location", "properties": {"name": "Germany"}}
+],
+"relationships": [
+  {"type": "suppliesTo", "start_node_id": "0", "end_node_id": "1",
+   "properties": {"evidence": "CATL supplies battery cells to BMW."}}
+]}\
+"""
+
+
 class SupplyChainERTemplate(ERExtractionTemplate):
-    """Prompt 1 - schema-guided entity and relation extraction.
+    """Prompt 1 - schema-constrained entity and relation extraction.
 
     Extends the library template with supply-chain framing, an explicit direction rule
     for ``suppliesTo`` (the most error-prone relation), and the evidence requirement.

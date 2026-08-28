@@ -1,9 +1,9 @@
 """The single place where the LLM provider is chosen.
 
-The KG code below never talks to a model vendor directly; it receives an
-``LLMInterface``. neo4j-graphrag's ``OpenAILLM`` accepts a ``base_url``, so the same
-class serves both a local vLLM server (which exposes an OpenAI-compatible API) and a
-hosted API, and no custom adapter is needed.
+The pipeline never talks to a model vendor directly; it receives an ``LLMInterface``.
+neo4j-graphrag's ``OpenAILLM`` accepts a ``base_url``, so the same class serves both a
+local vLLM server (which exposes an OpenAI-compatible API) and a hosted API. That is why
+there is a factory here and not an abstraction layer.
 """
 
 from __future__ import annotations
@@ -19,6 +19,14 @@ logger = logging.getLogger(__name__)
 DEFAULT_VLLM_BASE_URL = "http://localhost:8000/v1"
 
 
+def llm_is_configured(config: dict[str, Any]) -> bool:
+    """True when an endpoint is reachable in principle; used to skip integration tests."""
+    llm_config = config.get("llm", {})
+    if llm_config.get("provider") == "api":
+        return bool(os.environ.get("LLM_API_KEY"))
+    return bool(llm_config.get("base_url") or os.environ.get("LLM_API_BASE_URL"))
+
+
 def build_llm(config: dict[str, Any]) -> LLMInterface:
     """Build the LLM client described by the ``llm:`` config block."""
     llm_config = config.get("llm", {})
@@ -29,6 +37,11 @@ def build_llm(config: dict[str, Any]) -> LLMInterface:
 
     model_params: dict[str, Any] = {"temperature": llm_config.get("temperature", 0.0)}
 
+    # JSON mode makes the server guarantee parseable JSON. It is skipped when full
+    # schema-constrained decoding is on, because that path sets response_format itself.
+    if llm_config.get("json_mode", True) and not llm_config.get("structured_output", False):
+        model_params["response_format"] = {"type": "json_object"}
+
     if provider == "local":
         base_url = (
             llm_config.get("base_url")
@@ -38,12 +51,10 @@ def build_llm(config: dict[str, Any]) -> LLMInterface:
         # vLLM requires a key to be present but ignores its value.
         api_key = os.environ.get("LLM_API_KEY") or "EMPTY"
         # Qwen instruct/non-thinking behaviour is requested through the chat template,
-        # which vLLM exposes via extra_body. This is vLLM-specific, so it is not sent
-        # to hosted APIs below.
+        # which vLLM exposes via extra_body. This is vLLM-specific, so it is not sent to
+        # hosted APIs below.
         if not llm_config.get("enable_thinking", False):
-            model_params["extra_body"] = {
-                "chat_template_kwargs": {"enable_thinking": False}
-            }
+            model_params["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
     elif provider == "api":
         base_url = llm_config.get("base_url") or os.environ.get("LLM_API_BASE_URL")
         api_key = os.environ.get("LLM_API_KEY")
@@ -54,10 +65,15 @@ def build_llm(config: dict[str, Any]) -> LLMInterface:
     else:
         raise ValueError(f"unknown llm.provider {provider!r}; expected 'local' or 'api'")
 
-    logger.info("llm provider=%s model=%s base_url=%s", provider, model, base_url)
+    logger.info(
+        "llm provider=%s model=%s base_url=%s json_mode=%s structured_output=%s",
+        provider, model, base_url,
+        "response_format" in model_params, llm_config.get("structured_output", False),
+    )
     return OpenAILLM(
         model_name=model,
         model_params=model_params,
         base_url=base_url,
         api_key=api_key,
+        timeout=llm_config.get("request_timeout_seconds", 120),
     )

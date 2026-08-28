@@ -12,8 +12,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import sys
-from pathlib import Path
 from typing import Any
 
 from neo4j_graphrag.components.entity_relation_extractor import (
@@ -24,8 +22,7 @@ from neo4j_graphrag.components.text_splitters.fixed_size_splitter import FixedSi
 from neo4j_graphrag.components.types import Neo4jGraph
 from neo4j_graphrag.llm import LLMInterface
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from ontology import EXTRACTION_EXAMPLES, SupplyChainERTemplate, build_graph_schema
+from ..ontology import EXTRACTION_EXAMPLES, SupplyChainERTemplate, build_graph_schema
 
 logger = logging.getLogger(__name__)
 
@@ -33,9 +30,12 @@ logger = logging.getLogger(__name__)
 def extract_graph(
     llm: LLMInterface,
     document: dict[str, Any],
+    ontology: dict[str, Any],
     chunk_size: int = 2000,
     chunk_overlap: int = 200,
     on_error: str = "IGNORE",
+    max_concurrency: int = 4,
+    structured_output: bool = False,
 ) -> tuple[Neo4jGraph, dict[str, int]]:
     """Extract a graph from one normalized document record.
 
@@ -52,11 +52,13 @@ def extract_graph(
         prompt_template=SupplyChainERTemplate(),
         create_lexical_graph=False,
         on_error=OnError(on_error),
+        max_concurrency=max_concurrency,
+        use_structured_output=structured_output,
     )
     graph = asyncio.run(
         extractor.run(
             chunks=chunks,
-            schema=build_graph_schema(),
+            schema=build_graph_schema(ontology),
             examples=EXTRACTION_EXAMPLES,
         )
     )

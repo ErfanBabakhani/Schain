@@ -1,0 +1,48 @@
+# Settings shared by INGEST and EXPAND. Included by config/ingest.yaml and
+# config/expansion.yaml so the LLM, Neo4j and storage settings exist in one place.
+#
+# Secrets never belong here. Neo4j credentials and API keys come from .env.
+
+ontology_file: config/ontology.yaml
+
+runtime:
+  # Resume is the default: work already completed in a previous run is not redone.
+  resume: true
+  # Set true (or pass --restart) to clear checkpoint state and recompute from scratch.
+  restart_from_scratch: false
+
+llm:
+  provider: local              # local = OpenAI-compatible server (vLLM) | api = hosted API
+  model: Qwen/Qwen3.8-27B
+  backend: vllm
+  base_url: http://localhost:8000/v1
+  enable_thinking: false       # sent to vLLM as chat_template_kwargs.enable_thinking
+  temperature: 0.0
+  # Ask the server for guaranteed-parseable JSON. Set false if the endpoint rejects it.
+  json_mode: true
+  # Full JSON-schema-constrained decoding. Off by default: it needs a grammar backend on
+  # the server, and json_mode plus the strict prompt is enough in practice.
+  structured_output: false
+  request_timeout_seconds: 120
+
+neo4j:
+  database: neo4j
+  batch_size: 1000
+
+concurrency:
+  # Bounded async retrieval. The LLM server does its own batching, so there is no
+  # thread pool around the model here.
+  retrieval: 8
+  llm_max_concurrency: 4
+  http_timeout_seconds: 20
+
+storage:
+  raw_documents: data/raw/documents.jsonl
+  normalized_documents: data/processed/documents.parquet
+  extracted_facts: data/processed/facts.parquet
+  # Prompt 1 output per document, so a failure in Prompt 2 or in the graph
+  # write never causes Prompt 1 to run again.
+  extractions: data/processed/extractions
+  search_results: data/processed/search_results.parquet
+  entity_resolution: data/processed/entity_resolution.parquet
+  state_db: data/state/state.db

@@ -81,6 +81,33 @@ def read_document_text(path: Path) -> str:
     )
 
 
+def make_document(
+    text: str,
+    source_url: Optional[str] = None,
+    title: Optional[str] = None,
+    source_path: Optional[str] = None,
+) -> dict[str, Any]:
+    """Build the normalized document record from raw text.
+
+    Used both by INGEST (text read from a file) and by EXPAND (text from retrieval).
+    """
+    text = normalize_text(text)
+    if not text:
+        raise ValueError("document is empty after normalization")
+
+    digest = content_hash(text)
+    return {
+        "doc_id": digest[:DOC_ID_LENGTH],
+        "content_hash": digest,
+        "source_path": source_path,
+        "source_url": normalize_url(source_url),
+        "title": title or (Path(source_path).stem if source_path else ""),
+        "text": text,
+        "char_count": len(text),
+        "ingested_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
 def load_document(
     path: Path,
     source_url: Optional[str] = None,
@@ -88,25 +115,29 @@ def load_document(
 ) -> dict[str, Any]:
     """Build the normalized document record for one input file."""
     path = Path(path)
-    text = normalize_text(read_document_text(path))
-    if not text:
-        raise ValueError(f"document is empty after normalization: {path}")
-
-    digest = content_hash(text)
-    record = {
-        "doc_id": digest[:DOC_ID_LENGTH],
-        "content_hash": digest,
-        "source_path": str(path),
-        "source_url": normalize_url(source_url),
-        "title": title or path.stem,
-        "text": text,
-        "char_count": len(text),
-        "ingested_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
+    record = make_document(
+        read_document_text(path),
+        source_url=source_url,
+        title=title or path.stem,
+        source_path=str(path),
+    )
     logger.info(
-        "loaded document %s (%s, %d chars)", record["doc_id"], path.name, len(text)
+        "loaded document %s (%s, %d chars)", record["doc_id"], path.name, record["char_count"]
     )
     return record
+
+
+def iter_input_files(target: Path, patterns: list[str]) -> list[Path]:
+    """Input files for INGEST: the file itself, or every match inside a directory."""
+    target = Path(target)
+    if target.is_file():
+        return [target]
+    if not target.exists():
+        raise FileNotFoundError(f"input path does not exist: {target}")
+    files: list[Path] = []
+    for pattern in patterns:
+        files.extend(sorted(target.rglob(pattern)))
+    return sorted(set(files))
 
 
 def append_raw_jsonl(record: dict[str, Any], path: Path) -> None:
