@@ -141,7 +141,7 @@ re-issue searches or re-expand finished companies.
 | File | Contents |
 |---|---|
 | [config/base.yaml](config/base.yaml) | LLM, Neo4j, storage paths, runtime, concurrency. Included by both modes. |
-| [config/ontology.yaml](config/ontology.yaml) | entity types, relation types, allowed patterns, which relations advance a tier |
+| [config/ontology.yaml](config/ontology.yaml) | entity types, relation types, allowed patterns, which relations advance a tier, known aliases |
 | [config/ingest.yaml](config/ingest.yaml) | input location, chunking |
 | [config/expansion.yaml](config/expansion.yaml) | seeds, `max_tier`, sources, relevance filter, per-tier query templates |
 
@@ -217,9 +217,15 @@ model checks, and `SCHAIN_RUN_NETWORK_TESTS=1` for the live retrieval checks.
   `PROJECT_DECISIONS.md` §9 requires the opposite: canonical ids plus `MERGE`, so a
   duplicate is never created. The writer is one small module of plain Cypher.
 - **Custom Prompt 2.** The library ships exact/fuzzy/spaCy resolvers, not an LLM
-  disambiguator. Deterministic normalization runs first, the LLM only sees what is left,
-  and results are cached in the state database so the same resolution is never paid for
-  twice.
+  disambiguator. Four stages run cheapest-first: the persisted resolution cache,
+  deterministic normalization (case, punctuation, accents, legal suffixes), the known-alias
+  map in `config/ontology.yaml`, and only then one LLM call per entity type. Results are
+  cached in the state database, so the same resolution is never paid for twice.
+- **Two independent JSON controls.** `llm.json_mode` asks the server for guaranteed
+  parseable JSON and applies to both prompts. `llm.structured_output` additionally
+  constrains Prompt 1 with the full JSON schema, which needs a grammar backend on the
+  server (vLLM has one) and is off by default. They are independent: Prompt 2 is a plain
+  call, so it relies on `json_mode` regardless.
 - **Stable canonical ids.** A group's canonical name is the longest mention in it, not
   whatever the model calls it, and a group that reaches an already-known entity reuses that
   entity's id. Repeated runs therefore cannot produce duplicate nodes.
