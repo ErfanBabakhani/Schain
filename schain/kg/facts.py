@@ -1,12 +1,11 @@
 """Extracted facts as a flat table, kept outside Neo4j.
 
-PROJECT_DECISIONS.md section 8: "Intermediate documents and facts are stored outside
-Neo4j as well", so the graph can be rebuilt without repeating LLM calls.
-
-One row per extracted relationship, carrying both the raw mention and the canonical
-entity it resolved to, plus the document and chunk it came from. neo4j-graphrag does
-ship a Parquet formatter, but it emits a Neo4j bulk-import layout; a flat triple table
-is what a human actually reads when checking whether an extraction was correct.
+One row per extracted relationship, carrying the raw mention, the canonical entity it
+resolved to, the document and chunk it came from, the source URL and the model that
+produced it. neo4j-graphrag does ship a Parquet formatter, but it emits a Neo4j
+bulk-import layout; a flat triple table is what a human actually reads when checking
+whether an extraction was correct, and it is what lets the graph be rebuilt without
+repeating LLM calls.
 """
 
 from __future__ import annotations
@@ -15,7 +14,7 @@ import hashlib
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Optional
 
 import pandas as pd
 from neo4j_graphrag.components.types import Neo4jGraph
@@ -23,11 +22,11 @@ from neo4j_graphrag.components.types import Neo4jGraph
 logger = logging.getLogger(__name__)
 
 FACT_COLUMNS = [
-    "fact_id", "doc_id", "chunk_index",
+    "fact_id", "doc_id", "chunk_index", "source_url",
     "subject_id", "subject_type", "subject_name", "subject_mention",
     "relation",
     "object_id", "object_type", "object_name", "object_mention",
-    "evidence", "extracted_at",
+    "evidence", "model", "extracted_at",
 ]
 
 
@@ -40,7 +39,7 @@ def fact_id(doc_id: str, subject_id: str, relation: str, object_id: str) -> str:
 def chunk_index_of(node_id: str, chunk_index_by_id: dict[str, int]) -> int:
     """Recover the chunk a node came from; the extractor prefixes ids with the chunk id."""
     prefix = node_id.split(":", 1)[0]
-    return chunk_index_by_id.get(prefix, -1)
+    return int(chunk_index_by_id.get(prefix, -1))
 
 
 def graph_to_facts(
@@ -48,6 +47,7 @@ def graph_to_facts(
     document: dict[str, Any],
     chunk_index_by_id: dict[str, int],
     resolution: dict[str, dict[str, Any]],
+    model: Optional[str] = None,
 ) -> pd.DataFrame:
     """Build the facts table for one document."""
     extracted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -65,13 +65,12 @@ def graph_to_facts(
         rows.append(
             {
                 "fact_id": fact_id(
-                    document["doc_id"],
-                    subject["canonical_id"],
-                    relationship.type,
-                    target["canonical_id"],
+                    document["doc_id"], subject["canonical_id"],
+                    relationship.type, target["canonical_id"],
                 ),
                 "doc_id": document["doc_id"],
                 "chunk_index": chunk_index_of(relationship.start_node_id, chunk_index_by_id),
+                "source_url": document.get("source_url"),
                 "subject_id": subject["canonical_id"],
                 "subject_type": subject["label"],
                 "subject_name": subject["canonical_name"],
@@ -82,6 +81,7 @@ def graph_to_facts(
                 "object_name": target["canonical_name"],
                 "object_mention": target["mention"],
                 "evidence": (relationship.properties or {}).get("evidence", ""),
+                "model": model,
                 "extracted_at": extracted_at,
             }
         )
@@ -102,3 +102,31 @@ def upsert_facts_parquet(frame: pd.DataFrame, path: Path) -> int:
     frame = frame.drop_duplicates(subset="fact_id", keep="last").reset_index(drop=True)
     frame.to_parquet(path, index=False)
     return len(frame)
+
+
+def facts_for_document(path: Path, doc_id: str) -> pd.DataFrame:
+    """Read back the facts of one document, used when resuming after a failed write."""
+    if not path.exists():
+        return pd.DataFrame(columns=FACT_COLUMNS)
+    frame = pd.read_parquet(path)
+    return frame[frame.doc_id == doc_id].reset_index(drop=True)
+
+
+def upstream_companies(
+    facts: pd.DataFrame, entity_ids: Iterable[str], tier_relations: Iterable[str]
+) -> list[str]:
+    """Names of companies that supply ``entity_id``, i.e. the next tier upstream.
+
+    Direction is supplier --suppliesTo--> customer, so the upstream companies are the
+    subjects of a tier-advancing relation whose object is this entity. Relations such as
+    locatedIn, owns and produces are not in ``tier_relations`` and therefore never add
+    supply-chain depth.
+    """
+    if facts.empty:
+        return []
+    matches = facts[
+        facts.relation.isin(list(tier_relations))
+        & facts.object_id.isin(list(entity_ids))
+        & (facts.subject_type == "Company")
+    ]
+    return list(dict.fromkeys(matches.subject_name.tolist()))

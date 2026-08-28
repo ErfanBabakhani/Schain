@@ -1,0 +1,48 @@
+# V1 static ontology (AlMahri replication schema).
+#
+# Static means static: nothing in the pipeline adds entity or relation types at runtime.
+# Editing this file is the only way to change the schema.
+#
+# "Supplier" is deliberately NOT an entity type. Supplying is a role, expressed by the
+# suppliesTo relation between two Company (or Mine -> Company) nodes.
+
+ontology:
+  dynamic: false
+
+  entity_types:
+    - Company
+    - Location
+    - Material
+    - Person
+    - Product
+    - Mine
+
+  relation_types:
+    - suppliesTo
+    - locatedIn
+    - owns
+    - produces
+
+  # Direction: supplier --suppliesTo--> customer.
+  # Only these relations move a discovered company one tier further upstream during
+  # EXPAND. locatedIn / owns / produces describe an entity but do not add supply depth.
+  tier_advancing_relations:
+    - suppliesTo
+
+  # Entity types allowed to enter the expansion frontier.
+  expandable_types:
+    - Company
+
+  # Allowed (source, relation, target) combinations. The frozen decisions fix the type
+  # lists but not the combinations, so they are stated explicitly here.
+  patterns:
+    - [Company, suppliesTo, Company]
+    - [Mine, suppliesTo, Company]
+    - [Company, produces, Product]
+    - [Company, produces, Material]
+    - [Mine, produces, Material]
+    - [Company, locatedIn, Location]
+    - [Mine, locatedIn, Location]
+    - [Company, owns, Company]
+    - [Company, owns, Mine]
+    - [Person, owns, Company]

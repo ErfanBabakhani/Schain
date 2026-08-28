@@ -1,0 +1,113 @@
+# EXPAND: discover upstream suppliers from seed companies.
+#
+#   .venv/bin/python -m schain expand --config config/expansion.yaml
+
+include:
+  - config/base.yaml
+
+mode: expand
+
+# Tier 0. For testing automatic expansion these are OEM seeds only, so that suppliers
+# are actually discovered rather than supplied up front. The full AlMahri selected-company
+# set (add the two groups below to seeds) is the strict replication configuration.
+seeds:
+  ev_manufacturers:
+    - Toyota
+    - Tesla Inc.
+    - BMW
+    - BYD Co., Ltd.
+  # battery_suppliers:
+  #   - Samsung SDI
+  #   - CATL
+  #   - Panasonic
+  # mining_companies:
+  #   - Zijin Mining
+  #   - Albemarle Corporation
+  #   - Tianqi Lithium
+  #   - Ganfeng Lithium Co Ltd
+  #   - Norilsk Nickel
+  #   - Jinchuan Group
+
+expansion:
+  # Tier 0 = seeds, Tiers 1-3 = discovered upstream suppliers. Tier 3 nodes are stored
+  # but not expanded further.
+  max_tier: 3
+  # Safety stop for a run; 0 means no limit.
+  max_documents: 0
+
+  sources:
+    wikipedia:
+      enabled: true
+      language: en
+    gdelt:
+      enabled: true
+    google_news:
+      enabled: true
+      language: en-US
+      # Fetch and extract the article body. With false, only title and snippet are used.
+      fetch_full_text: true
+
+  # Cheap filter applied before any LLM call.
+  relevance:
+    require_entity_mention: true
+    min_chars: 200
+    keywords:
+      - supplier
+      - suppliers
+      - supply
+      - supplies
+      - sourcing
+      - sources
+      - procurement
+      - contract
+      - agreement
+      - deliver
+      - raw material
+      - battery
+      - semiconductor
+      - lithium
+      - nickel
+      - cobalt
+      - mine
+      - mining
+
+  # Query limits use "closest value wins", resolved per field:
+  #     global defaults  <  tier defaults  <  per-query override
+  # max_results is a limit PER QUERY, not a cumulative document target.
+  search:
+    defaults:
+      max_results: 20
+      providers: [wikipedia, gdelt, google_news]
+
+    tiers:
+      0:
+        defaults:
+          max_results: 30
+        queries:
+          - query: '"{entity}" suppliers'
+          - query: '"{entity}" sourcing'
+          - query: '"{entity}" battery suppliers'
+          - query: '"{entity}" semiconductor suppliers'
+            max_results: 15
+
+      1:
+        defaults:
+          max_results: 20
+        queries:
+          - query: '"{entity}" suppliers'
+          - query: '"{entity}" component suppliers'
+          - query: '"{entity}" raw material suppliers'
+
+      2:
+        queries:
+          - query: '"{entity}" material suppliers'
+          - query: '"{entity}" lithium suppliers'
+          - query: '"{entity}" nickel suppliers'
+          - query: '"{entity}" cobalt suppliers'
+          - query: '"{entity}" mines'
+            max_results: 40
+
+      3:
+        queries:
+          - query: '"{entity}" raw material sources'
+          - query: '"{entity}" mines'

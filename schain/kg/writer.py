@@ -14,7 +14,7 @@ endpoints without knowing their type.
 from __future__ import annotations
 
 import logging
-from typing import Any, Iterable
+from typing import Any, Iterable, Optional
 
 import neo4j
 
@@ -40,11 +40,18 @@ def ensure_constraints(driver: neo4j.Driver, database: str) -> None:
     )
 
 
+def _batched(rows: list[dict[str, Any]], size: int):
+    """Yield fixed-size batches, so one statement does not carry an unbounded payload."""
+    for start in range(0, len(rows), max(1, size)):
+        yield rows[start : start + max(1, size)]
+
+
 def merge_nodes(
     driver: neo4j.Driver,
     database: str,
     nodes: list[dict[str, Any]],
     entity_types: Iterable[str],
+    batch_size: int = 1000,
 ) -> int:
     """MERGE canonical entities, one statement per ontology label.
 
@@ -67,7 +74,8 @@ def merge_nodes(
             "    e.aliases = [a IN coalesce(e.aliases, []) WHERE NOT a IN row.aliases]"
             "               + row.aliases"
         )
-        driver.execute_query(query, rows=rows, database_=database)
+        for batch in _batched(rows, batch_size):
+            driver.execute_query(query, rows=batch, database_=database)
         written += len(rows)
         logger.info("merged %d %s node(s)", len(rows), label)
     return written
@@ -78,6 +86,7 @@ def merge_relationships(
     database: str,
     relationships: list[dict[str, Any]],
     relation_types: Iterable[str],
+    batch_size: int = 1000,
 ) -> int:
     """MERGE relationships, one statement per relation type.
 
@@ -101,14 +110,15 @@ def merge_relationships(
             "    r.source_doc_ids = [d IN coalesce(r.source_doc_ids, []) "
             "                        WHERE d <> row.doc_id] + [row.doc_id]"
         )
-        driver.execute_query(query, rows=rows, database_=database)
+        for batch in _batched(rows, batch_size):
+            driver.execute_query(query, rows=batch, database_=database)
         written += len(rows)
         logger.info("merged %d %s relationship(s)", len(rows), relation_type)
     return written
 
 
 def facts_to_graph_rows(
-    facts: "Any", resolution: dict[str, dict[str, Any]]
+    facts: "Any", resolution: Optional[dict[str, dict[str, Any]]] = None
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Turn the facts table into the node and relationship rows the writer expects.
 
@@ -117,13 +127,14 @@ def facts_to_graph_rows(
     """
     nodes: dict[str, dict[str, Any]] = {}
     aliases_by_id: dict[str, set[str]] = {}
-    for entry in resolution.values():
+    for entry in (resolution or {}).values():
         aliases_by_id.setdefault(entry["canonical_id"], set()).update(entry["aliases"])
 
     relationships: list[dict[str, Any]] = []
     for row in facts.to_dict("records"):
         for prefix in ("subject", "object"):
             canonical = row[f"{prefix}_id"]
+            aliases_by_id.setdefault(canonical, set()).add(row[f"{prefix}_mention"])
             nodes[canonical] = {
                 "canonical_id": canonical,
                 "label": row[f"{prefix}_type"],
