@@ -267,3 +267,15 @@ def test_provenance_survives_a_reload_because_it_is_computed():
         provider="gdelt", query="q", title="T", url="u", text="body").as_row().items()
         if k in fields}
     assert SearchResult(**row).content_source == "full_text"
+
+
+def test_article_extraction_dependency_is_actually_importable():
+    """Guards a clean install: trafilatura pulls justext, which needs lxml.html.clean.
+
+    That module moved out of lxml, so without the lxml-html-clean pin the import fails and
+    every retrieved document silently degrades to title+snippet.
+    """
+    import trafilatura
+
+    html = "<html><body><article><p>" + "BMW named a battery supplier. " * 6 + "</p></article></body></html>"
+    assert trafilatura.extract(html)
