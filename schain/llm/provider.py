@@ -37,9 +37,11 @@ def build_llm(config: dict[str, Any]) -> LLMInterface:
 
     model_params: dict[str, Any] = {"temperature": llm_config.get("temperature", 0.0)}
 
-    # JSON mode makes the server guarantee parseable JSON. It is skipped when full
-    # schema-constrained decoding is on, because that path sets response_format itself.
-    if llm_config.get("json_mode", True) and not llm_config.get("structured_output", False):
+    # JSON mode makes the server guarantee parseable JSON. It is set independently of
+    # structured_output: Prompt 1's schema-constrained path passes its own response_format
+    # and drops this one, but Prompt 2 is a plain call and would otherwise be left
+    # unconstrained when structured_output is on.
+    if llm_config.get("json_mode", True):
         model_params["response_format"] = {"type": "json_object"}
 
     if provider == "local":

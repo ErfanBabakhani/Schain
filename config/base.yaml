@@ -20,8 +20,9 @@ llm:
   temperature: 0.0
   # Ask the server for guaranteed-parseable JSON. Set false if the endpoint rejects it.
   json_mode: true
-  # Full JSON-schema-constrained decoding. Off by default: it needs a grammar backend on
-  # the server, and json_mode plus the strict prompt is enough in practice.
+  # Full JSON-schema-constrained decoding for Prompt 1. Off by default: it needs a
+  # grammar backend on the server (vLLM has one), and json_mode plus the strict prompt is
+  # enough in practice. Independent of json_mode, which still constrains Prompt 2.
   structured_output: false
   request_timeout_seconds: 120
 
