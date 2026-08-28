@@ -17,6 +17,10 @@ dependencies = [
     "python-dotenv>=1.0",
     "httpx>=0.27",          # async retrieval with bounded concurrency
     "trafilatura>=1.12",    # article text extraction from fetched news HTML
+    # trafilatura -> justext needs lxml.html.clean, which moved out of lxml in 5.2 into
+    # its own package. Without this, importing trafilatura fails on a clean install and
+    # full-text extraction silently degrades to title+snippet everywhere.
+    "lxml-html-clean>=0.4",
 ]
 
 [project.optional-dependencies]

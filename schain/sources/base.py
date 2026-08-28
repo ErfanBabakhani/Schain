@@ -112,7 +112,15 @@ async def fetch_article_text(client: httpx.AsyncClient, url: str) -> Optional[st
         return None
     try:
         import trafilatura
-
+    except ImportError as error:
+        # A broken install would otherwise disable full-text extraction everywhere and
+        # look like every page simply failing to parse, so say so once and loudly.
+        logger.warning(
+            "trafilatura is unavailable (%s); all retrieved documents will fall back to "
+            "title and snippet. Reinstall the project dependencies.", error,
+        )
+        return None
+    try:
         return trafilatura.extract(html, include_comments=False, include_tables=False)
     except Exception as error:  # noqa: BLE001 - a page that will not parse is not fatal
         logger.debug("article extraction failed for %s: %s", url, error)
