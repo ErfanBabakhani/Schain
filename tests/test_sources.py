@@ -225,3 +225,45 @@ def test_relevance_filter(text, expected):
 def test_filter_without_keywords_accepts_any_mention():
     assert is_relevant("BMW opened a museum in Munich for visitors this summer.",
                        "BMW", {"min_chars": 10, "require_entity_mention": True})
+
+
+# --- full text versus the title+snippet fallback -----------------------------------
+
+
+def test_content_source_reports_full_text_when_a_body_was_fetched():
+    from schain.sources.base import FULL_TEXT, SearchResult
+
+    result = SearchResult(provider="gdelt", query="q", title="T", url="u",
+                          snippet="S", text="A full article body.")
+    assert result.content_source == FULL_TEXT
+    assert result.document_text() == "A full article body."
+
+
+def test_content_source_reports_the_fallback_when_no_body_was_available():
+    """Google News RSS links are redirect wrappers, so this is the normal case there."""
+    from schain.sources.base import TITLE_SNIPPET, SearchResult
+
+    result = SearchResult(provider="google_news", query="q",
+                          title="BMW names battery supplier", url="u",
+                          snippet="BMW picked a supplier")
+    assert result.content_source == TITLE_SNIPPET
+    # still a usable document, just a shorter one
+    assert result.document_text() == "BMW names battery supplier\nBMW picked a supplier"
+
+
+def test_provenance_is_carried_into_the_persisted_row():
+    from schain.sources.base import SearchResult
+
+    row = SearchResult(provider="google_news", query="q", title="T", url="u").as_row()
+    assert row["content_source"] == "title_snippet"
+
+
+def test_provenance_survives_a_reload_because_it_is_computed():
+    """A cached row rehydrates without the column, and the marker is still right."""
+    from schain.sources.base import SearchResult
+
+    fields = set(SearchResult.__dataclass_fields__)
+    row = {k: v for k, v in SearchResult(
+        provider="gdelt", query="q", title="T", url="u", text="body").as_row().items()
+        if k in fields}
+    assert SearchResult(**row).content_source == "full_text"

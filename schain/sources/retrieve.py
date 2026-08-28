@@ -20,7 +20,7 @@ from .. import state
 from ..config import resolve_tier_queries, storage_path
 from ..names import normalization_key
 from . import PROVIDERS
-from .base import SearchResult, build_client, fetch_article_text
+from .base import TITLE_SNIPPET, SearchResult, build_client, fetch_article_text
 
 logger = logging.getLogger(__name__)
 
@@ -108,6 +108,13 @@ async def _add_full_text(
             return
         async with semaphore:
             result.text = await fetch_article_text(client, result.url)
+        if not result.text:
+            # Expected for Google News, whose RSS links are redirect wrappers. The
+            # document is still used, with title and snippet as its text.
+            logger.info(
+                "no article body for %s (%s); falling back to title and snippet",
+                result.url, result.provider,
+            )
 
     await asyncio.gather(*(fetch(result) for result in results))
 
@@ -181,9 +188,12 @@ async def retrieve_async(
         result for result in unique.values()
         if is_relevant(result.document_text(), entity_name, relevance)
     ]
+    fallbacks = sum(1 for result in relevant if result.content_source == TITLE_SNIPPET)
     logger.info(
-        "entity %s tier %d: %d candidate(s), %d unique, %d relevant",
+        "entity %s tier %d: %d candidate(s), %d unique, %d relevant "
+        "(%d full text, %d title+snippet)",
         entity_name, tier, len(combined), len(unique), len(relevant),
+        len(relevant) - fallbacks, fallbacks,
     )
     return relevant
 

@@ -193,3 +193,33 @@ def test_repeated_llm_failures_abort_instead_of_grinding(
     single_seed_config["runtime"]["max_consecutive_failures"] = 1
     with pytest.raises(RuntimeError, match="failed in a row"):
         run_expand(single_seed_config, connection, FailingLLM(), ontology, None)
+
+
+def test_headline_only_documents_are_ingested_and_marked_as_such(
+    single_seed_config, connection, ontology, monkeypatch
+):
+    """EXPAND must keep working when a provider yields only a title and snippet."""
+    def fake(config, entity_name, entity_key, tier, connection):
+        return [SearchResult(
+            provider="google_news", query="q",
+            title=f"{entity_name} names CATL as battery supplier",
+            url="https://news.google.com/rss/articles/CBMwrapper",
+            snippet="CATL supplies battery cells to BMW AG under a new agreement.",
+        )]
+
+    monkeypatch.setattr("schain.expansion.loop.retrieve_for_entity", fake)
+    single_seed_config["expansion"]["max_tier"] = 0
+    summary = run_expand(single_seed_config, connection, StubLLM(), ontology, FakeDriver())
+
+    assert summary["documents_processed"] == 1
+    documents = pd.read_parquet(single_seed_config["storage"]["normalized_documents"])
+    assert documents.iloc[0]["content_source"] == "title_snippet"
+
+
+def test_ingested_files_are_marked_as_file_sourced(
+    document_file, ingest_config, connection, ontology
+):
+    from schain.documents import load_document
+
+    record = load_document(document_file)
+    assert record["content_source"] == "file"

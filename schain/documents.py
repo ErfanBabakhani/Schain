@@ -86,10 +86,15 @@ def make_document(
     source_url: Optional[str] = None,
     title: Optional[str] = None,
     source_path: Optional[str] = None,
+    content_source: str = "file",
 ) -> dict[str, Any]:
     """Build the normalized document record from raw text.
 
     Used both by INGEST (text read from a file) and by EXPAND (text from retrieval).
+
+    ``content_source`` records where the text came from - "file" for INGEST,
+    "full_text" or "title_snippet" for retrieved documents - so it is visible later
+    whether a fact was extracted from an article body or only from a headline.
     """
     text = normalize_text(text)
     if not text:
@@ -104,6 +109,7 @@ def make_document(
         "title": title or (Path(source_path).stem if source_path else ""),
         "text": text,
         "char_count": len(text),
+        "content_source": content_source,
         "ingested_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 

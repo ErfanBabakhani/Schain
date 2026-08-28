@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 import pytest
 
@@ -142,3 +144,53 @@ def test_unknown_provider_in_config_is_skipped_with_a_warning(
         two_provider_config, "BMW", "company:bmw", 0, connection
     ) == []
     assert "unknown provider" in caplog.text
+
+
+def test_a_document_is_still_returned_when_the_body_cannot_be_fetched(
+    two_provider_config, connection, monkeypatch, caplog
+):
+    """A failed article fetch must degrade to title+snippet, not drop the result."""
+    async def no_body(client, url):
+        return None
+
+    async def headline_only(client, query, max_results, options):
+        return [SearchResult(
+            provider="google_news", query=query,
+            title="BMW names a new battery supplier for European plants",
+            url="https://news.google.com/rss/articles/CBMwrapper",
+            snippet="BMW has signed a multi-year sourcing agreement with a battery supplier.",
+        )]
+
+    caplog.set_level(logging.INFO, logger="schain.sources.retrieve")
+    monkeypatch.setattr("schain.sources.retrieve.fetch_article_text", no_body)
+    monkeypatch.setitem(retrieve.PROVIDERS, "google_news", headline_only)
+    # google_news is the provider whose RSS links are redirect wrappers, so it is the
+    # one configured to attempt a body fetch here.
+    two_provider_config["expansion"]["sources"] = {
+        "google_news": {"enabled": True, "fetch_full_text": True},
+    }
+    two_provider_config["expansion"]["search"]["defaults"]["providers"] = ["google_news"]
+
+    results = retrieve.retrieve_for_entity(
+        two_provider_config, "BMW", "company:bmw", 0, connection
+    )
+    assert len(results) == 1
+    assert results[0].content_source == "title_snippet"
+    assert "falling back to title and snippet" in caplog.text
+
+
+def test_the_fallback_marker_is_persisted_with_the_search_results(
+    two_provider_config, connection, monkeypatch
+):
+    async def headline_only(client, query, max_results, options):
+        return [SearchResult(provider="google_news", query=query,
+                             title="BMW supplier news for its European plants",
+                             url="https://news.test/x",
+                             snippet="A multi-year battery supplier agreement was signed.")]
+
+    monkeypatch.setitem(retrieve.PROVIDERS, "wikipedia", headline_only)
+    two_provider_config["expansion"]["sources"]["gdelt"]["enabled"] = False
+    retrieve.retrieve_for_entity(two_provider_config, "BMW", "company:bmw", 0, connection)
+
+    frame = pd.read_parquet(two_provider_config["storage"]["search_results"])
+    assert frame.iloc[0]["content_source"] == "title_snippet"
