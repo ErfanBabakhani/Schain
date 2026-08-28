@@ -1,0 +1,203 @@
+
+\documentclass[10pt,a4paper]{article}
+\usepackage[a4paper,top=14mm,bottom=14mm,left=15mm,right=15mm,headheight=13pt]{geometry}
+\usepackage{fontspec}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{tabularx}
+\usepackage{array}
+\usepackage{enumitem}
+\usepackage{tcolorbox}
+\usepackage{fancyhdr}
+\usepackage{lastpage}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{titlesec}
+\usepackage{ragged2e}
+
+\setmainfont{Noto Serif}
+\setsansfont{Inter}
+\setmonofont{TeXGyreCursor}
+
+\definecolor{MainBlue}{HTML}{0B2D5B}
+\definecolor{SoftBlue}{HTML}{EFF5FF}
+\definecolor{SoftGray}{HTML}{F6F7F9}
+\definecolor{MidGray}{HTML}{D9DEE7}
+\definecolor{DarkGray}{HTML}{40464F}
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\sffamily\small Supply-Chain Knowledge Graph}
+\rhead{\sffamily\small V1 Design Brief}
+\cfoot{\sffamily\footnotesize \thepage/\pageref{LastPage}}
+\renewcommand{\headrulewidth}{0.35pt}
+
+\titleformat{\section}
+  {\sffamily\bfseries\large\color{MainBlue}}{}{0pt}{}
+\titlespacing*{\section}{0pt}{7pt}{3pt}
+
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{3pt}
+\setlist[itemize]{leftmargin=1.25em,topsep=2pt,itemsep=1pt,parsep=0pt}
+\setlist[enumerate]{leftmargin=1.35em,topsep=2pt,itemsep=1pt,parsep=0pt}
+\renewcommand{\arraystretch}{1.12}
+
+\newtcolorbox{briefbox}[1][]{
+  colback=SoftBlue,
+  colframe=MainBlue,
+  boxrule=0.45pt,
+  arc=1.5mm,
+  left=2mm,right=2mm,top=1.4mm,bottom=1.4mm,
+  #1
+}
+\newtcolorbox{graybox}[1][]{
+  colback=SoftGray,
+  colframe=MidGray,
+  boxrule=0.4pt,
+  arc=1.5mm,
+  left=2mm,right=2mm,top=1.3mm,bottom=1.3mm,
+  #1
+}
+
+\begin{document}
+
+{\sffamily\bfseries\fontsize{17}{19}\selectfont\color{MainBlue}
+Supply-Chain Knowledge Graph: Frozen V1 Architecture}
+
+\vspace{1mm}
+\begin{briefbox}
+\small
+\textbf{Goal.} Build a reproducible supply-chain KG from unstructured text. V1 focuses on data acquisition, LLM-based entity/relation extraction, entity disambiguation, controlled upstream expansion, and Neo4j storage. Risk analysis and existing-edge monitoring are outside V1.
+\end{briefbox}
+
+\section{1. Decisions on the four open questions}
+
+\small
+\begin{tabularx}{\textwidth}{>{\bfseries\sffamily}p{0.22\textwidth} X}
+\toprule
+Question & Frozen V1 decision \\
+\midrule
+Seed definition &
+Seeds are configurable and can be increased. The default replication config uses AlMahri's 13 selected companies: Toyota, Tesla, BMW, BYD; Samsung SDI, CATL, Panasonic; Zijin Mining, Albemarle, Tianqi Lithium, Ganfeng Lithium, Norilsk Nickel, Jinchuan Group. \\
+
+Graph expansion &
+Node-centric and tier-aware, not pairwise. Each frontier company is searched with a small set of tier-specific query templates. Newly discovered upstream companies become the next frontier. \\
+
+Boundary / stopping &
+\texttt{max\_tier} is configurable. Following Prof. Kuo's suggestion for testing, the default is \textbf{3 upstream supply-chain tiers} from the final EV product: seeds are Tier 0, discovered suppliers are Tiers 1--3, and Tier 3 is terminal. Only supply-chain relations (mainly \texttt{SUPPLIES\_TO}) advance the tier. \\
+
+Ontology &
+Static in V1. We use the AlMahri evaluation schema: entity types \texttt{Company, Location, Material, Person, Product, Mine}; relations \texttt{suppliesTo, locatedIn, owns, produces}. A later mapping to SCRO can be added without changing the extraction pipeline. \\
+\bottomrule
+\end{tabularx}
+
+\section{2. AlMahri baseline, data modes, and datasets}
+
+AlMahri et al. created a controlled evaluation corpus of \textbf{1,277 Wikipedia sentences} and manually annotated it for six entity types and four relation types. Their method uses zero-shot LLM prompting for NER/RE and a second prompt for entity disambiguation. The exact annotated corpus was described in the paper, but we did not identify a public downloadable package for the full labeled dataset. Because that exact labeled package is not available to us, V1 is dataset-agnostic and exposes two operating modes: \texttt{INGEST} for a fixed corpus/dataset already in hand, and \texttt{EXPAND} when the system must discover documents from seeds.
+
+\begin{tabularx}{\textwidth}{>{\bfseries\sffamily}p{0.16\textwidth} X}
+\toprule
+Mode & Behavior \\
+\midrule
+\texttt{INGEST} &
+The user provides documents or a dataset. The system normalizes, extracts facts, resolves duplicates, and merges them into Neo4j. No search is performed. This is the closest mode to the fixed-data evaluation setup in AlMahri. \\
+
+\texttt{EXPAND} &
+The user provides seeds. For each frontier company, the system runs tier-specific queries over enabled retrieval sources (e.g., Wikipedia search and Google News / GDELT), extracts upstream suppliers from the returned documents, and continues until the configured tier boundary. Wikipedia is a source in the search layer; the system does not assume that the entity's own Wikipedia page is the document to retrieve. \\
+\bottomrule
+\end{tabularx}
+
+\textbf{Auxiliary reference dataset.} We use \textbf{Sectivia} as an external graph sanity-check dataset: 350 directed supplier-to-customer relations across 214 listed companies (215 company rows in the node file), released as CSV/JSON under CC BY 4.0. It is useful for checking discovered links, but it is \emph{not} a substitute for AlMahri's annotated text corpus.
+
+\section{3. V1 architecture}
+
+\begin{graybox}
+\centering\sffamily\small
+\textbf{INGEST:} Documents
+$\rightarrow$ Normalize/Store
+$\rightarrow$ LLM Prompt 1
+$\rightarrow$ Prompt 2
+$\rightarrow$ Facts
+$\rightarrow$ Neo4j MERGE
+\\[1mm]
+\textbf{EXPAND:} Seeds
+$\rightarrow$ Persistent Frontier
+$\rightarrow$ Tier-Specific Retrieval Queries
+$\rightarrow$ Wikipedia/Search/News Sources
+$\rightarrow$ Dedup/Filter
+$\rightarrow$ LLM Prompt 1
+$\rightarrow$ Prompt 2
+$\rightarrow$ Neo4j
+$\rightarrow$ New Upstream Companies
+$\rightarrow$ Next Tier
+\end{graybox}
+
+The implementation should reuse Neo4j GraphRAG KG Builder components for splitting, schema-guided entity/relation extraction, and graph writing where practical. Custom code is limited to source retrieval, expansion policy, checkpointing, provider adapters, and AlMahri-style disambiguation.
+
+\newpage
+
+\section{4. Graph expansion algorithm}
+
+\begin{enumerate}
+\item Initialize a persistent queue with user seeds at Tier 0.
+\item Pop one \texttt{Company} and load the query templates and retrieval-source settings for its tier.
+\item Run each query independently over the enabled sources (e.g., Wikipedia search, Google News, GDELT). Do not generate pairwise company queries.
+\item Merge returned documents/results, normalize URLs, remove duplicates, and keep at most the configured number of results \emph{per query}. Fetch/filter only useful documents.
+\item Extract facts. If a new company has a valid upstream supply relation to the current node, assign \texttt{tier=current+1}, merge it into the KG, and enqueue it only if \texttt{tier < max\_tier}. Tier-3 nodes are therefore stored but not expanded under the default setting.
+\item Continue until the frontier is empty or the tier/node limits are reached.
+\end{enumerate}
+
+\begin{briefbox}
+\small
+\textbf{Query design.} We never create all company pairs. Queries are \textbf{node-centric}: each tier has a configurable set of keywords/query templates, and the current frontier company's name is inserted into them. Search cost is approximately $O(NK)$, where $N$ is the number of expanded companies and $K$ is the small number of templates for that tier, rather than $O(N^2)$.
+
+\textbf{Example.} If BMW is a Tier-0 frontier node, Tier-0 templates such as \texttt{"\{entity\}" suppliers}, \texttt{"\{entity\}" sourcing}, and \texttt{"\{entity\}" battery suppliers} become \texttt{"BMW" suppliers}, \texttt{"BMW" sourcing}, and \texttt{"BMW" battery suppliers}. If CATL is then discovered as an upstream supplier, it becomes a Tier-1 frontier node and is searched with the Tier-1 set, e.g., \texttt{"CATL" suppliers}, \texttt{"CATL" component suppliers}, and \texttt{"CATL" raw material suppliers}. Tier-2 templates can focus further upstream, e.g., \texttt{"\{entity\}" material suppliers} and \texttt{"\{entity\}" mines}. Each template can have its own result limit through the same config hierarchy described below.
+\end{briefbox}
+
+\textbf{Config inheritance.} Search limits use ``closest value wins'':
+\[
+\text{global defaults} \;<\; \text{tier defaults} \;<\; \text{query override}.
+\]
+For example, the global default may be 20 results/query, Tier 0 may override it to 30, and one specific query may override it again to 15. This rule is applied per field, so only explicitly changed values are replaced.
+
+\section{5. LLM prompts and extraction}
+
+\begin{tabularx}{\textwidth}{>{\bfseries\sffamily}p{0.18\textwidth} X}
+\toprule
+Prompt & V1 behavior \\
+\midrule
+Prompt 1: NER + RE &
+\textbf{Purpose: extract graph facts from text.} The prompt receives a document/chunk plus the fixed ontology and asks the model to return only allowed entity types and relations. Its output is structured entities and triples, together with the supporting text/source evidence. For example, from ``CATL supplies battery cells to BMW'', it should identify CATL and BMW as \texttt{Company} entities and produce \texttt{CATL suppliesTo BMW}. NER and relation extraction are conceptually separate tasks, but V1 can obtain both in one structured LLM call. \\
+
+Prompt 2: Entity disambiguation &
+\textbf{Purpose: merge mentions that refer to the same real-world entity.} After Prompt 1, mentions are grouped by entity type and passed to this second prompt. The model assigns the same canonical/group ID to equivalent mentions, e.g., ``CATL'' and ``Contemporary Amperex Technology Co. Limited'', while keeping genuinely different entities separate. The resolved IDs are then used before Neo4j \texttt{MERGE}, preventing duplicate nodes. \\
+\bottomrule
+\end{tabularx}
+
+\begin{graybox}
+\small
+\textbf{Prompt flow:} document text + static ontology $\rightarrow$ \textbf{Prompt 1} $\rightarrow$ extracted entities/relations/evidence $\rightarrow$ \textbf{Prompt 2} $\rightarrow$ canonical entity groups $\rightarrow$ deduplicated facts $\rightarrow$ Neo4j.
+\end{graybox}
+
+The LLM layer is provider-independent. The planned local model is \textbf{Qwen3.8-27B} in instruct/non-thinking mode, served with vLLM; a GPT API can be kept as an optional comparison/provider. The same extraction contract is used in either case, so the KG logic does not depend on the model backend.
+
+\section{6. Reliability and scope}
+
+\begin{itemize}
+\item \textbf{Resume is default.} Both modes save state in a small persistent store (e.g., SQLite): document status for \texttt{INGEST}, and frontier/search/document status for \texttt{EXPAND}. A user can explicitly request a fresh run.
+\item \textbf{No duplicate work.} Raw documents are stored with normalized URL/content hash; normalized data and extracted facts are saved separately (JSONL/Parquet). Completed LLM results are reused after restart.
+\item \textbf{Idempotent graph writes.} Canonical entity IDs plus Neo4j \texttt{MERGE} prevent duplicate nodes/edges when a run is resumed or repeated.
+\item \textbf{Not in V1.} Existing-edge monitoring, relationship-change detection, risk analytics, and custom graph dashboards. Neo4j Browser is sufficient for inspection/visualization.
+\end{itemize}
+
+\vspace{1mm}
+{\footnotesize
+\textbf{References.}
+[1] S. AlMahri, L. Xu, A. Brintrup, ``Enhancing Supply Chain Visibility with Knowledge Graphs and Large Language Models,'' IJPR / arXiv:2408.07705.
+[2] Neo4j GraphRAG Python, Knowledge Graph Builder documentation.
+[3] IOFoundry, Supply Chain Reference Ontology (SCRO).
+[4] Sectivia, Open Supply-Chain Dataset (CC BY 4.0).
+}
+
+\end{document}
