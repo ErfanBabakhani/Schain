@@ -23,6 +23,25 @@ fi
 pids="$(schain_pids | tr '\n' ' ')"
 item "schain process" "${pids:+running (pid ${pids% })}${pids:-not running}"
 
+if slurm_available; then
+    job_file="$(slurm_job_file)"
+    job_id="$( [ -f "$job_file" ] && cat "$job_file" )"
+    if [ -z "$job_id" ]; then
+        item "slurm job" "none submitted from this checkout"
+    else
+        # squeue knows queued and running jobs; sacct also knows finished ones.
+        live="$(squeue -h -j "$job_id" -o '%T on %N' 2>/dev/null)"
+        if [ -n "$live" ]; then
+            item "slurm job" "$job_id  $live"
+            item "stop with" "scancel $job_id"
+        elif have sacct; then
+            item "slurm job" "$job_id  $(sacct -n -X -j "$job_id" -o State,Elapsed 2>/dev/null | head -1 | xargs)"
+        else
+            item "slurm job" "$job_id (no longer queued)"
+        fi
+    fi
+fi
+
 echo
 echo "== services =="
 if [ -x "$VENV_PY" ] && values="$(config_values "$CONFIG_FILE" 2>/dev/null)"; then

@@ -92,6 +92,40 @@ The script tracks what it started:
 - **Never touched** → `data/state/state.db`, the Parquet layers, the Neo4j data directory,
   and the logs.
 
+## On this cluster (Neumann)
+
+Verified against the real scheduler. Values stay configurable in `.env`:
+
+```
+SCHAIN_SLURM_PARTITION=ampere
+SCHAIN_SLURM_ACCOUNT=ampere
+SCHAIN_SLURM_GRES=gpu:a100_80gb:1
+```
+
+| | |
+|---|---|
+| Smoke test | interactive `srun`, capped at 2h — the cluster allows this for debugging |
+| Production | `sbatch` batch job, default `SCHAIN_SLURM_TIME=24:00:00` |
+
+Production must not use an interactive allocation: those are capped at two hours here
+however long `--time` asks for. `./scripts/server_run.sh` submits the batch job for you,
+prints the job id and log path, and returns your terminal. No tmux is used on SLURM —
+the batch job is the detached process. Stop it with `scancel <job id>`, which
+`./scripts/server_status.sh` prints for you.
+
+Neither Docker nor root is available here, so when `NEO4J_URI` is not reachable the runner
+installs **Neo4j Community from the official tarball** into `.runtime/neo4j` (gitignored),
+on the compute node beside the pipeline — `localhost` on the login node is not the compute
+node's `localhost`. Graph data and logs live under `.runtime/neo4j/data` and `logs`, never
+in `/tmp`, and survive the run. Java 21+ must be available; the runner fails clearly if not.
+If `NEO4J_PASSWORD` is unset on the first local install, one is generated and written to
+`.env` (chmod 600) and never printed.
+
+vLLM is not preinstalled here. On the first run with a GPU present, the runner installs it
+once into the existing `.venv`, then reuses it. The first model load also downloads
+Qwen3.8-27B from Hugging Face — the log says so explicitly, so a long first start is not
+mistaken for a hang. Set `HF_HOME` to cache on shared storage.
+
 ## Notes
 
 - **APOC is not required** by the current implementation; every write is plain Cypher

@@ -81,17 +81,41 @@ tcp_open() {
     timeout "$timeout" bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null
 }
 
+# A TCP connect only proves that something is listening on the port - any unrelated
+# process holding 7687 would look like Neo4j. The reuse-or-start decision depends on this
+# answer, so confirm with the project's own driver, exactly as the pipeline will.
 neo4j_reachable() {
     local uri="$1"
-    tcp_open "$(neo4j_host "$uri")" "$(neo4j_port "$uri")" 2
+    tcp_open "$(neo4j_host "$uri")" "$(neo4j_port "$uri")" 2 || return 1
+    [ -x "$VENV_PY" ] || return 0     # cannot verify further; the port is open
+    [ -n "${SCHAIN_NEO4J_SKIP_BOLT_CHECK:-}" ] && return 0
+    # Hard timeout: the driver completes the TCP connect and then waits indefinitely for
+    # a Bolt handshake that a non-Neo4j listener never sends.
+    timeout "${SCHAIN_NEO4J_PROBE_TIMEOUT:-8}" "$VENV_PY" - "$uri" <<'NEO4JCHECK' 2>/dev/null
+import os
+import sys
+
+import neo4j
+
+try:
+    with neo4j.GraphDatabase.driver(
+        sys.argv[1],
+        auth=(os.environ.get("NEO4J_USERNAME", "neo4j"),
+              os.environ.get("NEO4J_PASSWORD", "")),
+        connection_timeout=5,
+    ) as driver:
+        driver.verify_connectivity()
+except Exception:
+    raise SystemExit(1)
+NEO4JCHECK
 }
 
 # vLLM exposes /health; any OpenAI-compatible server exposes /v1/models.
 llm_healthy() {
-    local base_url="$1" origin
+    local base_url="$1" origin timeout="${SCHAIN_HTTP_PROBE_TIMEOUT:-3}"
     origin="$(llm_origin "$base_url")"
-    curl -fsS --max-time 3 "$origin/health"    >/dev/null 2>&1 && return 0
-    curl -fsS --max-time 3 "$base_url/models"  >/dev/null 2>&1 && return 0
+    curl -fsS --max-time "$timeout" "$origin/health"   >/dev/null 2>&1 && return 0
+    curl -fsS --max-time "$timeout" "$base_url/models" >/dev/null 2>&1 && return 0
     return 1
 }
 
@@ -119,5 +143,19 @@ schain_pids() {
     done
 }
 
-in_slurm_allocation() { [ -n "${SLURM_JOB_ID:-}" ]; }
+in_slurm_allocation() {
+    # True inside srun/sbatch, and when server_run.sh re-invoked itself in a job.
+    [ -n "${SLURM_JOB_ID:-}" ] || [ -n "${SCHAIN_IN_ALLOCATION:-}" ]
+}
 slurm_available()     { have sbatch || have srun; }
+
+# Where a submitted production job records its id, so status and stop can find it.
+slurm_job_file() {
+    printf '%s' "${SCHAIN_RUNTIME_DIR:-$REPO_ROOT/.runtime}/slurm/current_job"
+}
+
+# Java major version, or empty when java is missing. Neo4j 5 needs 21 or newer.
+java_major() {
+    have java || return 0
+    java -version 2>&1 | head -1 | sed -n 's/.*version "\([0-9][0-9]*\).*/\1/p'
+}

@@ -33,7 +33,7 @@ fails immediately and names exactly what is missing.
 | `SCHAIN_SLURM_PARTITION` | `sinfo -o '%P %G %l'` — partitions with a non-null GRES can run GPU jobs; `%l` is the time limit |
 | `SCHAIN_SLURM_ACCOUNT` (only if required) | `sacctmgr show assoc where user=$USER format=account,partition,qos` |
 | `SCHAIN_SLURM_GRES` (default `gpu:1`) | the `%G` column above, e.g. `gpu:a100:2` |
-| `SCHAIN_SLURM_TIME` (default `08:00:00`) | must not exceed the partition limit from `%l` |
+| `SCHAIN_SLURM_TIME` (default `24:00:00`) | production batch limit; must not exceed the partition limit from `%l` |
 
 Put them in `.env`. Nothing is hard-coded in the scripts.
 
