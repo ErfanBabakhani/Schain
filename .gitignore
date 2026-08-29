@@ -50,6 +50,10 @@ data/external/*
 !data/external/.gitkeep
 outputs/
 
+# Runtime tooling installed by scripts/server_run.sh: local Neo4j distribution and its
+# data/logs, and generated SLURM batch files.
+.runtime/
+
 # Local Neo4j data, if a local instance/volume is used
 neo4j_data/
 .neo4j/

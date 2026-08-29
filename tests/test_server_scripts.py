@@ -27,7 +27,17 @@ LIB = SCRIPTS / "lib.sh"
 
 
 def run(args, env=None, cwd=None, timeout=180):
-    environment = {**os.environ, "SCHAIN_NO_TMUX": "1", **(env or {})}
+    environment = {
+        **os.environ,
+        "SCHAIN_NO_TMUX": "1",
+        # Point health checks at a closed port by default: no script test should depend
+        # on whatever happens to be listening on 7687 on the developer machine, and the
+        # Bolt probe would otherwise wait its full timeout on an unrelated listener.
+        "NEO4J_URI": "bolt://127.0.0.1:1",
+        "SCHAIN_NEO4J_PROBE_TIMEOUT": "2",
+        "SCHAIN_HTTP_PROBE_TIMEOUT": "1",
+        **(env or {}),
+    }
     return subprocess.run(
         args, capture_output=True, text=True, timeout=timeout,
         env=environment, cwd=str(cwd or REPO_ROOT),
@@ -146,9 +156,9 @@ def test_preflight_reports_without_leaking_secrets():
 
 
 def test_preflight_reports_the_configured_model_and_endpoint():
-    result = run([str(PREFLIGHT)])
+    result = run([str(PREFLIGHT)], env={"NEO4J_URI": "bolt://db.test:7687"})
     assert "Qwen/Qwen3.8-27B" in result.stdout
-    assert "bolt://localhost:7687" in result.stdout
+    assert "bolt://db.test:7687" in result.stdout
 
 
 def test_status_runs_and_reports_the_sections():
@@ -182,12 +192,15 @@ def test_health_checks_detect_a_live_endpoint():
         script = (
             f'source {LIB}; '
             f'llm_healthy http://127.0.0.1:{port}/v1 && echo LLM_UP; '
-            f'neo4j_reachable bolt://127.0.0.1:{port} && echo NEO4J_UP; '
+            f'tcp_open 127.0.0.1 {port} && echo PORT_OPEN; '
+            # an HTTP server is listening, but it is not Neo4j, so this must say no
+            f'neo4j_reachable bolt://127.0.0.1:{port} || echo NOT_NEO4J; '
             f'llm_healthy http://127.0.0.1:{free_port()}/v1 || echo LLM_DOWN'
         )
         result = run(["bash", "-c", script])
         assert "LLM_UP" in result.stdout
-        assert "NEO4J_UP" in result.stdout
+        assert "PORT_OPEN" in result.stdout
+        assert "NOT_NEO4J" in result.stdout
         assert "LLM_DOWN" in result.stdout
     finally:
         server.terminate()
@@ -226,7 +239,7 @@ def test_slurm_with_configuration_builds_the_allocation_command(tmp_path):
         stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         stub.chmod(0o755)
 
-    result = run([str(RUN), "--dry-run"], env={
+    result = run([str(RUN), "--dry-run", "--smoke-test"], env={
         "PATH": f"{fake_bin}:{os.environ['PATH']}",
         "SCHAIN_SLURM_PARTITION": "gpu-short",
         "SCHAIN_SLURM_ACCOUNT": "my-account",
@@ -322,7 +335,8 @@ def test_already_running_services_are_reused_and_never_stopped(tmp_path):
     try:
         config = write_temp_config(tmp_path, llm_port)
         result = run([str(RUN), "--dry-run", "--config", str(config)],
-                     env={"NEO4J_URI": f"bolt://127.0.0.1:{neo4j_port}"})
+                     env={"NEO4J_URI": f"bolt://127.0.0.1:{neo4j_port}",
+                          "SCHAIN_NEO4J_SKIP_BOLT_CHECK": "1"})
         assert result.returncode == 0, result.stderr
         output = result.stdout + result.stderr
 
@@ -365,6 +379,7 @@ def test_a_service_started_by_the_run_is_stopped_when_the_workload_finishes(tmp_
             [str(RUN), "--foreground", "--config", str(config)],
             env={
                 "NEO4J_URI": f"bolt://127.0.0.1:{neo4j_port}",
+                "SCHAIN_NEO4J_SKIP_BOLT_CHECK": "1",
                 "PATH": f"{fake_bin}:{os.environ['PATH']}",
                 "SCHAIN_VLLM_STARTUP_TIMEOUT": "40",
             },
@@ -406,3 +421,229 @@ def test_checkpoint_state_is_never_deleted_by_cleanup():
     cleanup = script[script.index("cleanup() {"):script.index("trap cleanup")]
     for destructive in ("rm ", "rm -", "unlink", "docker rm", "--restart"):
         assert destructive not in cleanup, f"cleanup must not contain {destructive!r}"
+
+
+# --- SLURM: interactive for a smoke test, batch for production -----------------------
+
+
+def fake_cluster(tmp_path, sbatch_body="#!/bin/sh\necho 'Submitted batch job 66353'\n"):
+    """A PATH where SLURM exists and nvidia-smi reports no GPU, as on a login node."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    for name in ("srun", "sinfo", "nvidia-smi"):
+        stub = fake_bin / name
+        stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        stub.chmod(0o755)
+    sbatch = fake_bin / "sbatch"
+    sbatch.write_text(sbatch_body, encoding="utf-8")
+    sbatch.chmod(0o755)
+    return fake_bin
+
+
+def cluster_env(tmp_path, **extra):
+    return {
+        "PATH": f"{fake_cluster(tmp_path)}:{os.environ['PATH']}",
+        "SCHAIN_SLURM_PARTITION": "ampere",
+        "SCHAIN_SLURM_ACCOUNT": "ampere",
+        "SCHAIN_SLURM_GRES": "gpu:a100_80gb:1",
+        "SCHAIN_RUNTIME_DIR": str(tmp_path / "runtime"),
+        # a closed port, so the health checks fail fast and deterministically instead
+        # of depending on whatever happens to hold 7687 on the developer machine
+        "NEO4J_URI": "bolt://127.0.0.1:1",
+        "SCHAIN_NEO4J_PROBE_TIMEOUT": "2",
+        **extra,
+    }
+
+
+def test_production_submits_a_batch_job_not_an_interactive_one(tmp_path):
+    """Interactive allocations are capped at 2h here, so production must use sbatch."""
+    result = run([str(RUN), "--dry-run"], env=cluster_env(tmp_path))
+    assert result.returncode == 0, result.stderr
+    output = result.stdout + result.stderr
+    assert "would run: sbatch" in output
+    assert "exec: srun" not in output
+    assert "--partition=ampere" in output and "--account=ampere" in output
+    assert "--gres=gpu:a100_80gb:1" in output
+
+
+def test_the_smoke_test_still_uses_an_interactive_allocation(tmp_path):
+    result = run([str(RUN), "--dry-run", "--smoke-test"], env=cluster_env(tmp_path))
+    assert result.returncode == 0, result.stderr
+    output = result.stdout + result.stderr
+    assert "would exec: srun" in output
+    assert "sbatch" not in output
+    assert "--time=02:00:00" in output          # within the interactive cap
+
+
+def test_production_time_limit_is_configurable_and_defaults_to_a_day(tmp_path):
+    default = run([str(RUN), "--dry-run"], env=cluster_env(tmp_path))
+    assert "--time=24:00:00" in default.stdout + default.stderr
+
+    longer = run([str(RUN), "--dry-run"],
+                 env=cluster_env(tmp_path, SCHAIN_SLURM_TIME="48:00:00"))
+    assert "--time=48:00:00" in longer.stdout + longer.stderr
+
+
+def test_the_generated_batch_file_is_complete(tmp_path):
+    """The submitted script must carry the directives and re-enter the runner in-job."""
+    env = cluster_env(tmp_path)
+    result = run([str(RUN)], env=env)          # a real submission against fake sbatch
+    assert result.returncode == 0, result.stderr
+
+    batch_files = sorted((tmp_path / "runtime" / "slurm").glob("*.sbatch"))
+    assert len(batch_files) == 1
+    body = batch_files[0].read_text(encoding="utf-8")
+
+    assert body.startswith("#!/bin/bash")
+    for directive in ("--partition=ampere", "--account=ampere",
+                      "--gres=gpu:a100_80gb:1", "--cpus-per-task=8", "--time=24:00:00"):
+        assert f"#SBATCH {directive}" in body
+    assert "#SBATCH --output=" in body and "/logs/expand_" in body
+    assert f"cd {REPO_ROOT}" in body
+    # inside the job: no tmux, no re-submission, and stdout is SLURM's to capture
+    assert "SCHAIN_NO_TMUX=1" in body and "SCHAIN_IN_ALLOCATION=1" in body
+    assert "SCHAIN_LOG_TO_STDOUT=1" in body
+    assert body.rstrip().endswith("--foreground")
+
+
+def test_submission_reports_the_job_id_and_records_it(tmp_path):
+    env = cluster_env(tmp_path)
+    result = run([str(RUN)], env=env)
+    output = result.stdout + result.stderr
+
+    assert "Submitted SChain EXPAND" in output
+    assert "SLURM job: 66353" in output
+    assert "Status:    ./scripts/server_status.sh" in output
+    assert "scancel 66353" in output
+    assert (tmp_path / "runtime" / "slurm" / "current_job").read_text().strip() == "66353"
+
+
+def test_a_failed_submission_is_reported(tmp_path):
+    env = cluster_env(tmp_path)
+    env["PATH"] = f"{fake_cluster(tmp_path, sbatch_body=chr(35) + '!/bin/sh' + chr(10) + 'echo boom >&2' + chr(10) + 'exit 1' + chr(10))}:{os.environ['PATH']}"
+    result = run([str(RUN)], env=env)
+    assert result.returncode != 0
+    assert "sbatch failed" in result.stderr
+
+
+def test_no_tmux_wrapper_is_used_on_a_slurm_cluster(tmp_path):
+    """SLURM owns the detached process; wrapping it in tmux would add nothing."""
+    result = run([str(RUN), "--dry-run"], env=cluster_env(tmp_path))
+    assert "starting in tmux session" not in result.stdout + result.stderr
+
+
+def test_inside_an_allocation_no_further_allocation_is_requested(tmp_path):
+    env = cluster_env(tmp_path, SLURM_JOB_ID="66353")
+    output = run([str(RUN), "--dry-run"], env=env).stdout
+    assert "sbatch" not in output and "would exec: srun" not in output
+    assert "-m schain expand" in output
+
+
+# --- Neo4j without Docker -------------------------------------------------------------
+
+
+def no_docker_env(tmp_path, **extra):
+    """A PATH with SLURM and without docker, matching the real cluster."""
+    fake_bin = fake_cluster(tmp_path)
+    blocker = tmp_path / "nodocker"
+    blocker.mkdir(exist_ok=True)
+    # a PATH that keeps the usual tools but hides docker
+    kept = ":".join(part for part in os.environ["PATH"].split(":") if part)
+    env = {
+        "PATH": f"{fake_bin}:{blocker}:{kept}",
+        "SCHAIN_RUNTIME_DIR": str(tmp_path / "runtime"),
+        "SCHAIN_NEO4J_PROBE_TIMEOUT": "2",
+        **extra,
+    }
+    return env
+
+
+NEEDED_TOOLS = [
+    "bash", "sh", "env", "date", "mkdir", "sed", "grep", "tr", "cut", "seq", "sleep",
+    "curl", "timeout", "cat", "wc", "head", "tail", "ls", "df", "uname", "hostname",
+    "python3", "tar", "awk", "chmod", "cp", "rm", "dirname", "basename",
+]
+
+
+def test_without_docker_the_plan_is_a_local_neo4j(tmp_path):
+    """The cluster has no Docker and no root, so the fallback is a user-space install."""
+    bin_dir = tmp_path / "curated_bin"
+    bin_dir.mkdir()
+    for tool in NEEDED_TOOLS:
+        found = shutil.which(tool)
+        if found is None:
+            pytest.skip(f"{tool} is not available, cannot build a docker-free PATH")
+        (bin_dir / tool).symlink_to(found)
+    assert shutil.which("docker", path=str(bin_dir)) is None
+
+    result = run([str(RUN), "--dry-run"],
+                 env={"PATH": str(bin_dir),
+                      "SCHAIN_RUNTIME_DIR": str(tmp_path / "runtime")})
+    output = result.stdout + result.stderr
+    assert "would install and start local Neo4j" in output
+    assert "5.26" in output          # the pinned version, not "latest"
+
+
+def test_local_neo4j_requires_a_supported_java(tmp_path):
+    """Neo4j 5 needs Java 21+; an older runtime must fail clearly, before downloading."""
+    fake_bin = tmp_path / "oldjava"
+    fake_bin.mkdir()
+    java = fake_bin / "java"
+    java.write_text('#!/bin/sh\necho \'openjdk version "11.0.20" 2023-07-18\' >&2\n',
+                    encoding="utf-8")
+    java.chmod(0o755)
+    result = run(["bash", "-c", f'source {LIB}; java_major'],
+                 env={"PATH": f"{fake_bin}:{os.environ['PATH']}"})
+    assert result.stdout.strip() == "11"
+
+    script = (REPO_ROOT / "scripts" / "server_run.sh").read_text(encoding="utf-8")
+    assert "Java 21/25 is required for local Neo4j" in script
+    assert '[ "$major" -lt 21 ]' in script
+
+
+def test_local_neo4j_keeps_data_outside_the_distribution_and_off_tmp():
+    script = (REPO_ROOT / "scripts" / "server_run.sh").read_text(encoding="utf-8")
+    assert 'server.directories.data=$data_dir' in script
+    assert 'RUNTIME_DIR/neo4j/data' in script
+    assert "/tmp" not in script          # graph data never lands in /tmp
+    # the version is pinned in one place, not resolved to "latest" per run
+    assert 'NEO4J_VERSION="${SCHAIN_NEO4J_VERSION:-' in script
+
+
+def test_a_generated_neo4j_password_is_never_printed():
+    script = (REPO_ROOT / "scripts" / "server_run.sh").read_text(encoding="utf-8")
+    assert "NEO4J_PASSWORD: generated and stored in .env" in script
+    assert "chmod 600" in script
+    # the value itself is only ever written to .env, never echoed
+    assert 'log "NEO4J_PASSWORD: $' not in script
+    assert 'echo "$NEO4J_PASSWORD"' not in script
+
+
+def test_cleanup_stops_a_local_neo4j_it_started():
+    script = (REPO_ROOT / "scripts" / "server_run.sh").read_text(encoding="utf-8")
+    cleanup = script[script.index("cleanup() {"):script.index("trap cleanup")]
+    assert '[ "$OWNED_NEO4J" = "local" ]' in cleanup
+    assert "bin/neo4j\" stop" in cleanup
+    assert "data is kept" in cleanup
+    for destructive in ("rm ", "docker rm", "--restart"):
+        assert destructive not in cleanup
+
+
+# --- vLLM installation ----------------------------------------------------------------
+
+
+def test_vllm_is_installed_once_into_the_existing_venv():
+    script = (REPO_ROOT / "scripts" / "server_run.sh").read_text(encoding="utf-8")
+    # reuse first
+    assert '[ -x "$REPO_ROOT/.venv/bin/vllm" ]' in script
+    # install into the same environment the runner checks, not a new one
+    assert '"$VENV_PY" -m pip install --quiet vllm' in script
+    # only when a GPU is actually present, and only when the endpoint is down
+    assert '[ "$VLLM_AUTO_INSTALL" = "1" ] && [ "$(gpu_count)" -ge 1 ]' in script
+
+
+def test_first_run_model_download_is_announced_not_silent():
+    script = (REPO_ROOT / "scripts" / "server_run.sh").read_text(encoding="utf-8")
+    assert "the first run downloads the model" in script
+    assert "this is not a hang" in script
+    assert 'log "HF_TOKEN: $(secret_state HF_TOKEN)"' in script   # presence only
