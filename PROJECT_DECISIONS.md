@@ -23,7 +23,10 @@ Seeds are user-configurable and may be expanded.
 
 ## 3. Boundary
 
-Tier 0 contains seed entities. Upstream discovery continues through at most Tier 3 by default. `max_tier` is configurable.
+Tier 0 contains seed entities. Upstream discovery continues through at most Tier 6 by
+default (raised from 3 for the production experiment); Tier 6 is terminal, so its entities
+and relations are stored but never searched. `max_tier` remains configurable, and smoke
+tests use a much smaller depth.
 
 Only appropriate supply-chain relations advance the tier. Generic graph edges such as location or ownership should not be counted as supply tiers.
 

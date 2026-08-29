@@ -75,14 +75,19 @@ def build_client(timeout: float = 20.0) -> httpx.AsyncClient:
     )
 
 
-async def get_json(client: httpx.AsyncClient, url: str, params: dict[str, Any]) -> Any:
+async def get_json(
+    client: httpx.AsyncClient,
+    url: str,
+    params: dict[str, Any],
+    headers: Optional[dict[str, str]] = None,
+) -> Any:
     """GET returning parsed JSON, or None when the endpoint misbehaves.
 
     Retrieval endpoints fail in ordinary ways (rate limits, HTML error pages). A provider
     returning nothing must not abort a whole expansion run.
     """
     try:
-        response = await client.get(url, params=params)
+        response = await client.get(url, params=params, headers=headers)
         response.raise_for_status()
         return response.json()
     except (httpx.HTTPError, ValueError) as error:
@@ -101,15 +106,35 @@ async def get_text(client: httpx.AsyncClient, url: str) -> Optional[str]:
         return None
 
 
-async def fetch_article_text(client: httpx.AsyncClient, url: str) -> Optional[str]:
-    """Fetch a news page and extract its article body.
+async def fetch_article_text(
+    client: httpx.AsyncClient, url: str
+) -> tuple[Optional[str], Optional[int], Optional[str]]:
+    """Fetch a page and extract its article body.
 
-    Boilerplate removal is done by trafilatura, which is the established tool for this;
-    writing an HTML-to-text extractor by hand would be reimplementing a solved problem.
+    Returns ``(text, http_status, error)``. The error is a short code the retrieval
+    manifest records - HTTP_403, TIMEOUT, PARSE_FAILED, EMPTY_CONTENT - rather than an
+    exception type, because it is written to a CSV a human reads later.
+
+    Boilerplate removal is done by trafilatura, the established tool for this; writing an
+    HTML-to-text extractor by hand would be reimplementing a solved problem.
     """
-    html = await get_text(client, url)
-    if not html:
-        return None
+    status: Optional[int] = None
+    try:
+        response = await client.get(url)
+        status = response.status_code
+        response.raise_for_status()
+        html = response.text
+    except httpx.TimeoutException:
+        logger.debug("timeout fetching %s", url)
+        return None, status, "TIMEOUT"
+    except httpx.HTTPStatusError as error:
+        code = error.response.status_code
+        logger.debug("HTTP %s fetching %s", code, url)
+        return None, code, f"HTTP_{code}"
+    except httpx.HTTPError as error:
+        logger.debug("request to %s failed: %s", url, error)
+        return None, status, "FETCH_FAILED"
+
     try:
         import trafilatura
     except ImportError as error:
@@ -119,9 +144,14 @@ async def fetch_article_text(client: httpx.AsyncClient, url: str) -> Optional[st
             "trafilatura is unavailable (%s); all retrieved documents will fall back to "
             "title and snippet. Reinstall the project dependencies.", error,
         )
-        return None
+        return None, status, "PARSE_FAILED"
+
     try:
-        return trafilatura.extract(html, include_comments=False, include_tables=False)
+        text = trafilatura.extract(html, include_comments=False, include_tables=False)
     except Exception as error:  # noqa: BLE001 - a page that will not parse is not fatal
         logger.debug("article extraction failed for %s: %s", url, error)
-        return None
+        return None, status, "PARSE_FAILED"
+
+    if not text:
+        return None, status, "EMPTY_CONTENT"
+    return text, status, None

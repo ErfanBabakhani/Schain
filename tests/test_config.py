@@ -45,19 +45,27 @@ def test_circular_include_is_reported(tmp_path):
 
 
 def test_query_limits_follow_closest_value_wins():
-    config = load_config(REPO_ROOT / "config/expansion.yaml")
+    """global defaults < tier defaults < per-query override, resolved per field."""
+    config = {"expansion": {"search": {
+        "defaults": {"max_results": 20, "providers": ["gdelt"]},
+        "tiers": {
+            0: {"defaults": {"max_results": 50},
+                "queries": [{"query": "inherits"}, {"query": "overrides", "max_results": 15}]},
+            2: {"queries": [{"query": "global"}]},
+        },
+    }}}
+    tier0 = {spec["query"]: spec for spec in resolve_tier_queries(config, 0)}
+    assert tier0["inherits"]["max_results"] == 50    # tier default
+    assert tier0["overrides"]["max_results"] == 15   # per-query override
+    assert resolve_tier_queries(config, 2)[0]["max_results"] == 20  # global default
 
-    tier0 = resolve_tier_queries(config, 0)
-    by_query = {spec["query"]: spec for spec in tier0}
-    # tier default 30 applies...
-    assert by_query['"{entity}" suppliers']["max_results"] == 30
-    # ...except where a single query overrides it
-    assert by_query['"{entity}" semiconductor suppliers']["max_results"] == 15
 
-    # tier 2 declares no defaults, so the global default applies
-    tier2 = {spec["query"]: spec for spec in resolve_tier_queries(config, 2)}
-    assert tier2['"{entity}" material suppliers']["max_results"] == 20
-    assert tier2['"{entity}" mines']["max_results"] == 40  # per-query override
+def test_a_terminal_tier_yields_no_queries():
+    config = {"expansion": {"search": {
+        "defaults": {"max_results": 20, "providers": ["gdelt"]},
+        "tiers": {6: {"expand": False}},
+    }}}
+    assert resolve_tier_queries(config, 6) == []
 
 
 def test_fields_resolve_independently(tmp_path):

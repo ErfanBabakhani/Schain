@@ -100,6 +100,11 @@ The script tracks what it started:
   `.venv/bin/python -m pip install vllm`. The script says so if it is missing.
 - Logs land in `logs/`, timestamped, e.g. `logs/expand_2026-08-29_210000.log`. vLLM gets
   its own `logs/vllm_*.log`. The path is printed when the run starts.
+- Each EXPAND run also writes `logs/retrieval_manifest_<run_id>.csv`: one row per retrieved
+  candidate, with fetch, dedup, relevance and Prompt-1 status. Use it to see why a document
+  did or did not become graph facts. A summary is printed at the end of the run.
+- Production depth is `max_tier: 6`, so a full run is large. The smoke test deliberately
+  uses `--max-tier 0 --max-documents 3`; raise the depth only after it passes.
 - **Start small.** The smoke test exists for this. Only scale up — full `max_tier`, no
   `--max-documents` — once it has passed once.
 - Some documents will be title + snippet rather than full articles, because Google News

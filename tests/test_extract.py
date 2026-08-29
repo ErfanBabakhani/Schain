@@ -210,3 +210,74 @@ def test_unknown_provider_is_reported():
 
     with pytest.raises(ValueError, match="unknown llm.provider"):
         build_llm({"llm": {"provider": "magic", "model": "m"}})
+
+
+# --- how much one document may contribute -------------------------------------------
+
+
+RICH_DOCUMENT = json.dumps({
+    "nodes": [
+        {"id": str(index), "label": label, "properties": {"name": name}}
+        for index, (label, name) in enumerate([
+            ("Company", "BMW"), ("Company", "CATL"), ("Company", "Samsung SDI"),
+            ("Company", "Ganfeng Lithium"), ("Company", "Albemarle"),
+            ("Mine", "Greenbushes"), ("Material", "lithium"), ("Material", "nickel"),
+            ("Product", "battery cell"), ("Product", "electric vehicle"),
+            ("Location", "Germany"), ("Location", "Australia"), ("Person", "Oliver Zipse"),
+        ])
+    ],
+    "relationships": [
+        {"type": "suppliesTo", "start_node_id": "1", "end_node_id": "0",
+         "properties": {"evidence": "CATL supplies BMW."}},
+        {"type": "suppliesTo", "start_node_id": "2", "end_node_id": "0",
+         "properties": {"evidence": "Samsung SDI supplies BMW."}},
+        {"type": "suppliesTo", "start_node_id": "3", "end_node_id": "1",
+         "properties": {"evidence": "Ganfeng Lithium supplies CATL."}},
+        {"type": "suppliesTo", "start_node_id": "4", "end_node_id": "1",
+         "properties": {"evidence": "Albemarle supplies CATL."}},
+        {"type": "suppliesTo", "start_node_id": "5", "end_node_id": "3",
+         "properties": {"evidence": "Greenbushes supplies Ganfeng Lithium."}},
+        {"type": "produces", "start_node_id": "1", "end_node_id": "8",
+         "properties": {"evidence": "CATL produces battery cells."}},
+        {"type": "produces", "start_node_id": "5", "end_node_id": "6",
+         "properties": {"evidence": "Greenbushes produces lithium."}},
+        {"type": "locatedIn", "start_node_id": "0", "end_node_id": "10",
+         "properties": {"evidence": "BMW is located in Germany."}},
+        {"type": "locatedIn", "start_node_id": "5", "end_node_id": "11",
+         "properties": {"evidence": "Greenbushes is located in Australia."}},
+    ],
+})
+
+
+def test_one_document_may_produce_many_entities_and_relations(ontology):
+    """There is no per-document cap: a rich document yields everything it evidences."""
+    graph, _ = extract(RICH_DOCUMENT, ontology, chunk_size=100000)
+    assert len(graph.nodes) == 13
+    assert len(graph.relationships) == 9
+    assert {node.label for node in graph.nodes} == {
+        "Company", "Location", "Material", "Mine", "Person", "Product"
+    }
+
+
+def test_a_sparse_document_yields_only_what_it_evidences(ontology):
+    """The other end of the range: two entities and one relation is equally valid."""
+    graph, _ = extract(VALID, ontology, chunk_size=100000)
+    assert len(graph.nodes) == 2 and len(graph.relationships) == 1
+
+
+def test_the_same_fact_in_two_chunks_collapses_to_one_row(ontology, ingest_config):
+    """Chunking must not inflate the graph: identical facts share a deterministic id."""
+    from schain.kg.facts import graph_to_facts
+    from schain.kg.resolve import resolve_entities
+
+    # a document long enough to split, with every chunk returning the same fact
+    document = make_document("CATL supplies battery cells to BMW AG. " * 200)
+    graph, chunk_index = extract(VALID, ontology, chunk_size=400, chunk_overlap=0)
+    assert len(chunk_index) > 1
+    assert len(graph.relationships) == len(chunk_index)   # one per chunk before dedup
+
+    resolution, _ = resolve_entities(graph, llm=None)
+    facts = graph_to_facts(graph, document, chunk_index, resolution)
+    # the facts table collapses them: same doc, same canonical endpoints, same relation
+    assert facts.fact_id.nunique() == 1
+    assert len(facts.drop_duplicates(subset="fact_id")) == 1

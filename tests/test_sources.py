@@ -7,7 +7,7 @@ import asyncio
 import httpx
 import pytest
 
-from schain.sources import gdelt, google_news, wikipedia
+from schain.sources import gdelt, general_web, google_news, wikipedia
 from schain.sources.retrieve import is_relevant, mentions_entity
 
 WIKI_SEARCH = {
@@ -279,3 +279,113 @@ def test_article_extraction_dependency_is_actually_importable():
 
     html = "<html><body><article><p>" + "BMW named a battery supplier. " * 6 + "</p></article></body></html>"
     assert trafilatura.extract(html)
+
+
+# --- general web ---------------------------------------------------------------------
+
+
+DDG_HTML = """
+<div class="result__body">
+  <a class="result__a" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fwww.bmwgroup.com%2Fsuppliers.html&rut=x">BMW Group Supplier Network</a>
+  <a class="result__snippet">Information for BMW Group suppliers and sourcing.</a>
+</div>
+<div class="result__body">
+  <a class="result__a" href="https://example.com/sustainability-report-2026">Sustainability Report 2026</a>
+  <a class="result__snippet">Supply chain due diligence and raw materials.</a>
+</div>
+"""
+
+BRAVE_JSON = {"web": {"results": [
+    {"title": "Supplier list", "url": "https://corp.test/suppliers",
+     "description": "Our tier-1 suppliers.", "page_age": "2026-01-01"},
+    {"title": "No url", "description": "dropped"},
+]}}
+
+
+def test_general_web_returns_ordinary_pages_not_news():
+    def handler(request):
+        assert "duckduckgo.com" in str(request.url)
+        return httpx.Response(200, text=DDG_HTML)
+
+    async def go():
+        async with client_for(handler) as client:
+            return await general_web.search(client, '"BMW" suppliers', 10, {})
+
+    results = run(go())
+    assert [r.url for r in results] == [
+        "https://www.bmwgroup.com/suppliers.html",
+        "https://example.com/sustainability-report-2026",
+    ]
+    assert results[0].provider == "general_web"
+    assert "sourcing" in results[0].snippet
+
+
+def test_general_web_unwraps_redirect_links():
+    from schain.sources.general_web import _clean_link
+
+    assert _clean_link("//duckduckgo.com/l/?uddg=https%3A%2F%2Fa.test%2Fx&rut=1") == "https://a.test/x"
+    assert _clean_link("https://direct.test/page") == "https://direct.test/page"
+
+
+def test_general_web_honours_the_per_query_limit():
+    def handler(request):
+        return httpx.Response(200, text=DDG_HTML)
+
+    async def go():
+        async with client_for(handler) as client:
+            return await general_web.search(client, "q", 1, {})
+
+    assert len(run(go())) == 1
+
+
+def test_brave_backend_is_used_when_a_key_is_present(monkeypatch):
+    monkeypatch.setenv("BRAVE_SEARCH_API_KEY", "test-key")
+    seen = {}
+
+    def handler(request):
+        seen["auth"] = request.headers.get("X-Subscription-Token")
+        seen["host"] = request.url.host
+        return httpx.Response(200, json=BRAVE_JSON)
+
+    async def go():
+        async with client_for(handler) as client:
+            return await general_web.search(client, "q", 10, {"backend": "brave"})
+
+    results = run(go())
+    assert seen["host"] == "api.search.brave.com"
+    assert seen["auth"] == "test-key"
+    assert [r.url for r in results] == ["https://corp.test/suppliers"]
+
+
+def test_brave_backend_without_a_key_skips_instead_of_failing(monkeypatch, caplog):
+    monkeypatch.delenv("BRAVE_SEARCH_API_KEY", raising=False)
+
+    def handler(request):
+        raise AssertionError("no request should be made without a key")
+
+    async def go():
+        async with client_for(handler) as client:
+            return await general_web.search(client, "q", 5, {"backend": "brave"})
+
+    assert run(go()) == []
+    assert "BRAVE_SEARCH_API_KEY" in caplog.text
+
+
+def test_unknown_backend_is_skipped_not_fatal(caplog):
+    async def go():
+        async with client_for(lambda r: httpx.Response(200, text="")) as client:
+            return await general_web.search(client, "q", 5, {"backend": "nonsense"})
+
+    assert run(go()) == []
+    assert "unknown general_web backend" in caplog.text
+
+
+def test_an_unparseable_results_page_is_not_fatal():
+    def handler(request):
+        return httpx.Response(200, text="not html at all <<<")
+
+    async def go():
+        async with client_for(handler) as client:
+            return await general_web.search(client, "q", 5, {})
+
+    assert run(go()) == []

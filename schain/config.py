@@ -110,7 +110,9 @@ def neo4j_is_configured() -> bool:
 # --- search limits: global defaults < tier defaults < per-query override ------------
 
 # Fields resolved independently through the hierarchy. Only these are inheritable.
-INHERITABLE_QUERY_FIELDS = ("max_results", "providers", "min_snippet_chars")
+INHERITABLE_QUERY_FIELDS = (
+    "max_results", "max_results_by_provider", "providers", "min_snippet_chars",
+)
 
 
 def resolve_tier_queries(config: dict[str, Any], tier: int) -> list[dict[str, Any]]:
@@ -121,13 +123,19 @@ def resolve_tier_queries(config: dict[str, Any], tier: int) -> list[dict[str, An
     the global default. Fields are resolved one by one, so a tier that overrides only
     ``max_results`` still inherits the global ``providers``.
 
-    ``max_results`` is a limit *per query*, not a cumulative document target.
+    ``max_results`` is a limit per provider per query, not a cumulative document
+    target. ``max_results_by_provider`` overrides it for the providers it names.
+
+    A tier marked ``expand: false`` yields no queries at all: it is terminal, so its
+    entities are stored but never searched.
     """
     search = config.get("expansion", {}).get("search", {})
     global_defaults = search.get("defaults", {}) or {}
     tiers = search.get("tiers", {}) or {}
     # YAML may key tiers as ints or strings; accept both.
     tier_config = tiers.get(tier, tiers.get(str(tier), {})) or {}
+    if tier_config.get("expand", True) is False:
+        return []
     tier_defaults = tier_config.get("defaults", {}) or {}
 
     resolved: list[dict[str, Any]] = []
@@ -141,6 +149,16 @@ def resolve_tier_queries(config: dict[str, Any], tier: int) -> list[dict[str, An
                     break
         resolved.append(spec)
     return resolved
+
+
+def query_limit(spec: dict[str, Any], provider: str) -> int:
+    """Candidate ceiling for one provider on one query.
+
+    A per-provider entry wins over the plain ``max_results``, so news providers can be
+    given a high limit while Wikipedia stays small, without duplicating every query.
+    """
+    by_provider = spec.get("max_results_by_provider") or {}
+    return int(by_provider.get(provider, spec.get("max_results", 20)))
 
 
 def seed_entities(config: dict[str, Any]) -> list[str]:

@@ -204,12 +204,44 @@ data/state/state.db                         checkpoint/resume state
 data/external/                              externally obtained datasets
 ```
 
+## Expansion depth
+
+Tier is **graph distance along `supplier --suppliesTo--> customer`**, never industrial
+role: a mining company selling directly to an OEM is Tier 1, not a deep tier. Only
+`suppliesTo` advances depth; `locatedIn`, `owns` and `produces` describe an entity without
+adding any.
+
+Production default is `max_tier: 6` — Tier 0 seeds, Tiers 1–6 successive upstream
+suppliers. **Tier 6 is terminal**: its entities and relations are stored, but it is never
+searched and nothing is promoted past it. Tiers 0–5 each have their own six query
+templates, moving from OEM language (`battery suppliers`, `semiconductor suppliers`)
+toward upstream language (`feedstock`, `concentrate`, `offtake agreement`, `mines`). Smoke
+tests use a much smaller depth; the production default is not lowered to make tests fast.
+
 ## Retrieval sources
 
-Wikipedia (MediaWiki API), GDELT (DOC 2.0 API) and Google News (RSS search). None needs
-credentials. Wikipedia is a search provider like the others: a generated query such as
-`"BMW" suppliers` goes to the search endpoint and the matching articles come back — the
-pipeline never assumes the entity's own page is the document to fetch.
+Four providers, all feeding **one** pipeline — there is no separate handling per source:
+
+| Family | Providers | Per-query candidate ceiling |
+|---|---|---|
+| News | Google News (RSS search), GDELT (DOC 2.0 API) | 50 at Tiers 0–2, 40 at Tier 3, 30 at Tiers 4–5 |
+| General web | `general_web` — company supplier/sourcing pages, press releases, investor relations, annual and sustainability reports, filings | 30 at Tiers 0–2, 25 at Tier 3, 20 at Tiers 4–5 |
+| Reference | Wikipedia (MediaWiki API) | 10 at every tier |
+
+News carries new supply agreements; the general web carries the older, more stable
+sourcing information. `general_web` defaults to a DuckDuckGo backend needing no
+credentials, and uses the official Brave Search API instead when `BRAVE_SEARCH_API_KEY` is
+set. It is optional: if it fails or is disabled, the other providers are unaffected.
+
+**Wikipedia has no special role and no "background mode".** It is a search provider like
+the others: a generated query such as `"BMW" suppliers` goes to its search endpoint and the
+matching articles come back. The pipeline never assumes the entity's own page is the
+document to fetch.
+
+Limits are ceilings on candidates **per provider, per query** — not a target number of
+relevant documents, and there is no cumulative target mechanism. Every candidate then goes
+through the same path: URL dedup → cheap title/snippet relevance check → full-text fetch
+where possible → content dedup → Prompt 1.
 
 **Known limitation.** Google News RSS returns redirect/wrapper links, so an article body
 often cannot be extracted. When that happens the document falls back to title + snippet
@@ -222,6 +254,53 @@ content_source = full_text | title_snippet | file
 visible in `data/processed/documents.parquet` and in the search-results layer. The pipeline
 is designed to work either way; extraction from a headline simply yields fewer facts. V1
 does not attempt to defeat the redirects — no scraping stack, no browser automation.
+
+## What one document may contribute
+
+There is no per-document cap on facts. Prompt 1 extracts everything the usable text
+evidences within the static ontology, so one document may yield two entities and one
+relation, or a dozen entities and several relations. Long documents are split by the
+existing chunking; after chunks are combined, repeated entities and repeated facts collapse
+(a fact id is derived from document plus canonical endpoints plus relation), and evidence
+is retained.
+
+## What V1 does to the graph, exactly
+
+After Prompt 1 and Prompt 2, four things happen and nothing else:
+
+1. **MERGE node** — on `canonical_id`. A new canonical entity is created; an existing one
+   is reused. Stable identity is preserved and properties are not blindly overwritten;
+   aliases accumulate as a union.
+2. **MERGE relationship** — a new structural relationship is created; an existing one is
+   reused. Several documents supporting the same relationship do **not** produce several
+   edges: `source_doc_ids` accumulates on the one edge.
+3. **Persist evidence** — document id, source URL, evidence text, model and retrieval
+   metadata, in the facts Parquet layer.
+4. **Expand** — an eligible new `Company` discovered through `suppliesTo` enters the
+   persistent frontier when its tier is within `max_tier`.
+
+**MERGE means "do not duplicate canonical nodes and edges". It does not mean "update the
+real world".** V1 performs no temporal updates: no supplier-status changes, no contract
+termination detection, no edge or node deletion, no relationship replacement, no periodic
+monitoring, no stale-edge checks, no existing-edge revalidation. If an older document says
+CATL supplies BMW and a newer one reports the agreement ended, V1 records both as evidence
+and changes nothing structurally. That belongs to a future monitoring version.
+
+## Retrieval audit manifest
+
+Each `EXPAND` run writes `logs/retrieval_manifest_<run_id>.csv` — one row per candidate a
+provider returned, including candidates that were deduplicated, judged irrelevant, failed
+to fetch, or never reached the LLM. Columns cover the query and provider that produced it,
+title, URL, domain, publication and retrieval time, snippet and content lengths (characters
+and words), `fetch_status`, `http_status`, `content_mode`, `dedup_status`,
+`relevance_status`, `llm_status` and a short `error` code. Article text is not copied into
+it.
+
+It is for audit and debugging only — SQLite and Parquet remain the source of truth for
+resume, and rows are keyed so a resumed run updates them instead of appending duplicates. A
+compact summary (raw candidates, unique URLs, fetch outcomes, full-text vs snippet-only,
+relevance, how many reached Prompt 1, with a per-provider and per-tier breakdown) is printed
+at the end of every run and derived from those rows.
 
 ## Inspecting the graph
 
