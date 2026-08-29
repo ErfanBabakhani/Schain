@@ -134,3 +134,81 @@ def test_writer_does_not_need_a_resolution_map():
     nodes, relationships = facts_to_graph_rows(facts_frame(), resolution=None)
     assert [n["canonical_id"] for n in nodes] == ["company:catl", "company:bmw"]
     assert relationships[0]["type"] == "suppliesTo"
+
+
+# --- exactly what V1 does to the graph after extraction ------------------------------
+
+
+def test_a_new_canonical_node_is_inserted_and_an_existing_one_is_reused():
+    """MERGE on canonical_id: first sighting creates, later ones attach to the same node."""
+    driver = RecordingDriver()
+    merge_nodes(driver, "neo4j", [node()], ["Company"])
+    query, params = driver.calls[0]
+    assert "MERGE (e:Company:Entity {canonical_id: row.canonical_id})" in query
+    assert "ON CREATE SET" in query          # first sighting only
+    assert params["rows"][0]["canonical_id"] == "company:bmw"
+    # the id is the whole identity rule: nothing else decides whether it is the same node
+    assert "MATCH" not in query and "CREATE (" not in query
+
+
+def test_a_repeated_relationship_does_not_become_a_second_edge():
+    driver = RecordingDriver()
+    merge_relationships(driver, "neo4j", [relationship(), relationship()], ["suppliesTo"])
+    query, params = driver.calls[0]
+    assert query.count("MERGE (a)-[r:suppliesTo]->(b)") == 1
+    # both rows are UNWOUND through the same MERGE, so they converge on one edge
+    assert len(params["rows"]) == 2
+    assert "UNWIND $rows AS row" in query
+
+
+def test_evidence_from_several_documents_accumulates_on_one_edge():
+    """Many documents may support one relationship; that must not fan out into edges."""
+    frame = pd.concat([
+        facts_frame(fact_id="f1", doc_id="doc-a", evidence="A says CATL supplies BMW."),
+        facts_frame(fact_id="f2", doc_id="doc-b", evidence="B says CATL supplies BMW."),
+    ], ignore_index=True)
+    nodes, relationships = facts_to_graph_rows(frame)
+
+    assert len(nodes) == 2                                   # CATL and BMW, once each
+    assert {(r["start_id"], r["type"], r["end_id"]) for r in relationships} == {
+        ("company:catl", "suppliesTo", "company:bmw")
+    }
+    driver = RecordingDriver()
+    merge_relationships(driver, "neo4j", relationships, ["suppliesTo"])
+    query, _ = driver.calls[0]
+    # provenance is a set union, so a second document adds a doc id, not an edge
+    assert "r.source_doc_ids = [d IN coalesce(r.source_doc_ids, []) " in query
+    assert "WHERE d <> row.doc_id] + [row.doc_id]" in query
+
+
+def test_the_writer_contains_no_deletion_or_temporal_logic():
+    """V1 merges structure and stores evidence. It never revises the real world."""
+    from schain.config import REPO_ROOT
+
+    source = (REPO_ROOT / "schain" / "kg" / "writer.py").read_text(encoding="utf-8")
+    upper = source.upper()
+    for forbidden in ("DELETE", "DETACH", "REMOVE ", "SET r = ", "SET e = "):
+        assert forbidden not in upper, f"writer must not contain {forbidden!r}"
+    for temporal in ("valid_from", "valid_to", "terminated", "deactivat", "superseded",
+                     "is_active", "end_date"):
+        assert temporal not in source.lower(), f"writer must not track {temporal!r}"
+
+
+def test_no_module_deletes_nodes_or_relationships():
+    """Guards the whole package against edge/node removal creeping in."""
+    from schain.config import REPO_ROOT
+
+    for path in (REPO_ROOT / "schain").rglob("*.py"):
+        text = path.read_text(encoding="utf-8").upper()
+        assert "DETACH DELETE" not in text, f"{path.name} deletes graph data"
+
+
+def test_node_properties_are_not_blindly_overwritten():
+    """A later document adds aliases; it does not reset the entity's identity."""
+    driver = RecordingDriver()
+    merge_nodes(driver, "neo4j", [node()], ["Company"])
+    query, _ = driver.calls[0]
+    assert "e.first_seen_doc_id = row.doc_id" in query      # recorded once, on create
+    assert query.count("ON CREATE SET") == 1
+    # aliases accumulate as a union rather than replacing the stored list
+    assert "[a IN coalesce(e.aliases, []) WHERE NOT a IN row.aliases]" in query

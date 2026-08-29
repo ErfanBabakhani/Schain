@@ -12,14 +12,15 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any
+from typing import Any, Optional
 
 import pandas as pd
 
 from .. import state
-from ..config import resolve_tier_queries, storage_path
+from ..config import query_limit, resolve_tier_queries, storage_path
 from ..names import normalization_key
-from . import PROVIDERS
+from . import PROVIDERS, SOURCE_TYPES
+from . import manifest as mf
 from .base import TITLE_SNIPPET, SearchResult, build_client, fetch_article_text
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,21 @@ def is_relevant(text: str, entity_name: str, relevance: dict[str, Any]) -> bool:
         lowered = text.casefold()
         return any(keyword.casefold() in lowered for keyword in keywords)
     return True
+
+
+def relevance_settings(expansion: dict[str, Any]) -> dict[str, Any]:
+    """The relevance filter settings, with the optional EV vocabulary folded in.
+
+    The vocabulary only widens this keyword list. It is never combined with entity names
+    to generate queries: the fixed tier templates stay the only query mechanism.
+    """
+    relevance = dict(expansion.get("relevance", {}) or {})
+    if relevance.get("include_vocabulary", False):
+        keywords = list(relevance.get("keywords") or [])
+        for group in (expansion.get("vocabulary") or {}).values():
+            keywords.extend(group or [])
+        relevance["keywords"] = keywords
+    return relevance
 
 
 # --- persistence -------------------------------------------------------------------
@@ -99,22 +115,49 @@ async def _run_query(
 
 
 async def _add_full_text(
-    client, semaphore: asyncio.Semaphore, results: list[SearchResult], sources: dict[str, Any]
+    client,
+    semaphore: asyncio.Semaphore,
+    results: list[SearchResult],
+    sources: dict[str, Any],
+    manifest: Optional[mf.RetrievalManifest] = None,
 ) -> None:
     """Fetch article bodies for results whose provider did not supply text."""
 
-    async def fetch(result: SearchResult) -> None:
-        if result.text or not sources.get(result.provider, {}).get("fetch_full_text", False):
-            return
-        async with semaphore:
-            result.text = await fetch_article_text(client, result.url)
-        if not result.text:
-            # Expected for Google News, whose RSS links are redirect wrappers. The
-            # document is still used, with title and snippet as its text.
-            logger.info(
-                "no article body for %s (%s); falling back to title and snippet",
-                result.url, result.provider,
+    def note(result: SearchResult, **fields: Any) -> None:
+        if manifest:
+            manifest.update(
+                manifest.key_for(result.provider, result.query, result.url), **fields
             )
+
+    async def fetch(result: SearchResult) -> None:
+        if result.text:
+            note(result, fetch_status=mf.NOT_ATTEMPTED, content_mode=mf.FULL_TEXT,
+                 content_length_chars=len(result.text),
+                 content_length_words=mf.word_count(result.text))
+            return
+        if not sources.get(result.provider, {}).get("fetch_full_text", False):
+            note(result, fetch_status=mf.NOT_ATTEMPTED,
+                 content_mode=mf.SNIPPET_ONLY if result.snippet or result.title else mf.NONE)
+            return
+
+        async with semaphore:
+            text, http_status, error = await fetch_article_text(client, result.url)
+        result.text = text
+        if text:
+            note(result, fetch_status=mf.SUCCESS, http_status=http_status or "",
+                 content_mode=mf.FULL_TEXT, content_length_chars=len(text),
+                 content_length_words=mf.word_count(text), error="")
+            return
+
+        # Expected for Google News, whose RSS links are redirect wrappers. The document
+        # is still used, with title and snippet as its text.
+        logger.info(
+            "no article body for %s (%s): %s; falling back to title and snippet",
+            result.url, result.provider, error,
+        )
+        note(result, fetch_status=mf.FAILED, http_status=http_status or "",
+             content_mode=mf.SNIPPET_ONLY if result.snippet or result.title else mf.NONE,
+             error=error or "")
 
     await asyncio.gather(*(fetch(result) for result in results))
 
@@ -125,10 +168,11 @@ async def retrieve_async(
     entity_key: str,
     tier: int,
     connection,
+    manifest: Optional[mf.RetrievalManifest] = None,
 ) -> list[SearchResult]:
     expansion = config.get("expansion", {})
     sources = expansion.get("sources", {}) or {}
-    relevance = expansion.get("relevance", {}) or {}
+    relevance = relevance_settings(expansion)
     resume = config.get("runtime", {}).get("resume", True)
     concurrency = config.get("concurrency", {})
     semaphore = asyncio.Semaphore(max(1, concurrency.get("retrieval", 8)))
@@ -148,7 +192,7 @@ async def retrieve_async(
             if resume and state.search_completed(connection, sid):
                 cached_ids.append(sid)
                 continue
-            pending.append((provider, query, spec["max_results"], options, sid))
+            pending.append((provider, query, query_limit(spec, provider), options, sid))
 
     results_path = storage_path(config, "search_results")
     fresh: list[SearchResult] = []
@@ -172,22 +216,54 @@ async def retrieve_async(
                 fresh.extend(batch)
                 state.record_search(connection, sid, entity_key, tier, provider,
                                     query, state.DONE, len(batch))
-            await _add_full_text(client, semaphore, fresh, sources)
+                if manifest:
+                    for rank, result in enumerate(batch, start=1):
+                        manifest.record_candidate(
+                            entity_name, tier, provider,
+                            SOURCE_TYPES.get(provider, ""), query, rank, result,
+                        )
+            await _add_full_text(client, semaphore, fresh, sources, manifest)
         append_search_results(fresh, results_path)
 
-    combined = load_search_results(results_path, cached_ids) + fresh
+    cached = load_search_results(results_path, cached_ids)
+    combined = cached + fresh
     if cached_ids:
         logger.info("%d query result set(s) reused from a previous run", len(cached_ids))
+        # Reused results still belong in the audit trail, and re-recording them updates
+        # the existing rows rather than adding duplicates.
+        if manifest:
+            for rank, result in enumerate(cached, start=1):
+                manifest.record_candidate(
+                    entity_name, tier, result.provider,
+                    SOURCE_TYPES.get(result.provider, ""), result.query, rank, result,
+                )
+                manifest.update(
+                    manifest.key_for(result.provider, result.query, result.url),
+                    content_mode=mf.FULL_TEXT if result.text else mf.SNIPPET_ONLY,
+                )
 
     # Deduplicate the same article surfaced by several providers or queries.
     unique: dict[str, SearchResult] = {}
     for result in combined:
-        unique.setdefault(result.url, result)
+        if result.url in unique:
+            if manifest:
+                manifest.update(
+                    manifest.key_for(result.provider, result.query, result.url),
+                    dedup_status=mf.DUPLICATE_URL,
+                )
+            continue
+        unique[result.url] = result
 
-    relevant = [
-        result for result in unique.values()
-        if is_relevant(result.document_text(), entity_name, relevance)
-    ]
+    relevant: list[SearchResult] = []
+    for result in unique.values():
+        keep = is_relevant(result.document_text(), entity_name, relevance)
+        if manifest:
+            manifest.update_by_url(
+                result.url,
+                relevance_status=mf.RELEVANT if keep else mf.IRRELEVANT,
+            )
+        if keep:
+            relevant.append(result)
     fallbacks = sum(1 for result in relevant if result.content_source == TITLE_SNIPPET)
     logger.info(
         "entity %s tier %d: %d candidate(s), %d unique, %d relevant "
@@ -204,6 +280,9 @@ def retrieve_for_entity(
     entity_key: str,
     tier: int,
     connection,
+    manifest: Optional[mf.RetrievalManifest] = None,
 ) -> list[SearchResult]:
     """Blocking wrapper around :func:`retrieve_async`."""
-    return asyncio.run(retrieve_async(config, entity_name, entity_key, tier, connection))
+    return asyncio.run(
+        retrieve_async(config, entity_name, entity_key, tier, connection, manifest)
+    )

@@ -151,7 +151,7 @@ def test_a_document_is_still_returned_when_the_body_cannot_be_fetched(
 ):
     """A failed article fetch must degrade to title+snippet, not drop the result."""
     async def no_body(client, url):
-        return None
+        return None, 403, "HTTP_403"
 
     async def headline_only(client, query, max_results, options):
         return [SearchResult(
@@ -194,3 +194,96 @@ def test_the_fallback_marker_is_persisted_with_the_search_results(
 
     frame = pd.read_parquet(two_provider_config["storage"]["search_results"])
     assert frame.iloc[0]["content_source"] == "title_snippet"
+
+
+# --- the general-web provider alongside the others -----------------------------------
+
+
+@pytest.fixture
+def mixed_source_config(expand_config):
+    """One query, all four source families, so the mix can be exercised together."""
+    expand_config["expansion"]["sources"] = {
+        "google_news": {"enabled": True}, "gdelt": {"enabled": True},
+        "general_web": {"enabled": True, "backend": "duckduckgo"},
+        "wikipedia": {"enabled": True},
+    }
+    expand_config["expansion"]["search"] = {
+        "defaults": {"max_results": 5,
+                     "providers": ["google_news", "gdelt", "general_web", "wikipedia"]},
+        "tiers": {0: {"queries": [{"query": '"{entity}" suppliers'}]}},
+    }
+    expand_config["expansion"]["relevance"] = {
+        "min_chars": 20, "require_entity_mention": True, "keywords": ["supplier"],
+    }
+    return expand_config
+
+
+def test_all_four_source_families_feed_the_same_pipeline(
+    mixed_source_config, connection, monkeypatch
+):
+    """News, general web and reference results are treated identically from here on."""
+    calls: list[str] = []
+    for name in ("google_news", "gdelt", "general_web", "wikipedia"):
+        monkeypatch.setitem(retrieve.PROVIDERS, name,
+                            provider_returning(f"https://{name}.test/1", calls, name))
+
+    results = retrieve.retrieve_for_entity(
+        mixed_source_config, "BMW", "company:bmw", 0, connection
+    )
+    assert sorted(calls) == ["gdelt", "general_web", "google_news", "wikipedia"]
+    assert {r.provider for r in results} == {"gdelt", "general_web", "google_news", "wikipedia"}
+
+
+def test_general_web_can_be_disabled_cleanly(mixed_source_config, connection, monkeypatch):
+    calls: list[str] = []
+    for name in ("google_news", "gdelt", "general_web", "wikipedia"):
+        monkeypatch.setitem(retrieve.PROVIDERS, name,
+                            provider_returning(f"https://{name}.test/1", calls, name))
+    mixed_source_config["expansion"]["sources"]["general_web"]["enabled"] = False
+
+    retrieve.retrieve_for_entity(mixed_source_config, "BMW", "company:bmw", 0, connection)
+    assert "general_web" not in calls
+    assert sorted(calls) == ["gdelt", "google_news", "wikipedia"]
+
+
+def test_a_failing_general_web_provider_does_not_block_the_others(
+    mixed_source_config, connection, monkeypatch
+):
+    """The optional general-web source must never take the run down with it."""
+    calls: list[str] = []
+    for name in ("google_news", "gdelt", "wikipedia"):
+        monkeypatch.setitem(retrieve.PROVIDERS, name,
+                            provider_returning(f"https://{name}.test/1", calls, name))
+
+    async def broken(client, query, max_results, options):
+        raise RuntimeError("general web backend is unavailable")
+
+    monkeypatch.setitem(retrieve.PROVIDERS, "general_web", broken)
+
+    results = retrieve.retrieve_for_entity(
+        mixed_source_config, "BMW", "company:bmw", 0, connection
+    )
+    assert {r.provider for r in results} == {"gdelt", "google_news", "wikipedia"}
+    sid = state.search_id("company:bmw", 0, "general_web", '"BMW" suppliers')
+    assert state.search_completed(connection, sid) is False   # so it is retried later
+
+
+def test_per_provider_limits_reach_the_providers(mixed_source_config, connection, monkeypatch):
+    """Wikipedia gets a small ceiling while news providers get a large one."""
+    seen: dict[str, int] = {}
+
+    def recorder(name):
+        async def search(client, query, max_results, options):
+            seen[name] = max_results
+            return []
+        return search
+
+    for name in ("google_news", "gdelt", "general_web", "wikipedia"):
+        monkeypatch.setitem(retrieve.PROVIDERS, name, recorder(name))
+    mixed_source_config["expansion"]["search"]["defaults"]["max_results_by_provider"] = {
+        "wikipedia": 10, "general_web": 30,
+    }
+    mixed_source_config["expansion"]["search"]["defaults"]["max_results"] = 50
+
+    retrieve.retrieve_for_entity(mixed_source_config, "BMW", "company:bmw", 0, connection)
+    assert seen == {"google_news": 50, "gdelt": 50, "general_web": 30, "wikipedia": 10}

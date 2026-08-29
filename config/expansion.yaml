@@ -29,28 +29,46 @@ seeds:
   #   - Jinchuan Group
 
 expansion:
-  # Tier 0 = seeds, Tiers 1-3 = discovered upstream suppliers. Tier 3 nodes are stored
-  # but not expanded further.
-  max_tier: 3
+  # Tier is graph distance along supplier --suppliesTo--> customer, never industrial
+  # role: a mining company selling directly to an OEM is Tier 1, not a "deep" tier.
+  # Tier 0 = seeds, Tiers 1-6 = successive upstream suppliers. Tier 6 is terminal:
+  # its entities and relations are stored, but it is never searched.
+  max_tier: 6
   # Safety stop for a run; 0 means no limit.
   max_documents: 0
 
   sources:
-    wikipedia:
-      enabled: true
-      language: en
-    gdelt:
-      enabled: true
+    # News: explicit new supply agreements.
     google_news:
       enabled: true
       language: en-US
-      # Fetch and extract the article body. With false, only title and snippet are used.
+      # Google News RSS links are redirect wrappers, so a body often cannot be fetched;
+      # such documents fall back to title + snippet.
       fetch_full_text: true
+    gdelt:
+      enabled: true
+      fetch_full_text: true
+    # General web: company supplier/sourcing pages, press releases, investor relations,
+    # annual and sustainability reports, filings. Older and more stable than news.
+    general_web:
+      enabled: true
+      # duckduckgo needs no credentials. Set backend: brave and BRAVE_SEARCH_API_KEY in
+      # .env for the official API, which is more reliable for a long run.
+      backend: duckduckgo
+      fetch_full_text: true
+    # Reference material. Wikipedia is an ordinary search provider here: queries go to
+    # its search endpoint and matching articles come back. It has no special graph role,
+    # and the pipeline never assumes "fetch this entity's own page".
+    wikipedia:
+      enabled: true
+      language: en
 
   # Cheap filter applied before any LLM call.
   relevance:
     require_entity_mention: true
     min_chars: 200
+    # Add the EV vocabulary below to these keywords.
+    include_vocabulary: true
     keywords:
       - supplier
       - suppliers
@@ -63,51 +81,110 @@ expansion:
       - agreement
       - deliver
       - raw material
-      - battery
-      - semiconductor
-      - lithium
-      - nickel
-      - cobalt
-      - mine
-      - mining
+      - offtake
+
+  # Optional EV vocabulary, used only to widen the relevance filter above. It is NOT
+  # multiplied with entity names to generate queries: the fixed tier templates remain
+  # the only query mechanism.
+  vocabulary:
+    components:
+      [battery, battery cell, battery pack, cathode, anode, electrolyte, separator,
+       semiconductor, chip, inverter, motor, e-axle, wiring harness]
+    materials:
+      [lithium, nickel, cobalt, manganese, graphite, copper, aluminum, steel, rare earth]
+    upstream:
+      [CAM, cathode active material, pCAM, precursor cathode active material, sulfate,
+       hydroxide, carbonate, concentrate, MHP, matte, refinery, refining, smelter, mine,
+       mining, extraction, ore, brine, spodumene, laterite]
 
   # Query limits use "closest value wins", resolved per field:
   #     global defaults  <  tier defaults  <  per-query override
-  # max_results is a limit PER QUERY, not a cumulative document target.
+  #
+  # max_results is a limit PER PROVIDER, PER QUERY, and is a ceiling on candidates
+  # retrieved - not a target number of relevant documents.
+  # max_results_by_provider overrides max_results for the providers it names.
   search:
     defaults:
-      max_results: 20
-      providers: [wikipedia, gdelt, google_news]
+      max_results: 30
+      providers: [google_news, gdelt, general_web, wikipedia]
+      max_results_by_provider:
+        general_web: 30
+        wikipedia: 10
 
     tiers:
       0:
         defaults:
-          max_results: 30
+          max_results: 50               # news providers
+          max_results_by_provider: {general_web: 30, wikipedia: 10}
         queries:
           - query: '"{entity}" suppliers'
           - query: '"{entity}" sourcing'
+          - query: '"{entity}" "supply agreement"'
           - query: '"{entity}" battery suppliers'
           - query: '"{entity}" semiconductor suppliers'
-            max_results: 15
+          - query: '"{entity}" raw material supply'
 
       1:
         defaults:
-          max_results: 20
+          max_results: 50
+          max_results_by_provider: {general_web: 30, wikipedia: 10}
         queries:
           - query: '"{entity}" suppliers'
+          - query: '"{entity}" sourcing'
+          - query: '"{entity}" "supply agreement"'
           - query: '"{entity}" component suppliers'
+          - query: '"{entity}" battery material suppliers'
           - query: '"{entity}" raw material suppliers'
 
       2:
+        defaults:
+          max_results: 50
+          max_results_by_provider: {general_web: 30, wikipedia: 10}
         queries:
+          - query: '"{entity}" suppliers'
+          - query: '"{entity}" sourcing'
+          - query: '"{entity}" "supply agreement"'
           - query: '"{entity}" material suppliers'
-          - query: '"{entity}" lithium suppliers'
-          - query: '"{entity}" nickel suppliers'
-          - query: '"{entity}" cobalt suppliers'
-          - query: '"{entity}" mines'
-            max_results: 40
+          - query: '"{entity}" precursor suppliers'
+          - query: '"{entity}" feedstock suppliers'
 
       3:
+        defaults:
+          max_results: 40
+          max_results_by_provider: {general_web: 25, wikipedia: 10}
         queries:
-          - query: '"{entity}" raw material sources'
+          - query: '"{entity}" suppliers'
+          - query: '"{entity}" raw material suppliers'
+          - query: '"{entity}" feedstock'
+          - query: '"{entity}" precursor'
+          - query: '"{entity}" refining'
+          - query: '"{entity}" "offtake agreement"'
+
+      4:
+        defaults:
+          max_results: 30
+          max_results_by_provider: {general_web: 20, wikipedia: 10}
+        queries:
+          - query: '"{entity}" suppliers'
+          - query: '"{entity}" feedstock suppliers'
+          - query: '"{entity}" refinery suppliers'
+          - query: '"{entity}" concentrate suppliers'
+          - query: '"{entity}" ore suppliers'
+          - query: '"{entity}" "offtake agreement"'
+
+      5:
+        defaults:
+          max_results: 30
+          max_results_by_provider: {general_web: 20, wikipedia: 10}
+        queries:
+          - query: '"{entity}" suppliers'
+          - query: '"{entity}" raw material sourcing'
+          - query: '"{entity}" mining suppliers'
           - query: '"{entity}" mines'
+          - query: '"{entity}" extraction'
+          - query: '"{entity}" "offtake agreement"'
+
+      6:
+        # Terminal tier: Tier-6 entities and their relations are stored, but no search
+        # is performed for them and nothing is promoted to Tier 7.
+        expand: false

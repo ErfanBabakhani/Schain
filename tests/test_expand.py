@@ -30,7 +30,7 @@ def fake_retrieval(monkeypatch):
     """Replace retrieval with one fixed document, so no network is touched."""
     calls: list[tuple[str, int]] = []
 
-    def fake(config, entity_name, entity_key, tier, connection):
+    def fake(config, entity_name, entity_key, tier, connection, manifest=None):
         calls.append((entity_name, tier))
         return [
             SearchResult(
@@ -199,7 +199,7 @@ def test_headline_only_documents_are_ingested_and_marked_as_such(
     single_seed_config, connection, ontology, monkeypatch
 ):
     """EXPAND must keep working when a provider yields only a title and snippet."""
-    def fake(config, entity_name, entity_key, tier, connection):
+    def fake(config, entity_name, entity_key, tier, connection, manifest=None):
         return [SearchResult(
             provider="google_news", query="q",
             title=f"{entity_name} names CATL as battery supplier",
@@ -223,3 +223,68 @@ def test_ingested_files_are_marked_as_file_sourced(
 
     record = load_document(document_file)
     assert record["content_source"] == "file"
+
+
+# --- depth 6 and what determines a tier ---------------------------------------------
+
+
+def test_tier_six_entities_are_stored_but_never_searched(
+    single_seed_config, connection, ontology, fake_retrieval
+):
+    """Terminal tier: it may sit in the frontier, but it generates no queries."""
+    from schain.expansion.queries import generate_queries
+
+    single_seed_config["expansion"]["max_tier"] = 6
+    assert generate_queries(single_seed_config, "Deep Mine Co", 6) == []
+
+    # a Tier-6 company is recorded with its tier...
+    state.enqueue_entity(connection, "Deep Mine Co", 6)
+    assert state.frontier_tier_counts(connection)[6] == 1
+    # ...and expanding it promotes nothing to Tier 7
+    assert discover_upstream(
+        connection, single_seed_config, ontology, "Deep Mine Co", "company:deep-mine-co",
+        6, facts_frame(),
+    ) == []
+    assert 7 not in state.frontier_tier_counts(connection)
+
+
+def test_a_tier_five_supplier_is_promoted_to_tier_six(
+    single_seed_config, connection, ontology
+):
+    single_seed_config["expansion"]["max_tier"] = 6
+    facts = facts_frame()
+    facts.loc[0, "object_id"] = "company:midstream-refining"
+    added = discover_upstream(
+        connection, single_seed_config, ontology, "Midstream Refining",
+        "company:midstream-refining", 5, facts,
+    )
+    assert added == ["Contemporary Amperex Technology Co. Limited"]
+    assert state.frontier_tier_counts(connection) == {6: 1}
+
+
+def test_tier_is_graph_distance_not_industrial_role(
+    single_seed_config, connection, ontology
+):
+    """A mining company supplying an OEM directly is Tier 1, not a deep tier."""
+    single_seed_config["expansion"]["max_tier"] = 6
+    facts = facts_frame()
+    facts.loc[0, "subject_id"] = "company:zijin-mining"
+    facts.loc[0, "subject_name"] = "Zijin Mining"
+
+    added = discover_upstream(
+        connection, single_seed_config, ontology, "BMW", "company:bmw", 0, facts
+    )
+    assert added == ["Zijin Mining"]
+    assert state.frontier_tier_counts(connection) == {1: 1}
+
+
+def test_a_deep_tier_still_advances_only_through_supplies_to(
+    single_seed_config, connection, ontology
+):
+    single_seed_config["expansion"]["max_tier"] = 6
+    facts = facts_frame(relation="owns")
+    facts.loc[0, "object_id"] = "company:midstream-refining"
+    assert discover_upstream(
+        connection, single_seed_config, ontology, "Midstream Refining",
+        "company:midstream-refining", 4, facts,
+    ) == []
