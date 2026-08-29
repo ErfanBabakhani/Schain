@@ -70,17 +70,25 @@ laptop cannot serve Qwen3.8-27B (4 GB VRAM against roughly 54 GB needed in bf16)
 Neo4j instance, so the real model, the real database and any end-to-end run belong to the
 server phase.
 
-The intended future steps, in order:
+`scripts/server_run.sh` performs the intended steps in one command: install
+dependencies, validate configuration, start or reuse Neo4j, start or reuse vLLM, wait for
+both to be healthy, then run the pipeline and shut down only what it started.
 
-1. install dependencies (as above);
-2. configure `.env`;
-3. start or connect Neo4j;
-4. start vLLM with Qwen3.8-27B and point `llm.base_url` at it;
-5. run a small real INGEST;
-6. run a small real EXPAND.
+```bash
+git pull
+./scripts/server_run.sh --smoke-test    # tiny real run first
+./scripts/server_run.sh                 # then the full EXPAND
+```
 
-[docs/SERVER_HANDOFF.md](docs/SERVER_HANDOFF.md) is the checklist for doing this, including
-the exact commands, the integration-test flags, and the first verification steps.
+| Script | Purpose |
+|---|---|
+| `scripts/server_run.sh` | the one command above; `--help` documents the modes and flags |
+| `scripts/server_preflight.sh` | read-only environment report (secrets shown as set/not set) |
+| `scripts/server_status.sh` | run status, service health, checkpoint counts, recent log |
+
+[docs/SERVER_HANDOFF.md](docs/SERVER_HANDOFF.md) is the checklist, and
+[docs/SERVER_REQUIRED_INFO.md](docs/SERVER_REQUIRED_INFO.md) lists the few values that
+cannot be auto-detected.
 
 ### Environment variables
 
