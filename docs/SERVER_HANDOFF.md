@@ -1,124 +1,122 @@
-# Server handoff checklist
+# Server handoff
 
-For moving V1 to the GPU server. **None of the steps below have been executed yet** — the
-laptop cannot run Qwen3.8-27B (4 GB VRAM) and has no Neo4j instance, so everything in this
-file is still to be done.
+For moving V1 to the GPU server. **None of this has been executed yet** — the development
+laptop cannot serve Qwen3.8-27B (4 GB VRAM) and has no Neo4j, so the real model, the real
+database and any end-to-end run belong to the server phase.
 
-## 1. Clone
+## First run
 
 ```bash
-git clone git@github.com:ErfanBabakhani/SChain.git
+git clone git@github.com:ErfanBabakhani/SChain.git    # or: git pull
 cd SChain
+cp .env.example .env          # then set NEO4J_PASSWORD; see below for the rest
+./scripts/server_run.sh --smoke-test
 ```
 
-## 2. Python environment
-
-Python 3.10–3.14.
+The smoke test is a tiny real run — one tier, three documents, the normal pipeline code,
+the real LLM and the real Neo4j. If it passes, do the full run:
 
 ```bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -e ".[dev]"
+./scripts/server_run.sh
 ```
 
-## 3. Environment variables
+Everything else is automatic: the script creates `.venv` and installs the project if
+needed, reads the model and endpoint from `config/base.yaml`, starts Neo4j and vLLM if
+they are not already up, waits for both to be healthy, and then launches
+`python -m schain expand`.
+
+### What you must set in `.env`
+
+Only `NEO4J_PASSWORD`, unless one of these applies:
+
+- the cluster uses SLURM and no GPU is visible in your shell → `SCHAIN_SLURM_PARTITION`
+  (and possibly `SCHAIN_SLURM_ACCOUNT`);
+- the model weights are gated → `HF_TOKEN`;
+- you want the weights cached on a shared filesystem → `HF_HOME`.
+
+The script tells you exactly which value is missing and how to discover it. See
+[SERVER_REQUIRED_INFO.md](SERVER_REQUIRED_INFO.md). Every other `SCHAIN_*` setting in
+`.env.example` is optional and has a working default.
+
+If `.env` already exists, leave it alone — `cp` would overwrite it.
+
+## Normal later run
 
 ```bash
-cp .env.example .env
+git pull
+./scripts/server_run.sh
 ```
 
-| Variable | Required | Notes |
-|---|---|---|
-| `NEO4J_URI` | yes | e.g. `bolt://localhost:7687` |
-| `NEO4J_USERNAME` | yes | e.g. `neo4j` |
-| `NEO4J_PASSWORD` | yes | omit only when running with `--no-neo4j` |
-| `LLM_API_BASE_URL` | no | overrides `llm.base_url` in `config/base.yaml` |
-| `LLM_API_KEY` | no | only for `llm.provider: api`; vLLM ignores the value |
+Resume is the default, so this continues from the SQLite checkpoint rather than starting
+over. Re-running after any interruption is always safe.
 
-The retrieval providers (Wikipedia, GDELT, Google News) need no credentials.
+## Commands
 
-## 4. Neo4j
-
-Any Neo4j 5.x. **APOC is not required by the current implementation** — every write is
-plain Cypher `MERGE`, one statement per ontology label and relation type. The pipeline
-creates its own `Entity.canonical_id` uniqueness constraint on startup.
-
-```bash
-docker run -d --name schain-neo4j -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/CHANGE_ME -v "$PWD/neo4j_data:/data" neo4j:5
-```
-
-## 5. vLLM with Qwen3.8-27B
-
-```bash
-vllm serve Qwen/Qwen3.8-27B --served-model-name Qwen/Qwen3.8-27B --max-model-len 16384 --port 8000
-```
-
-Add `--tensor-parallel-size N` for multiple GPUs. Point `llm.base_url` in
-`config/base.yaml` (or `LLM_API_BASE_URL`) at the host serving it. Instruct/non-thinking
-behaviour needs no server flag: the pipeline sends
-`chat_template_kwargs: {"enable_thinking": false}` with every request.
-
-## 6. Smoke tests — start very small
-
-Do these before any large run. A first run on a big corpus or a full expansion will spend
-a lot of GPU time before any mistake becomes visible.
-
-INGEST, one small document (the architecture brief is a convenient real PDF):
-
-```bash
-.venv/bin/python -m schain ingest --config config/ingest.yaml --input docs/SupplyChain_KG_V1_Architecture_Brief_Final.pdf
-```
-
-EXPAND, deliberately tiny — one tier, a handful of documents:
-
-```bash
-.venv/bin/python -m schain expand --config config/expansion.yaml --max-tier 0 --max-documents 3
-```
-
-Only after both look right should you raise `--max-tier` toward the default of 3 and remove
-`--max-documents`.
-
-## 7. Integration tests
-
-They skip unless their service is configured, so run them explicitly once the stack is up:
-
-```bash
-NEO4J_PASSWORD=... SCHAIN_RUN_LLM_TESTS=1 SCHAIN_RUN_NETWORK_TESTS=1 .venv/bin/python -m pytest tests/test_integration.py -v
-```
-
-| Flag / variable | Enables |
+| Task | Command |
 |---|---|
-| `NEO4J_PASSWORD` | live `MERGE` idempotency check against the database |
-| `SCHAIN_RUN_LLM_TESTS=1` | Prompt 1 and Prompt 2 against the real model |
-| `SCHAIN_RUN_NETWORK_TESTS=1` | live queries to the public retrieval APIs |
+| Full EXPAND run | `./scripts/server_run.sh` |
+| INGEST documents | `./scripts/server_run.sh ingest path/to/docs` |
+| Smoke test first | `./scripts/server_run.sh --smoke-test` |
+| Status | `./scripts/server_status.sh` |
+| Environment report only | `./scripts/server_preflight.sh` |
+| Attach to a running run | `tmux attach -t schain` |
+| Detach again | `Ctrl-b` then `d` |
+| Follow the log instead | `tail -f logs/expand_*.log` |
+| Stop a run | `tmux kill-session -t schain` |
+| See the plan without doing anything | `./scripts/server_run.sh --dry-run` |
+| Deliberate fresh start | `./scripts/server_run.sh --restart` |
 
-## 8. First verification steps, in order
+`--restart` clears the checkpoint state and the generated data layers under `data/`. It
+does **not** touch Neo4j: the writes are idempotent `MERGE`, so a rerun converges on the
+same graph. Nothing else ever deletes state.
 
-1. `.venv/bin/python -m pytest tests -q` — the offline suite should pass unchanged.
-2. `python -m schain ingest --help` and `--no-neo4j` on one document — confirms config and
-   the data layers before any external service is involved.
-3. Bring up Neo4j, then run `tests/test_integration.py` with `NEO4J_PASSWORD` set — proves
-   `MERGE` is idempotent on the real database.
-4. Bring up vLLM, then re-run with `SCHAIN_RUN_LLM_TESTS=1` — proves both prompts behave
-   against the real model, and that non-thinking mode is accepted.
-5. Run the small INGEST smoke test end to end, and inspect the graph in Neo4j Browser:
+## What survives what
+
+| Situation | Result |
+|---|---|
+| SSH disconnects | The run continues: it lives in a tmux session, not your shell. Reconnect and `tmux attach -t schain`. |
+| The pipeline crashes | Owned services are shut down and the checkpoint is intact. Re-run `./scripts/server_run.sh` to resume. |
+| The server reboots | tmux is gone, `data/state/state.db` is not. Re-run `./scripts/server_run.sh` to resume. |
+| The run finishes | Services this run started are stopped; the GPU is released. |
+
+## What gets shut down, and what does not
+
+The script tracks what it started:
+
+- **Started by the run** → stopped when the workload finishes: vLLM (so a 27B model does
+  not sit on the GPU), and the Neo4j container if the script created or started it. Under
+  SLURM, the script exits, `srun` returns, and the allocation is released — no idle job is
+  left behind.
+- **Already running beforehand** → reused and never stopped. If Neo4j or an OpenAI-compatible
+  endpoint is already up, the script says so and leaves it alone.
+- **Never touched** → `data/state/state.db`, the Parquet layers, the Neo4j data directory,
+  and the logs.
+
+## Notes
+
+- **APOC is not required** by the current implementation; every write is plain Cypher
+  `MERGE`. The container the script starts does not install it.
+- **vLLM is not installed automatically.** It is large and GPU-specific. On the server:
+  `.venv/bin/python -m pip install vllm`. The script says so if it is missing.
+- Logs land in `logs/`, timestamped, e.g. `logs/expand_2026-08-29_210000.log`. vLLM gets
+  its own `logs/vllm_*.log`. The path is printed when the run starts.
+- **Start small.** The smoke test exists for this. Only scale up — full `max_tier`, no
+  `--max-documents` — once it has passed once.
+- Some documents will be title + snippet rather than full articles, because Google News
+  RSS links are redirect wrappers. Each document records which it was in
+  `content_source`.
+
+## Verification order on the first day
+
+1. `./scripts/server_preflight.sh` — check what the machine offers before anything runs.
+2. `.venv/bin/python -m pytest tests -q` — the offline suite should pass unchanged.
+3. `NEO4J_PASSWORD=... .venv/bin/python -m pytest tests/test_integration.py -v` — proves
+   `MERGE` is idempotent against the real database.
+4. `SCHAIN_RUN_LLM_TESTS=1 .venv/bin/python -m pytest tests/test_integration.py -v` —
+   proves both prompts behave against the real model.
+5. `./scripts/server_run.sh --smoke-test`.
+6. Inspect the graph in Neo4j Browser:
    ```cypher
    MATCH (s:Company)-[r:suppliesTo]->(c:Company) RETURN s.name, c.name, r.evidence LIMIT 25;
    ```
-6. Run the tiny EXPAND smoke test, then check the frontier advanced by tier:
-   ```bash
-   sqlite3 data/state/state.db "SELECT tier, status, COUNT(*) FROM frontier GROUP BY tier, status;"
-   ```
-7. Re-run the same command once more: it should do almost nothing (resume is the default)
-   and must not create duplicate nodes.
-8. Only then scale up.
-
-## 9. Things to expect
-
-- Google News RSS links are redirect wrappers, so some documents will be title + snippet
-  rather than full article bodies. This is recorded per document as
-  `content_source = title_snippet` in `data/processed/documents.parquet`, and the pipeline
-  is designed to work either way.
-- `llm.structured_output` is off by default. vLLM has a grammar backend, so it can be
-  turned on in `config/base.yaml` if Prompt 1 output needs tighter constraint.
-- Concurrency defaults (`concurrency.retrieval: 8`, `llm_max_concurrency: 4`) are untuned
-  guesses; tuning them belongs on the real GPU server.
+7. `./scripts/server_run.sh` for the full run, then `./scripts/server_status.sh` to watch it.
