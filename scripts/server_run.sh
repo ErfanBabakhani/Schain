@@ -165,17 +165,62 @@ fi
 # --- 3. virtual environment ---------------------------------------------------------
 
 STAMP="$REPO_ROOT/.venv/.schain-install-stamp"
+
+bootstrap_venv_pip() {
+    if "$VENV_PY" -m pip --version >/dev/null 2>&1; then
+        return 0
+    fi
+    log "bootstrapping pip in .venv"
+    if "$VENV_PY" - <<'PY' 2>/dev/null; then
+import ensurepip
+ensurepip.bootstrap()
+PY
+        :
+    elif have curl; then
+        local get_pip
+        mkdir -p "${REPO_ROOT}/.runtime"
+        get_pip="$(mktemp "${REPO_ROOT}/.runtime/get-pip.XXXXXX")"
+        curl -fsSL https://bootstrap.pypa.io/get-pip.py -o "$get_pip" \
+            || die "could not download get-pip.py to bootstrap pip"
+        "$VENV_PY" "$get_pip" --quiet || die "get-pip failed"
+        rm -f "$get_pip"
+    else
+        die "pip is missing from .venv and curl is unavailable to bootstrap it"
+    fi
+    "$VENV_PY" -m pip --version >/dev/null 2>&1 || die "pip is still unavailable in .venv"
+}
+
+create_venv() {
+    log "creating .venv"
+    rm -rf "$REPO_ROOT/.venv"
+    if python3 -m venv "$REPO_ROOT/.venv" 2>/dev/null; then
+        :
+    else
+        warn "standard venv creation failed; trying without bundled pip"
+        python3 -m venv --without-pip "$REPO_ROOT/.venv" || die "could not create .venv"
+        bootstrap_venv_pip
+    fi
+    "$VENV_PY" -m pip install --quiet --upgrade pip || die "could not upgrade pip in .venv"
+}
+
 ensure_venv() {
-    if [ ! -x "$VENV_PY" ]; then
-        log "creating .venv"
-        [ "$DRY_RUN" -eq 1 ] && { echo "  would run: python3 -m venv .venv && .venv/bin/python -m pip install -e ."; return; }
-        python3 -m venv "$REPO_ROOT/.venv" || die "could not create .venv"
-        "$VENV_PY" -m pip install --quiet --upgrade pip
+    if ! venv_usable; then
+        if [ -d "$REPO_ROOT/.venv" ]; then
+            log "incomplete .venv detected; recreating it"
+        fi
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "  would run: python3 -m venv .venv && .venv/bin/python -m pip install -e ."
+            return
+        fi
+        create_venv
     fi
     # Reinstall only when the dependency declaration is newer than the last install.
     if [ ! -f "$STAMP" ] || [ "$REPO_ROOT/pyproject.toml" -nt "$STAMP" ]; then
         log "installing/updating project dependencies (pyproject.toml changed)"
-        [ "$DRY_RUN" -eq 1 ] && { echo "  would run: .venv/bin/python -m pip install -e ."; return; }
+        if [ "$DRY_RUN" -eq 1 ]; then
+            echo "  would run: .venv/bin/python -m pip install -e ."
+            return
+        fi
         "$VENV_PY" -m pip install --quiet -e "$REPO_ROOT" || die "pip install failed"
         touch "$STAMP"
     else
@@ -185,17 +230,11 @@ ensure_venv() {
 ensure_venv
 
 # Configuration comes from the project's own loader, so it cannot drift from the app.
-if [ "$DRY_RUN" -eq 1 ] && [ ! -x "$VENV_PY" ]; then
-    CFG_LLM_BASE_URL="http://localhost:8000/v1"; CFG_NEO4J_URI="bolt://localhost:7687"
-    CFG_LLM_MODEL="(unknown until .venv exists)"; CFG_NEO4J_DATABASE="neo4j"
-else
-    # Capture first: eval of an empty string would succeed and leave variables unset.
-    if ! CONFIG_OUTPUT="$(config_values "$CONFIG_FILE" 2>&1)"; then
-        die "could not read $CONFIG_FILE:
+if ! CONFIG_OUTPUT="$(config_values "$CONFIG_FILE" 2>&1)"; then
+    die "could not read $CONFIG_FILE:
 $CONFIG_OUTPUT"
-    fi
-    eval "$CONFIG_OUTPUT"
 fi
+eval "$CONFIG_OUTPUT"
 
 LOG_DIR="$REPO_ROOT/logs"
 mkdir -p "$LOG_DIR"

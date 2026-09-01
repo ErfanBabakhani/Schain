@@ -1,0 +1,21 @@
+# Colab INGEST: local vLLM on 127.0.0.1:8000 (T4 / Qwen3-4B).
+#
+# Inherits everything from config/ingest.yaml (which already includes config/base.yaml).
+# Override only the LLM settings that differ from the server-default 27B model.
+#
+#   python -m schain ingest \
+#       --config config/colab_ingest.yaml \
+#       --input data/corpus \
+#       --no-neo4j \
+#       --restart
+#
+# Environment (optional if base_url is set below):
+#   LLM_API_BASE_URL=http://127.0.0.1:8000/v1
+#   LLM_API_KEY=EMPTY
+
+include:
+  - config/ingest.yaml
+
+llm:
+  model: Qwen/Qwen3-4B-Instruct-2507
+  base_url: http://127.0.0.1:8000/v1
