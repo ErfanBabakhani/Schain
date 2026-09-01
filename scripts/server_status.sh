@@ -44,12 +44,12 @@ fi
 
 echo
 echo "== services =="
-if [ -x "$VENV_PY" ] && values="$(config_values "$CONFIG_FILE" 2>/dev/null)"; then
+if values="$(config_values "$CONFIG_FILE" 2>/dev/null)"; then
     eval "$values"
     item "neo4j" "$(neo4j_reachable "$CFG_NEO4J_URI" && echo "reachable ($CFG_NEO4J_URI)" || echo "not reachable ($CFG_NEO4J_URI)")"
     item "llm endpoint" "$(llm_healthy "$CFG_LLM_BASE_URL" && echo "healthy ($CFG_LLM_BASE_URL)" || echo "not healthy ($CFG_LLM_BASE_URL)")"
 else
-    item "config" "not readable (.venv missing?)"
+    item "config" "not readable (PyYAML missing or config error)"
 fi
 if have docker; then
     container="${SCHAIN_NEO4J_CONTAINER:-schain-neo4j}"
