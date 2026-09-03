@@ -1,21 +1,24 @@
-# Colab INGEST: local vLLM on 127.0.0.1:8000 (T4 / Qwen3-4B).
+# Colab INGEST against a local OpenAI-compatible vLLM endpoint.
 #
-# Inherits everything from config/ingest.yaml (which already includes config/base.yaml).
-# Override only the LLM settings that differ from the server-default 27B model.
+# Inherits config/ingest.yaml (and through it config/base.yaml): ontology, storage,
+# runtime, chunking, concurrency, json_mode, structured_output, etc.
+# Override only the model identity for the T4-sized Colab checkpoint.
+#
+# Endpoint and API key come from the environment (preferred over hardcoding here):
+#   export LLM_API_BASE_URL=http://127.0.0.1:8000/v1
+#   export LLM_API_KEY=EMPTY
 #
 #   python -m schain ingest \
 #       --config config/colab_ingest.yaml \
 #       --input data/corpus \
 #       --no-neo4j \
 #       --restart
-#
-# Environment (optional if base_url is set below):
-#   LLM_API_BASE_URL=http://127.0.0.1:8000/v1
-#   LLM_API_KEY=EMPTY
 
 include:
   - config/ingest.yaml
 
 llm:
+  provider: local
   model: Qwen/Qwen3-4B-Instruct-2507
-  base_url: http://127.0.0.1:8000/v1
+  # Clear the base.yaml default so LLM_API_BASE_URL from the environment is used.
+  base_url: null
