@@ -7,9 +7,10 @@ Three concerns are kept apart:
 * ``config/ontology.yaml`` the static ontology, so the entity and relation types are
   stated in one place rather than in the code.
 
-A config file may list ``include:`` paths. Those are loaded first and the including
-file's own keys are merged over them, so ``config/ingest.yaml`` and
-``config/expansion.yaml`` share one copy of the LLM, Neo4j and storage settings.
+A config file may list ``include:`` paths (a single path string or a YAML list).
+Those are loaded first and the including file's own keys are merged over them, so
+``config/ingest.yaml`` and ``config/expansion.yaml`` share one copy of the LLM, Neo4j
+and storage settings.
 """
 
 from __future__ import annotations
@@ -52,6 +53,31 @@ def resolve_path(value: str | Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
+def _normalize_includes(value: Any) -> list[str]:
+    """Normalize ``include:`` to a list of path strings.
+
+    YAML accepts either a single path or a list. A bare string must not be iterated as
+    characters (``include: ingest.yaml`` would otherwise try to open ``i``, ``n``, …).
+    """
+    if value is None or value == [] or value == "":
+        return []
+    if isinstance(value, Path):
+        return [str(value)]
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        paths: list[str] = []
+        for entry in value:
+            if isinstance(entry, (str, Path)):
+                paths.append(str(entry))
+            else:
+                raise ValueError(
+                    "include must be a path string or a list of path strings"
+                )
+        return paths
+    raise ValueError("include must be a path string or a list of path strings")
+
+
 def load_config(path: str | Path, _seen: Optional[set[Path]] = None) -> dict[str, Any]:
     """Read a YAML config, apply its ``include:`` chain, and load .env into the environment."""
     load_dotenv(REPO_ROOT / ".env")  # does nothing if .env is absent
@@ -63,7 +89,7 @@ def load_config(path: str | Path, _seen: Optional[set[Path]] = None) -> dict[str
     seen.add(path)
 
     raw = _read_yaml(path)
-    includes = raw.pop("include", []) or []
+    includes = _normalize_includes(raw.pop("include", None))
     config: dict[str, Any] = {}
     for included in includes:
         config = _deep_merge(config, load_config(included, seen))
