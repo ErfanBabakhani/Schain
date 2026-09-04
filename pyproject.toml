@@ -25,6 +25,10 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+# Visualization renders self-contained HTML with vis-network (CDN) and needs no
+# extra Python packages beyond the core dependencies. The extra exists so notebooks
+# and docs can say: pip install -e ".[viz]"
+viz = []
 
 [project.scripts]
 schain = "schain.__main__:main"

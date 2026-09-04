@@ -48,6 +48,8 @@ data/processed/*
 !data/processed/.gitkeep
 data/external/*
 !data/external/.gitkeep
+data/visualizations/*
+!data/visualizations/.gitkeep
 outputs/
 
 # Runtime tooling installed by scripts/server_run.sh: local Neo4j distribution and its
