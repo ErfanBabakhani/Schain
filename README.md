@@ -202,7 +202,25 @@ data/processed/entity_resolution.parquet    Prompt 2 results
 data/processed/search_results.parquet       retrieval results per query
 data/state/state.db                         checkpoint/resume state
 data/external/                              externally obtained datasets
+outputs/supply_chain_graph.v1.json          derived frontend-ready semantic graph
 ```
+
+## Frontend-ready graph export
+
+After a successful `ingest` or `expand` run, SChain writes a **semantic** graph bundle to
+`outputs/supply_chain_graph.v1.json` (configurable via `storage.graph_export`). The file is
+plain UTF-8 JSON: nodes, aggregated edges, evidence, document provenance, ontology, and
+statistics. It is **not** a visualization — no coordinates, colours, HTML, or layout.
+
+Regenerate without repeating LLM calls:
+
+```bash
+.venv/bin/python -m schain export --config config/ingest.yaml
+.venv/bin/python -m schain export --config config/expansion.yaml --output outputs/demo_graph.json
+```
+
+A separate frontend may consume this bundle for 2D/3D rendering, filters, and evidence
+panels. The Parquet / SQLite layers remain the source of truth; the JSON is derived.
 
 ## Expansion depth
 

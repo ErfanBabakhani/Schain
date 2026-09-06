@@ -53,7 +53,7 @@ def run_cli(*args):
 
 def test_the_three_modes_exist():
     parser = build_parser()
-    for mode in ("ingest", "expand", "validate"):
+    for mode in ("ingest", "expand", "validate", "export"):
         assert parser.parse_args([mode]).mode == mode
 
 
@@ -82,6 +82,8 @@ def test_ingest_runs_and_reports(cli_config, corpus, llms, capsys):
     assert summary["documents_processed"] == 1
     assert summary["facts"] == 3
     assert llms[0].extraction_calls == 1
+    assert "graph_export" in summary
+    assert Path(summary["graph_export"]).is_file()
 
 
 def test_resume_is_the_default(cli_config, corpus, llms, ingest_config):
@@ -96,6 +98,9 @@ def test_resume_is_the_default(cli_config, corpus, llms, ingest_config):
 
 def test_restart_recomputes_from_scratch(cli_config, corpus, llms, ingest_config):
     run_cli("ingest", "--config", str(cli_config), "--input", str(corpus), "--no-neo4j")
+    export_path = Path(ingest_config["storage"]["graph_export"])
+    assert export_path.exists()
+    export_path.write_text("stale", encoding="utf-8")
 
     run_cli("ingest", "--config", str(cli_config), "--input", str(corpus),
             "--no-neo4j", "--restart")
@@ -104,6 +109,9 @@ def test_restart_recomputes_from_scratch(cli_config, corpus, llms, ingest_config
     # and the facts were rebuilt rather than duplicated
     facts = pd.read_parquet(ingest_config["storage"]["extracted_facts"])
     assert len(facts) == 3 and facts.fact_id.is_unique
+    # restart removed the stale export, then the successful run rewrote it
+    assert export_path.exists()
+    assert export_path.read_text(encoding="utf-8") != "stale"
 
 
 def test_restart_clears_the_state_database(cli_config, corpus, llms, ingest_config):
@@ -165,3 +173,67 @@ def test_validate_reports_coverage(cli_config, corpus, llms, tmp_path, capsys):
 def test_validate_without_a_reference_explains_what_to_do(cli_config, caplog):
     assert run_cli("validate", "--config", str(cli_config)) == 1
     assert "EXTERNAL_DATASETS.md" in caplog.text
+
+
+# --- export ------------------------------------------------------------------------
+
+
+def test_standalone_export_does_not_invoke_the_llm(cli_config, corpus, llms, monkeypatch, capsys):
+    run_cli("ingest", "--config", str(cli_config), "--input", str(corpus), "--no-neo4j")
+    capsys.readouterr()
+    calls_before = len(llms)
+
+    def refuse(config):
+        raise AssertionError("export must not build an LLM")
+
+    monkeypatch.setattr("schain.__main__.build_llm", refuse)
+    assert run_cli("export", "--config", str(cli_config)) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert Path(report["graph_export"]).is_file()
+    assert len(llms) == calls_before
+
+
+def test_standalone_export_does_not_open_neo4j(cli_config, corpus, llms, monkeypatch, capsys):
+    run_cli("ingest", "--config", str(cli_config), "--input", str(corpus), "--no-neo4j")
+    capsys.readouterr()
+
+    def refuse(config):
+        raise AssertionError("export must not open Neo4j")
+
+    monkeypatch.setattr("schain.__main__.open_driver", refuse)
+    monkeypatch.setattr(
+        "schain.__main__.build_llm",
+        lambda config: (_ for _ in ()).throw(AssertionError("export must not build an LLM")),
+    )
+    assert run_cli("export", "--config", str(cli_config)) == 0
+
+
+def test_expand_also_writes_graph_export(tmp_path, expand_config, llms, monkeypatch, capsys):
+    """EXPAND ends with the same derived JSON artifact as INGEST."""
+    import yaml
+
+    from schain.sources.base import SearchResult
+
+    expand_config["seeds"] = {"ev_manufacturers": ["BMW"]}
+    expand_config["expansion"]["max_tier"] = 0
+    expand_config["expansion"]["max_documents"] = 1
+    config_path = tmp_path / "expand.yaml"
+    config_path.write_text(yaml.safe_dump(expand_config), encoding="utf-8")
+
+    def fake(config, entity_name, entity_key, tier, connection, manifest=None):
+        return [
+            SearchResult(
+                provider="test", query='"BMW" suppliers',
+                title="BMW supplier news", url="https://news.test/0",
+                text=DOCUMENT_TEXT,
+            )
+        ]
+
+    monkeypatch.setattr("schain.expansion.loop.retrieve_for_entity", fake)
+    assert run_cli(
+        "expand", "--config", str(config_path), "--no-neo4j", "--max-tier", "0",
+        "--max-documents", "1",
+    ) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert "graph_export" in summary
+    assert Path(summary["graph_export"]).is_file()

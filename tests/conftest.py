@@ -94,6 +94,7 @@ def _with_tmp_storage(config: dict, tmp_path: Path) -> dict:
         "search_results": str(tmp_path / "processed/search_results.parquet"),
         "entity_resolution": str(tmp_path / "processed/entity_resolution.parquet"),
         "state_db": str(tmp_path / "state/state.db"),
+        "graph_export": str(tmp_path / "outputs/supply_chain_graph.v1.json"),
     }
     return config
 

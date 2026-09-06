@@ -22,7 +22,7 @@ SChain/
 │   ├── SupplyChain_KG_V1_Architecture_Brief_Final.tex
 │   └── EXTERNAL_DATASETS.md
 ├── schain/
-│   ├── __main__.py        # CLI: ingest | expand | validate
+│   ├── __main__.py        # CLI: ingest | expand | validate | export
 │   ├── config.py          # config loading, include merge, search-limit precedence
 │   ├── names.py           # deterministic name normalization and canonical ids
 │   ├── documents.py       # loading, normalization, hashing, raw/normalized layers
@@ -30,6 +30,7 @@ SChain/
 │   ├── state.py           # SQLite checkpoint/resume state
 │   ├── pipeline.py        # the per-document path shared by both modes
 │   ├── ingest.py          # INGEST driver
+│   ├── graph_export.py    # frontend-ready semantic graph JSON (derived artifact)
 │   ├── llm/               # provider factory (vLLM or hosted OpenAI-compatible API)
 │   ├── kg/                # extraction, entity resolution, facts table, Neo4j writer
 │   ├── sources/           # retrieval: wikipedia, gdelt, google_news, orchestration
@@ -40,6 +41,7 @@ SChain/
 │   ├── processed/         # documents / facts / search_results / entity_resolution parquet
 │   ├── external/          # externally obtained datasets
 │   └── state/             # state.db
+├── outputs/               # derived graph JSON (gitignored)
 └── tests/
 ```
 

@@ -47,3 +47,5 @@ storage:
   search_results: data/processed/search_results.parquet
   entity_resolution: data/processed/entity_resolution.parquet
   state_db: data/state/state.db
+  # Derived frontend-ready semantic graph (not a source of truth; regenerated on demand).
+  graph_export: outputs/supply_chain_graph.v1.json
