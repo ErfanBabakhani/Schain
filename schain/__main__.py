@@ -3,6 +3,7 @@
     python -m schain ingest   --config config/ingest.yaml
     python -m schain expand   --config config/expansion.yaml
     python -m schain validate --config config/ingest.yaml
+    python -m schain export   --config config/ingest.yaml
 
 Resume is the default. Pass --restart for an explicit fresh run.
 """
@@ -65,6 +66,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--reference", type=Path, default=None,
         help="supplier-customer CSV/JSON (default: first file in data/external/sectivia)",
     )
+
+    export = subparsers.add_parser(
+        "export",
+        help="write frontend-ready graph JSON from persisted facts (no LLM, no Neo4j)",
+    )
+    export.add_argument("--config", type=Path, default=Path("config/ingest.yaml"))
+    export.add_argument(
+        "--output", type=Path, default=None,
+        help="output JSON path (default: storage.graph_export)",
+    )
     return parser
 
 
@@ -88,6 +99,26 @@ def _run_validate(args: argparse.Namespace, config: dict[str, Any]) -> int:
     return 0
 
 
+def _run_export(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    from .graph_export import export_graph
+
+    path = export_graph(config, output=args.output, mode="export")
+    print(json.dumps({"graph_export": str(path)}, indent=2))
+    return 0
+
+
+def _attach_graph_export(
+    config: dict[str, Any], summary: dict[str, Any], mode: str
+) -> dict[str, Any]:
+    """Write the derived graph JSON after a successful ingest/expand run."""
+    from .graph_export import export_graph
+
+    path = export_graph(config, mode=mode, pipeline_summary=summary)
+    summary = dict(summary)
+    summary["graph_export"] = str(path)
+    return summary
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     args = build_parser().parse_args(argv)
     logging.basicConfig(
@@ -98,6 +129,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     config = load_config(args.config)
     if args.mode == "validate":
         return _run_validate(args, config)
+    if args.mode == "export":
+        # Operate only on persisted artifacts — no LLM, Neo4j, or retrieval.
+        return _run_export(args, config)
 
     # CLI flags override the config file.
     if args.restart:
@@ -123,6 +157,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             summary = run_ingest(config, connection, llm, ontology, driver, args.input)
         else:
             summary = run_expand(config, connection, llm, ontology, driver)
+        summary = _attach_graph_export(config, summary, args.mode)
     except LLMGenerationError as error:
         logger.error(
             "LLM call failed (%s). Check that the server at %s is running and that "

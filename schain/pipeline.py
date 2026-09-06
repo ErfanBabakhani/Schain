@@ -90,7 +90,7 @@ def clear_generated_data(config: dict[str, Any]) -> list[str]:
     state.reset(storage_path(config, "state_db"))
     removed.append(str(storage_path(config, "state_db")))
     for key in ("raw_documents", "normalized_documents", "extracted_facts",
-                "search_results", "entity_resolution"):
+                "search_results", "entity_resolution", "graph_export"):
         path = storage_path(config, key)
         if path.exists():
             path.unlink()
