@@ -40,6 +40,9 @@ def run_ingest(
         "input": str(target), "files": len(files), "documents_processed": 0,
         "documents_skipped": 0, "documents_failed": 0, "facts": 0,
         "nodes_merged": 0, "relationships_merged": 0,
+        "elapsed_seconds": 0.0, "llm_calls": 0, "extraction_chunks": 0,
+        "extraction_calls": 0, "extraction_cache_hits": 0, "extraction_retries": 0,
+        "candidate_facts": 0, "accepted_facts": 0, "rejected_facts": 0,
     }
 
     for path in files:
@@ -66,6 +69,10 @@ def run_ingest(
         summary["facts"] += document_summary["facts"]
         summary["nodes_merged"] += document_summary["nodes_merged"]
         summary["relationships_merged"] += document_summary["relationships_merged"]
+        for field in ("elapsed_seconds", "llm_calls", "extraction_chunks", "extraction_calls",
+                      "extraction_cache_hits", "extraction_retries", "candidate_facts",
+                      "accepted_facts", "rejected_facts"):
+            summary[field] += document_summary.get(field, 0)
 
     summary["documents"] = state.document_counts(connection)
     return summary

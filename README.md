@@ -1,3 +1,8 @@
+> **Updated code: 0.3.0 (8 September 2026).** Start with [START_HERE.md](START_HERE.md)
+> for setup and migration; read [the v0.3.0 audit](docs/AUDIT_V0.3.0.md) for corrected retrieval, tiers, budgets and tests. See
+> [docs/UPGRADE_REVIEW.md](docs/UPGRADE_REVIEW.md) for the paper comparison.
+> This dated addendum supersedes older statements below that exclude a local viewer.
+
 # Supply Chain Knowledge Graph — V1
 
 Builds a reproducible supply-chain knowledge graph from unstructured text: retrieval, LLM
@@ -9,13 +14,15 @@ Two modes, and only two:
 | Mode | Input | What it does |
 |---|---|---|
 | `INGEST` | documents you already have | normalize → deduplicate → Prompt 1 → Prompt 2 → facts → Neo4j `MERGE`. No search. |
-| `EXPAND` | seed companies | persistent frontier → tier-aware queries → retrieval → dedup/filter → Prompt 1 → Prompt 2 → facts → Neo4j `MERGE` → discover upstream suppliers → next tier, up to `max_tier`. |
+| `EXPAND` | seed companies | persistent frontier → tier-aware queries → retrieval → source reputation (metadata) → Prompt 1 → Prompt 2 → ontology/evidence validation → facts → edge support → frontier from valid suppliesTo → Neo4j `MERGE` (optional) → next tier, up to `max_tier`. |
 
 Project documents: [CLAUDE.md](CLAUDE.md) (development rules),
 [docs/SupplyChain_KG_V1_Architecture_Brief_Final.pdf](docs/SupplyChain_KG_V1_Architecture_Brief_Final.pdf)
 (architecture), [PROJECT_DECISIONS.md](PROJECT_DECISIONS.md) (frozen V1 scope),
 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) (layout),
 [docs/EXTERNAL_DATASETS.md](docs/EXTERNAL_DATASETS.md) (validation data),
+[docs/SOURCE_REPUTATION_AND_VERIFICATION.md](docs/SOURCE_REPUTATION_AND_VERIFICATION.md)
+(source reputation, validation statuses, frontier gate),
 [docs/SERVER_HANDOFF.md](docs/SERVER_HANDOFF.md) (server checklist).
 
 ---
@@ -66,9 +73,8 @@ Configuration, argument parsing and the data layers can be checked with no servi
 # Server deployment — to be done later
 
 **None of the steps in this section have been executed or verified.** The development
-laptop cannot serve Qwen3.8-27B (4 GB VRAM against roughly 54 GB needed in bf16) and has no
-Neo4j instance, so the real model, the real database and any end-to-end run belong to the
-server phase.
+environment used for this audit ran offline tests only. The real model, database and
+provider end-to-end run remain a later runtime validation step.
 
 `scripts/server_run.sh` performs the intended steps in one command: install
 dependencies, validate configuration, start or reuse Neo4j, start or reuse vLLM, wait for
@@ -114,7 +120,7 @@ docker run -d --name schain-neo4j -p 7474:7474 -p 7687:7687 -e NEO4J_AUTH=neo4j/
 ### Model endpoint
 
 ```bash
-vllm serve Qwen/Qwen3.8-27B --served-model-name Qwen/Qwen3.8-27B --max-model-len 16384 --port 8000
+vllm serve Qwen/Qwen3-4B-Instruct-2507 --served-model-name Qwen/Qwen3-4B-Instruct-2507 --max-model-len 16384 --port 8000
 ```
 
 Add `--tensor-parallel-size N` for multiple GPUs. Instruct/non-thinking behaviour needs no
@@ -202,7 +208,25 @@ data/processed/entity_resolution.parquet    Prompt 2 results
 data/processed/search_results.parquet       retrieval results per query
 data/state/state.db                         checkpoint/resume state
 data/external/                              externally obtained datasets
+outputs/supply_chain_graph.v1.json          derived frontend-ready semantic graph
 ```
+
+## Frontend-ready graph export
+
+After a successful `ingest` or `expand` run, SChain writes a **semantic** graph bundle to
+`outputs/supply_chain_graph.v1.json` (configurable via `storage.graph_export`). The file is
+plain UTF-8 JSON: nodes, aggregated edges, evidence, document provenance, ontology, and
+statistics. It is **not** a visualization — no coordinates, colours, HTML, or layout.
+
+Regenerate without repeating LLM calls:
+
+```bash
+.venv/bin/python -m schain export --config config/ingest.yaml
+.venv/bin/python -m schain export --config config/expansion.yaml --output outputs/demo_graph.json
+```
+
+A separate frontend may consume this bundle for 2D/3D rendering, filters, and evidence
+panels. The Parquet / SQLite layers remain the source of truth; the JSON is derived.
 
 ## Expansion depth
 
@@ -211,12 +235,12 @@ role: a mining company selling directly to an OEM is Tier 1, not a deep tier. On
 `suppliesTo` advances depth; `locatedIn`, `owns` and `produces` describe an entity without
 adding any.
 
-Production default is `max_tier: 6` — Tier 0 seeds, Tiers 1–6 successive upstream
-suppliers. **Tier 6 is terminal**: its entities and relations are stored, but it is never
-searched and nothing is promoted past it. Tiers 0–5 each have their own six query
-templates, moving from OEM language (`battery suppliers`, `semiconductor suppliers`)
-toward upstream language (`feedstock`, `concentrate`, `offtake agreement`, `mines`). Smoke
-tests use a much smaller depth; the production default is not lowered to make tests fast.
+The current experiment has four active OEM seeds and `max_tier: 5`. Tiers 0–4
+are searched; Tier 5 is terminal. Five directional query families are shared across
+searchable tiers. Runtime and document budgets are cumulative across resumes, with
+150 unique selected documents and 110 minutes as the configured safety ceilings.
+A quality-ranked beam and reserved deeper-tier targets control breadth. See
+[the audit policy](docs/AUDIT_V0.3.0.md) for exact tier allocations and limitations.
 
 ## Retrieval sources
 
@@ -224,9 +248,9 @@ Four providers, all feeding **one** pipeline — there is no separate handling p
 
 | Family | Providers | Per-query candidate ceiling |
 |---|---|---|
-| News | Google News (RSS search), GDELT (DOC 2.0 API) | 50 at Tiers 0–2, 40 at Tier 3, 30 at Tiers 4–5 |
-| General web | `general_web` — company supplier/sourcing pages, press releases, investor relations, annual and sustainability reports, filings | 30 at Tiers 0–2, 25 at Tier 3, 20 at Tiers 4–5 |
-| Reference | Wikipedia (MediaWiki API) | 10 at every tier |
+| News | Google News (RSS search), GDELT (DOC 2.0 API) | 12 per provider at Tiers 0–4 |
+| General web | `general_web` — company supplier/sourcing pages, press releases, investor relations, annual and sustainability reports, filings | 12 at Tiers 0–4 |
+| Reference | Wikipedia (MediaWiki API) | 5 at Tiers 0–4 |
 
 News carries new supply agreements; the general web carries the older, more stable
 sourcing information. `general_web` defaults to a DuckDuckGo backend needing no

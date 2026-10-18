@@ -17,6 +17,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,11 +26,16 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import pandas as pd
 
+from .checkpoint import atomic_write_parquet
+
 logger = logging.getLogger(__name__)
 
 TEXT_SUFFIXES = {".txt", ".md", ".text"}
 DOC_ID_LENGTH = 16
 _TRACKING_PREFIXES = ("utm_", "fbclid", "gclid", "mc_cid", "mc_eid")
+_PUBLISHER_TITLE_SPLIT = re.compile(
+    r"^(?P<title>.+?)\s+[-–—|]\s+(?P<publisher>[A-Za-z0-9][^|]{1,80})$"
+)
 
 
 def normalize_text(raw: str) -> str:
@@ -42,6 +48,26 @@ def normalize_text(raw: str) -> str:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     lines = [line.rstrip() for line in text.split("\n")]
     return "\n".join(lines).strip()
+
+
+def split_publisher_title(title: str) -> tuple[str, Optional[str]]:
+    """Split ``Headline - Publisher`` into article title and publisher provenance.
+
+    Publisher attribution must not be treated as article content for entity extraction.
+    """
+    text = " ".join(str(title or "").split()).strip()
+    if not text:
+        return "", None
+    match = _PUBLISHER_TITLE_SPLIT.match(text)
+    if not match:
+        return text, None
+    article = match.group("title").strip()
+    publisher = match.group("publisher").strip()
+    # Avoid splitting compound headlines that use dashes mid-sentence without a
+    # plausible publisher token (too short / all-lowercase single word is ok).
+    if len(article) < 8 or len(publisher) < 2:
+        return text, None
+    return article, publisher
 
 
 def normalize_url(url: Optional[str]) -> Optional[str]:
@@ -87,6 +113,20 @@ def make_document(
     title: Optional[str] = None,
     source_path: Optional[str] = None,
     content_source: str = "file",
+    retrieval_url: Optional[str] = None,
+    canonical_source_url: Optional[str] = None,
+    source_domain: Optional[str] = None,
+    source_known: Optional[bool] = None,
+    source_class: Optional[str] = None,
+    source_base_score: Optional[float] = None,
+    source_effective_score: Optional[float] = None,
+    source_group_id: Optional[str] = None,
+    provider: Optional[str] = None,
+    query: Optional[str] = None,
+    origin_entity: Optional[str] = None,
+    tier: Optional[int] = None,
+    publisher_name: Optional[str] = None,
+    publisher_url: Optional[str] = None,
 ) -> dict[str, Any]:
     """Build the normalized document record from raw text.
 
@@ -96,6 +136,16 @@ def make_document(
     "full_text" or "title_snippet" for retrieved documents - so it is visible later
     whether a fact was extracted from an article body or only from a headline.
     """
+    clean_title = title
+    publisher = publisher_name
+    if title and publisher:
+        suffix = re.compile(r"\s+[-–—|]\s+" + re.escape(publisher) + r"\s*$", re.I)
+        clean_title = suffix.sub("", title)
+        # Only known metadata is stripped, and only from fallback lines. A dash in
+        # a real headline/body is not sufficient evidence of a publisher suffix.
+        if content_source == "title_snippet":
+            text = "\n".join(suffix.sub("", line) for line in text.splitlines())
+
     text = normalize_text(text)
     if not text:
         raise ValueError("document is empty after normalization")
@@ -106,11 +156,25 @@ def make_document(
         "content_hash": digest,
         "source_path": source_path,
         "source_url": normalize_url(source_url),
-        "title": title or (Path(source_path).stem if source_path else ""),
+        "title": clean_title or title or (Path(source_path).stem if source_path else ""),
+        "publisher_name": publisher,
+        "publisher_url": normalize_url(publisher_url),
         "text": text,
         "char_count": len(text),
         "content_source": content_source,
         "ingested_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "retrieval_url": normalize_url(retrieval_url or source_url),
+        "canonical_source_url": normalize_url(canonical_source_url),
+        "source_domain": source_domain,
+        "source_known": source_known,
+        "source_class": source_class,
+        "source_base_score": source_base_score,
+        "source_effective_score": source_effective_score,
+        "source_group_id": source_group_id,
+        "provider": provider,
+        "query": query,
+        "origin_entity": origin_entity,
+        "tier": tier,
     }
 
 
@@ -164,4 +228,4 @@ def upsert_normalized_parquet(record: dict[str, Any], path: Path) -> None:
     if path.exists():
         frame = pd.concat([pd.read_parquet(path), frame], ignore_index=True)
         frame = frame.drop_duplicates(subset="doc_id", keep="last").reset_index(drop=True)
-    frame.to_parquet(path, index=False)
+    atomic_write_parquet(frame, path)

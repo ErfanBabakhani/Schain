@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -39,17 +40,34 @@ async def search(
     payload = await get_json(client, API_URL, params)
     articles = (payload or {}).get("articles", []) or []
 
-    results = [
-        SearchResult(
-            provider="gdelt",
-            query=query,
-            title=article.get("title", ""),
-            url=article.get("url", ""),
-            published=article.get("seendate"),
-            language=article.get("language"),
+    results: list[SearchResult] = []
+    for article in articles:
+        url = article.get("url") or ""
+        if not url:
+            continue
+        title = (article.get("title") or "").strip()
+        # GDELT DOC 2.0 often omits snippets. Use title as a soft snippet so
+        # origin/usability filters can evaluate the candidate rather than
+        # discarding every title-only hit before full-text fetch.
+        host = ""
+        try:
+            host = (urlsplit(url).hostname or "").lower()
+        except ValueError:
+            host = ""
+        results.append(
+            SearchResult(
+                provider="gdelt",
+                query=query,
+                title=title,
+                url=url,
+                snippet=title,
+                published=article.get("seendate"),
+                language=article.get("language"),
+                source_domain=host or None,
+                publisher_name=host.split(".")[0] if host else None,
+                publisher_url=f"https://{host}/" if host else None,
+                document_type="news",
+            )
         )
-        for article in articles
-        if article.get("url")
-    ]
     logger.info("gdelt: %d result(s) for %s", len(results), query)
     return results

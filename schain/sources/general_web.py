@@ -84,7 +84,7 @@ def parse_duckduckgo_html(body: str, query: str, max_results: int) -> list[Searc
 async def _search_duckduckgo(
     client: httpx.AsyncClient, query: str, max_results: int
 ) -> list[SearchResult]:
-    body = await get_text(client, f"{DUCKDUCKGO_URL}?q={httpx.QueryParams({'q': query})['q']}")
+    body = await get_text(client, f"{DUCKDUCKGO_URL}?{httpx.QueryParams({'q': query})}")
     if not body:
         return []
     return parse_duckduckgo_html(body, query, max_results)

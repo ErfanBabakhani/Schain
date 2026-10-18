@@ -8,6 +8,7 @@ the ownership rule that decides what cleanup is allowed to stop.
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import socket
 import subprocess
@@ -106,7 +107,7 @@ def test_ingest_passes_its_input():
 
 def test_smoke_test_limits_the_expansion():
     output = plan("--smoke-test")
-    assert "--max-tier 0 --max-documents 3" in output
+    assert "--max-tier 1 --max-documents 3" in output
     assert "(smoke test)" in output
 
 
@@ -157,7 +158,7 @@ def test_preflight_reports_without_leaking_secrets():
 
 def test_preflight_reports_the_configured_model_and_endpoint():
     result = run([str(PREFLIGHT)], env={"NEO4J_URI": "bolt://db.test:7687"})
-    assert "Qwen/Qwen3.8-27B" in result.stdout
+    assert "Qwen/Qwen3-4B-Instruct-2507" in result.stdout
     assert "bolt://db.test:7687" in result.stdout
 
 
@@ -349,6 +350,65 @@ def test_already_running_services_are_reused_and_never_stopped(tmp_path):
         for process in (llm, neo4j):
             process.terminate()
             process.wait(timeout=10)
+
+
+def test_config_inspection_works_without_a_project_venv(tmp_path):
+    """A fresh checkout must report real configured endpoints before installing .venv."""
+    config = write_temp_config(tmp_path, 9123)
+    command = (
+        f"source {shlex.quote(str(LIB))}; "
+        f"VENV_PY={shlex.quote(str(tmp_path / 'missing-python'))}; "
+        f"config_values {shlex.quote(str(config))}"
+    )
+    result = run(
+        ["bash", "-c", command], cwd=tmp_path,
+        env={"NEO4J_URI": "bolt://configured.test:7687"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "CFG_LLM_BASE_URL=http://127.0.0.1:9123/v1" in result.stdout
+    assert "CFG_NEO4J_URI=bolt://configured.test:7687" in result.stdout
+    assert "Qwen/Qwen3-4B-Instruct-2507" in result.stdout
+    assert not (tmp_path / ".venv").exists()
+
+
+def test_open_http_port_is_not_neo4j_when_project_venv_is_missing(tmp_path):
+    port = free_port()
+    listener = start_http_stub(port)
+    try:
+        command = (
+            f"source {shlex.quote(str(LIB))}; "
+            f"VENV_PY={shlex.quote(str(tmp_path / 'missing-python'))}; "
+            f"neo4j_reachable bolt://127.0.0.1:{port}"
+        )
+        result = run(
+            ["bash", "-c", command], env={"SCHAIN_NEO4J_SKIP_BOLT_CHECK": ""},
+        )
+        assert result.returncode != 0
+        assert alive(listener)
+    finally:
+        listener.terminate()
+        listener.wait(timeout=10)
+
+
+def test_occupied_unverified_neo4j_port_never_starts_another_instance(tmp_path):
+    port = free_port()
+    listener = start_http_stub(port)
+    try:
+        config = write_temp_config(tmp_path, port)
+        result = run(
+            [str(RUN), "--dry-run", "--config", str(config)],
+            env={"NEO4J_URI": f"bolt://127.0.0.1:{port}",
+                 "SCHAIN_NEO4J_SKIP_BOLT_CHECK": ""},
+        )
+        output = result.stdout + result.stderr
+        assert result.returncode != 0
+        assert "occupied but Neo4j could not be verified" in output
+        assert "would start Neo4j" not in output
+        assert "would install and start local Neo4j" not in output
+        assert alive(listener)
+    finally:
+        listener.terminate()
+        listener.wait(timeout=10)
 
 
 def test_a_service_started_by_the_run_is_stopped_when_the_workload_finishes(tmp_path):
@@ -647,3 +707,54 @@ def test_first_run_model_download_is_announced_not_silent():
     assert "the first run downloads the model" in script
     assert "this is not a hang" in script
     assert 'log "HF_TOKEN: $(secret_state HF_TOKEN)"' in script   # presence only
+
+
+def test_batch_preserves_nondefault_arguments_and_quoting(tmp_path):
+    config = write_temp_config(tmp_path, 1)
+    input_path = tmp_path / 'documents with spaces'
+    result = run([str(RUN), 'ingest', str(input_path), '--config', str(config), '--restart'],
+                 env=cluster_env(tmp_path))
+    assert result.returncode == 0, result.stderr
+    body = next((tmp_path / 'runtime' / 'slurm').glob('*.sbatch')).read_text()
+    command = next(line for line in body.splitlines() if line.startswith('exec '))
+    tokens = shlex.split(command)[1:]
+    assert tokens == [str(RUN), 'ingest', str(input_path), '--config', str(config),
+                      '--restart', '--foreground']
+
+
+def test_interactive_allocation_plan_preserves_nondefault_arguments(tmp_path):
+    config = write_temp_config(tmp_path, 1)
+    result = run([str(RUN), '--dry-run', '--smoke-test', '--config', str(config), '--restart'],
+                 env=cluster_env(tmp_path))
+    assert result.returncode == 0, result.stderr
+    allocation = next(line for line in result.stdout.splitlines() if 'would exec: srun' in line)
+    assert '--smoke-test' in allocation and '--restart' in allocation
+    assert str(config) in allocation
+
+
+def test_weight_override_uses_configured_api_model_name():
+    result = run([str(RUN), '--dry-run'], env={'SCHAIN_VLLM_MODEL': 'different/weights'})
+    assert result.returncode == 0, result.stderr
+    line = next(line for line in result.stdout.splitlines() if 'would start vLLM:' in line)
+    assert 'serve different/weights' in line
+    assert '--served-model-name Qwen/Qwen3-4B-Instruct-2507' in line
+
+
+def test_tmux_preserves_original_mode_config_and_spaced_input(tmp_path):
+    fake_bin = tmp_path / 'tmux_bin'
+    fake_bin.mkdir()
+    capture = tmp_path / 'tmux_command.txt'
+    tmux = fake_bin / 'tmux'
+    tmux.write_text('#!/bin/bash\n'
+                    'if [ "$1" = has-session ]; then exit 1; fi\n'
+                    'if [ "$1" = new-session ]; then printf "%s\\n" "${@: -1}" > '
+                    + shlex.quote(str(capture)) + '; fi\n')
+    tmux.chmod(0o755)
+    input_path = tmp_path / 'documents with spaces'
+    result = run([str(RUN), 'ingest', str(input_path), '--config', 'config/ingest.yaml', '--restart'],
+                 env={'PATH': f"{fake_bin}:{os.environ['PATH']}", 'SCHAIN_NO_TMUX': '', 'TMUX': ''})
+    assert result.returncode == 0, result.stderr
+    tokens = shlex.split(capture.read_text())
+    run_start = tokens.index(str(RUN))
+    assert tokens[run_start:] == [str(RUN), 'ingest', str(input_path), '--config',
+                                 'config/ingest.yaml', '--restart']

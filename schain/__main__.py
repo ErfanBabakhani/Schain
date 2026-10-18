@@ -3,7 +3,7 @@
     python -m schain ingest   --config config/ingest.yaml
     python -m schain expand   --config config/expansion.yaml
     python -m schain validate --config config/ingest.yaml
-    python -m schain visualize --config config/ingest.yaml
+    python -m schain export   --config config/ingest.yaml
 
 Resume is the default. Pass --restart for an explicit fresh run.
 """
@@ -11,6 +11,7 @@ Resume is the default. Pass --restart for an explicit fresh run.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 from pathlib import Path
@@ -19,7 +20,7 @@ from typing import Any, Optional
 from neo4j_graphrag.exceptions import LLMGenerationError
 
 from . import state
-from .config import REPO_ROOT, load_config, storage_path
+from .config import load_config, storage_path, log_effective_expansion_config, validate_expansion_config
 from .expansion.loop import run_expand
 from .ingest import run_ingest
 from .llm.provider import build_llm
@@ -57,6 +58,20 @@ def build_parser() -> argparse.ArgumentParser:
     expand.add_argument(
         "--max-documents", type=int, default=None, help="stop after this many documents"
     )
+    seed_override = expand.add_mutually_exclusive_group()
+    seed_override.add_argument(
+        "--seeds",
+        type=str,
+        default=None,
+        help=(
+            "explicit comma-separated seed override (otherwise seeds come from "
+            "config/expansion.yaml and are never replaced)"
+        ),
+    )
+    seed_override.add_argument(
+        "--seed", action="append", default=None,
+        help="repeat for each explicit seed; preserves names containing commas",
+    )
 
     validate = subparsers.add_parser(
         "validate", help="compare extracted facts with an external reference dataset"
@@ -67,23 +82,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="supplier-customer CSV/JSON (default: first file in data/external/sectivia)",
     )
 
-    visualize = subparsers.add_parser(
-        "visualize",
-        help="render interactive HTML graphs from facts.parquet (no LLM, no Neo4j)",
+    export = subparsers.add_parser(
+        "export",
+        help="write frontend-ready graph JSON from persisted facts (no LLM, no Neo4j)",
     )
-    visualize.add_argument("--config", type=Path, default=Path("config/ingest.yaml"))
-    visualize.add_argument(
-        "--doc-id", default=None,
-        help="render only this document (default: all documents + aggregate)",
+    export.add_argument("--config", type=Path, default=Path("config/ingest.yaml"))
+    export.add_argument(
+        "--output", type=Path, default=None,
+        help="output JSON path (default: storage.graph_export)",
     )
-    visualize.add_argument(
-        "--output-dir", type=Path, default=None,
-        help="HTML output directory (default: data/visualizations)",
-    )
-    visualize.add_argument(
-        "--facts", type=Path, default=None,
-        help="override path to facts.parquet (default: storage.extracted_facts)",
-    )
+    view = subparsers.add_parser("view", help="build an offline HTML graph explorer")
+    view.add_argument("--config", type=Path, default=Path("config/ingest.yaml"))
+    view.add_argument("--input", required=True, type=Path, help="existing SChain graph JSON")
+    view.add_argument("--output", type=Path, default=Path("outputs/graph-explorer.html"))
+
+    evaluate = subparsers.add_parser("evaluate", help="score directed triples against a held-out gold set")
+    evaluate.add_argument("--config", type=Path, default=Path("config/ingest.yaml"))
+    evaluate.add_argument("--gold", required=True, type=Path)
+    evaluate.add_argument("--output", type=Path, default=None)
     return parser
 
 
@@ -107,48 +123,24 @@ def _run_validate(args: argparse.Namespace, config: dict[str, Any]) -> int:
     return 0
 
 
-def _run_visualize(args: argparse.Namespace, config: dict[str, Any]) -> int:
-    from .visualization import load_facts, render_all_graph, render_document_graph
-    from .visualization.render import _safe_filename
+def _run_export(args: argparse.Namespace, config: dict[str, Any]) -> int:
+    from .graph_export import export_graph
 
-    facts_path = Path(args.facts) if args.facts else storage_path(config, "extracted_facts")
-    if not facts_path.is_absolute():
-        facts_path = (REPO_ROOT / facts_path).resolve()
-    facts = load_facts(facts_path)
-    if facts.empty and not facts_path.exists():
-        logger.error("no facts file at %s — run ingest first", facts_path)
-        return 1
-
-    output_dir = args.output_dir or (REPO_ROOT / "data" / "visualizations")
-    output_dir = Path(output_dir)
-    if not output_dir.is_absolute():
-        output_dir = (REPO_ROOT / output_dir).resolve()
-
-    if args.doc_id:
-        if "doc_id" in facts.columns and args.doc_id not in set(facts["doc_id"].astype(str)):
-            logger.error("doc_id %r not found in %s", args.doc_id, facts_path)
-            return 1
-        path = render_document_graph(
-            facts,
-            output_dir / f"{_safe_filename(args.doc_id)}.html",
-            doc_id=args.doc_id,
-            title=f"SChain · {args.doc_id}",
-        )
-        written = {args.doc_id: path}
-    else:
-        written = render_all_graph(facts, output_dir)
-
-    summary = {
-        "facts_path": str(facts_path),
-        "facts_rows": int(len(facts)),
-        "output_dir": str(output_dir),
-        "html_files": {key: str(path) for key, path in written.items()},
-    }
-    logger.info(
-        "wrote %d HTML graph(s) under %s", len(written), output_dir,
-    )
-    print(json.dumps(summary, indent=2))
+    path = export_graph(config, output=args.output, mode="export")
+    print(json.dumps({"graph_export": str(path)}, indent=2))
     return 0
+
+
+def _attach_graph_export(
+    config: dict[str, Any], summary: dict[str, Any], mode: str
+) -> dict[str, Any]:
+    """Write the derived graph JSON after a successful ingest/expand run."""
+    from .graph_export import export_graph
+
+    path = export_graph(config, mode=mode, pipeline_summary=summary)
+    summary = dict(summary)
+    summary["graph_export"] = str(path)
+    return summary
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -158,13 +150,26 @@ def main(argv: Optional[list[str]] = None) -> int:
         format="%(levelname)-7s %(name)s: %(message)s",
     )
 
+    if args.mode == "view":
+        from .viewer import main as viewer_main
+        return viewer_main(["--input", str(args.input), "--output", str(args.output)])
     config = load_config(args.config)
+    if args.mode == "evaluate":
+        from .validation.gold import evaluate_file
+        report = evaluate_file(args.gold, storage_path(config, "extracted_facts"))
+        payload = json.dumps(report, indent=2, allow_nan=False)
+        if args.output:
+            from .checkpoint import atomic_write_json
+            atomic_write_json(args.output, report)
+        print(payload)
+        return 0
     if args.mode == "validate":
         return _run_validate(args, config)
-    if args.mode == "visualize":
-        return _run_visualize(args, config)
+    if args.mode == "export":
+        # Operate only on persisted artifacts — no LLM, Neo4j, or retrieval.
+        return _run_export(args, config)
 
-    # CLI flags override the config file.
+    # CLI flags override the config file. Seeds are replaced ONLY via --seeds.
     if args.restart:
         config.setdefault("runtime", {})["restart_from_scratch"] = True
     if args.mode == "expand":
@@ -172,6 +177,18 @@ def main(argv: Optional[list[str]] = None) -> int:
             config.setdefault("expansion", {})["max_tier"] = args.max_tier
         if args.max_documents is not None:
             config.setdefault("expansion", {})["max_documents"] = args.max_documents
+        if getattr(args, "seeds", None) or getattr(args, "seed", None):
+            names = args.seed or next(csv.reader([args.seeds], skipinitialspace=True))
+            names = [name.strip() for name in names if name.strip()]
+            if names:
+                config["seeds"] = {"cli_override": names}
+                logger.warning(
+                    "explicit --seeds override active (%d seed(s)); "
+                    "expansion.yaml seeds were replaced intentionally",
+                    len(names),
+                )
+        log_effective_expansion_config(config)
+        validate_expansion_config(config)
 
     if config.get("runtime", {}).get("restart_from_scratch"):
         removed = clear_generated_data(config)
@@ -188,6 +205,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             summary = run_ingest(config, connection, llm, ontology, driver, args.input)
         else:
             summary = run_expand(config, connection, llm, ontology, driver)
+        summary = _attach_graph_export(config, summary, args.mode)
     except LLMGenerationError as error:
         logger.error(
             "LLM call failed (%s). Check that the server at %s is running and that "
@@ -203,7 +221,17 @@ def main(argv: Optional[list[str]] = None) -> int:
             driver.close()
         connection.close()
 
-    logger.info("done")
+    logger.info(
+        "done documents=%s facts=%s nodes=%s relationships=%s frontier=%s "
+        "graph_export=%s elapsed=%ss",
+        summary.get("documents_processed", summary.get("documents")),
+        summary.get("facts"),
+        summary.get("nodes_merged", summary.get("nodes")),
+        summary.get("relationships_merged", summary.get("relationships")),
+        summary.get("frontier"),
+        summary.get("graph_export"),
+        summary.get("elapsed_seconds"),
+    )
     print(json.dumps(summary, indent=2, default=str))
     return 0
 

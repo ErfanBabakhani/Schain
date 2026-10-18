@@ -92,12 +92,12 @@ def test_claiming_marks_processing_and_resume_requeues_it(connection):
     state.enqueue_entity(connection, "BMW", 0)
     row = state.next_frontier_entity(connection, max_tier=3)
     assert state.frontier_counts(connection) == {state.PROCESSING: 1}
-    assert row["attempts"] == 0  # the claimed row is returned pre-increment
+    assert row["attempts"] == 1  # attempts incremented when claimed
 
     assert state.requeue_stale_processing(connection) == 1
     assert state.frontier_counts(connection) == {state.PENDING: 1}
     # a second claim increments attempts, so retries are visible
-    assert state.next_frontier_entity(connection, max_tier=3)["attempts"] == 1
+    assert state.next_frontier_entity(connection, max_tier=3)["attempts"] == 2
 
 
 def test_done_entity_is_not_served_again(connection):

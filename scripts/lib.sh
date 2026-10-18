@@ -35,118 +35,41 @@ load_env() {
 # "set" / "not set", so a secret's presence can be reported without its value.
 secret_state() { [ -n "${!1:-}" ] && echo "set" || echo "not set"; }
 
-# --- virtual environment -----------------------------------------------------------
-
-# True when .venv exists, is executable, and pip is usable inside it.
-venv_usable() {
-    [ -x "$VENV_PY" ] || return 1
-    "$VENV_PY" -m pip --version >/dev/null 2>&1 || return 1
-}
-
-# Python for reading config: prefer the project venv when schain is importable,
-# otherwise fall back to system python3 with PyYAML (enough for preflight/dry-run).
-config_python() {
-    if venv_usable && "$VENV_PY" -c 'import schain.config' 2>/dev/null; then
-        printf '%s' "$VENV_PY"
-        return 0
-    fi
-    if python3 -c 'import yaml' 2>/dev/null; then
-        printf '%s' python3
-        return 0
-    fi
-    return 1
-}
-
-# Python for the Neo4j Bolt probe: needs the official driver, not merely an open port.
-neo4j_check_python() {
-    if venv_usable && "$VENV_PY" -c 'import neo4j' 2>/dev/null; then
-        printf '%s' "$VENV_PY"
-        return 0
-    fi
-    if python3 -c 'import neo4j' 2>/dev/null; then
-        printf '%s' python3
-        return 0
-    fi
-    return 1
-}
-
 # --- project configuration ---------------------------------------------------------
+
+# Inspection must also work before server_run.sh has created .venv. Prefer the project
+# interpreter, then an available Python for read-only configuration and driver probes.
+# The workload still runs only in the managed project .venv.
+inspection_python() {
+    if [ -x "$VENV_PY" ]; then
+        printf '%s\n' "$VENV_PY"
+    else
+        command -v python3
+    fi
+}
 
 # Read the values the scripts need straight from the project's config loader, so the
 # shell and the application can never disagree about model, endpoint or paths.
 # Usage: eval "$(config_values config/expansion.yaml)"
-config_values() {
-    local config_file="$1" py
-    py="$(config_python)" || return 1
-    SCHAIN_REPO_ROOT="$REPO_ROOT" "$py" - "$config_file" <<'PY'
-import copy
-import os
+config_values() (
+    local config_file="$1"
+    local inspect_py
+    inspect_py="$(inspection_python)" || return 1
+    cd "$REPO_ROOT" || return 1
+    "$inspect_py" - "$config_file" <<'PY'
 import shlex
 import sys
-from pathlib import Path
 
-repo_root = Path(os.environ["SCHAIN_REPO_ROOT"]).resolve()
+from schain.config import load_config, neo4j_settings, resolve_path
+
+config = load_config(sys.argv[1])
+llm = config.get("llm", {})
+neo4j = neo4j_settings(config)
 
 
 def emit(key, value):
     print(f"{key}={shlex.quote(str(value))}")
 
-
-try:
-    from schain.config import load_config, neo4j_settings, resolve_path
-except ImportError:
-    import yaml
-
-    def load_dotenv_simple(path: Path) -> None:
-        if not path.is_file():
-            return
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            os.environ.setdefault(key.strip(), value.strip())
-
-    def resolve_path(value: str | Path) -> Path:
-        path = Path(value)
-        return path if path.is_absolute() else repo_root / path
-
-    def deep_merge(base: dict, override: dict) -> dict:
-        merged = copy.deepcopy(base)
-        for key, value in override.items():
-            if isinstance(value, dict) and isinstance(merged.get(key), dict):
-                merged[key] = deep_merge(merged[key], value)
-            else:
-                merged[key] = copy.deepcopy(value)
-        return merged
-
-    def load_config(path: str | Path, seen: set[Path] | None = None) -> dict:
-        load_dotenv_simple(repo_root / ".env")
-        path = resolve_path(path).resolve()
-        seen = seen or set()
-        if path in seen:
-            raise ValueError(f"circular config include detected at {path}")
-        seen.add(path)
-        with path.open(encoding="utf-8") as handle:
-            raw = yaml.safe_load(handle) or {}
-        includes = raw.pop("include", []) or []
-        config: dict = {}
-        for included in includes:
-            config = deep_merge(config, load_config(included, seen))
-        return deep_merge(config, raw)
-
-    def neo4j_settings(config: dict) -> dict:
-        return {
-            "uri": os.environ.get("NEO4J_URI", "bolt://localhost:7687"),
-            "username": os.environ.get("NEO4J_USERNAME", "neo4j"),
-            "password": os.environ.get("NEO4J_PASSWORD", ""),
-            "database": config.get("neo4j", {}).get("database", "neo4j"),
-            "batch_size": config.get("neo4j", {}).get("batch_size", 1000),
-        }
-
-config = load_config(sys.argv[1])
-llm = config.get("llm", {})
-neo4j = neo4j_settings(config)
 
 emit("CFG_LLM_PROVIDER", llm.get("provider", "local"))
 emit("CFG_LLM_MODEL", llm.get("model", ""))
@@ -155,7 +78,7 @@ emit("CFG_NEO4J_URI", neo4j["uri"])
 emit("CFG_NEO4J_DATABASE", neo4j["database"])
 emit("CFG_STATE_DB", resolve_path(config["storage"]["state_db"]))
 PY
-}
+)
 
 # --- service health ----------------------------------------------------------------
 
@@ -169,20 +92,20 @@ neo4j_port() { local u="${1##*:}"; printf '%s' "${u%%/*}"; }
 # TCP reachability, using bash's own /dev/tcp so no extra tool is required.
 tcp_open() {
     local host="$1" port="$2" timeout="${3:-2}"
-    timeout "$timeout" bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null
+    timeout "$timeout" bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null
 }
 
 # A TCP connect only proves that something is listening on the port - any unrelated
 # process holding 7687 would look like Neo4j. The reuse-or-start decision depends on this
 # answer, so confirm with the project's own driver, exactly as the pipeline will.
 neo4j_reachable() {
-    local uri="$1" py
+    local uri="$1" inspect_py
     tcp_open "$(neo4j_host "$uri")" "$(neo4j_port "$uri")" 2 || return 1
     [ -n "${SCHAIN_NEO4J_SKIP_BOLT_CHECK:-}" ] && return 0
-    py="$(neo4j_check_python)" || return 1
+    inspect_py="$(inspection_python)" || return 1
     # Hard timeout: the driver completes the TCP connect and then waits indefinitely for
     # a Bolt handshake that a non-Neo4j listener never sends.
-    timeout "${SCHAIN_NEO4J_PROBE_TIMEOUT:-8}" "$py" - "$uri" <<'NEO4JCHECK' 2>/dev/null
+    timeout "${SCHAIN_NEO4J_PROBE_TIMEOUT:-8}" "$inspect_py" - "$uri" <<'NEO4JCHECK' 2>/dev/null
 import os
 import sys
 

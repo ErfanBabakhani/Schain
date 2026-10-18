@@ -29,6 +29,7 @@ def generate_queries(config: dict[str, Any], entity_name: str, tier: int) -> lis
     ``max_results`` applies to that single query.
     """
     queries = []
+    seen: set[tuple[Any, ...]] = set()
     for spec in resolve_tier_queries(config, tier):
         template = spec["query"]
         if ENTITY_PLACEHOLDER not in template:
@@ -36,6 +37,17 @@ def generate_queries(config: dict[str, Any], entity_name: str, tier: int) -> lis
                 "tier %d template %r has no %s placeholder; used as a literal query",
                 tier, template, ENTITY_PLACEHOLDER,
             )
-        queries.append({**spec, "template": template,
-                        "query": template.replace(ENTITY_PLACEHOLDER, entity_name)})
+        query = template.replace(ENTITY_PLACEHOLDER, entity_name)
+        # Ignore accidental repeated templates without conflating distinct provider
+        # selections or limits. No extra search should be scheduled for the same spec.
+        key = (
+            " ".join(query.split()).casefold(),
+            tuple(spec.get("providers") or []),
+            spec.get("max_results"),
+            tuple(sorted((spec.get("max_results_by_provider") or {}).items())),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        queries.append({**spec, "template": template, "query": query})
     return queries

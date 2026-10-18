@@ -10,6 +10,7 @@ __pycache__/
 *.pyd
 *.so
 .venv/
+.venv-win/
 venv/
 env/
 .python-version
@@ -48,8 +49,6 @@ data/processed/*
 !data/processed/.gitkeep
 data/external/*
 !data/external/.gitkeep
-data/visualizations/*
-!data/visualizations/.gitkeep
 outputs/
 
 # Runtime tooling installed by scripts/server_run.sh: local Neo4j distribution and its
@@ -78,3 +77,4 @@ dist/
 
 # Archives (the starter pack's contents are tracked unpacked at the repo root)
 *.zip
+.venv-win

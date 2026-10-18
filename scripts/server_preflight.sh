@@ -23,11 +23,9 @@ item "disk free"     "$(df -Ph "$REPO_ROOT" | awk 'NR==2 {print $4" free of "$2}
 
 section "python"
 item "python3"       "$(have python3 && python3 --version 2>&1 || echo 'MISSING')"
-if venv_usable; then
+if [ -x "$VENV_PY" ]; then
     item ".venv"     "present ($("$VENV_PY" --version 2>&1))"
     item "schain"    "$("$VENV_PY" -c 'import schain; print(schain.__version__)' 2>/dev/null || echo 'not importable')"
-elif [ -x "$VENV_PY" ] || [ -d "$REPO_ROOT/.venv" ]; then
-    item ".venv"     "present but incomplete (server_run.sh will repair it)"
 else
     item ".venv"     "missing (server_run.sh will create it)"
 fi
@@ -78,7 +76,7 @@ if values="$(config_values "$CONFIG_FILE" 2>/dev/null)"; then
     item "neo4j database" "$CFG_NEO4J_DATABASE"
     item "state db"      "$CFG_STATE_DB $([ -f "$CFG_STATE_DB" ] && echo '(exists: a run can resume)' || echo '(absent: first run)')"
 else
-    item "config"        "not readable yet (PyYAML missing or config error)"
+    item "config"        "not readable (Python dependencies missing or config error)"
 fi
 
 section "secrets (.env)"

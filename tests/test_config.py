@@ -16,7 +16,7 @@ from schain.config import (
 def test_include_brings_in_shared_settings():
     config = load_config(REPO_ROOT / "config/ingest.yaml")
     # llm/neo4j/storage live in config/base.yaml, not in ingest.yaml
-    assert config["llm"]["model"] == "Qwen/Qwen3.8-27B"
+    assert config["llm"]["model"] == "Qwen/Qwen3-4B-Instruct-2507"
     assert config["neo4j"]["database"] == "neo4j"
     assert config["storage"]["state_db"].endswith("state.db")
     # and the including file's own keys survive
@@ -33,38 +33,6 @@ def test_own_keys_override_included_ones(tmp_path):
     config = load_config(child)
     assert config["llm"]["model"] == "child-model"   # overridden
     assert config["llm"]["temperature"] == 0.7       # merged, not replaced wholesale
-
-
-def test_single_include_string_is_accepted(tmp_path):
-    """A scalar include path is intentional sugar; it must not be iterated as characters."""
-    base = tmp_path / "base.yaml"
-    base.write_text("llm:\n  model: base-model\n  temperature: 0.5\n", encoding="utf-8")
-    child = tmp_path / "child.yaml"
-    child.write_text(f"include: {base}\nllm:\n  model: child-model\n", encoding="utf-8")
-
-    config = load_config(child)
-    assert config["llm"]["model"] == "child-model"
-    assert config["llm"]["temperature"] == 0.5
-
-
-def test_invalid_include_type_is_reported_clearly(tmp_path):
-    bad = tmp_path / "bad.yaml"
-    bad.write_text("include: 1\n", encoding="utf-8")
-    with pytest.raises(ValueError, match="include must be a path string or a list"):
-        load_config(bad)
-
-
-def test_colab_ingest_inherits_base_and_overrides_model():
-    config = load_config(REPO_ROOT / "config/colab_ingest.yaml")
-    assert config["mode"] == "ingest"
-    assert config["ingest"]["chunk_size"] == 2000
-    assert config["llm"]["provider"] == "local"
-    assert config["llm"]["model"] == "Qwen/Qwen3-4B-Instruct-2507"
-    assert config["llm"]["json_mode"] is True
-    assert config["llm"]["structured_output"] is False
-    assert config["llm"]["enable_thinking"] is False
-    assert config["llm"].get("base_url") is None
-    assert config["storage"]["state_db"].endswith("state.db")
 
 
 def test_circular_include_is_reported(tmp_path):

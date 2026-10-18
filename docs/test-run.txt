@@ -1,0 +1,21 @@
+........................................................................ [ 16%]
+.................................................................ssss... [ 33%]
+........................................................................ [ 50%]
+........................................................................ [ 67%]
+........................................................................ [ 84%]
+.................................................................        [100%]
+=============================== warnings summary ===============================
+tests/test_manifest.py::test_expand_writes_a_manifest_and_a_summary
+tests/test_manifest.py::test_resume_does_not_duplicate_manifest_rows
+tests/test_manifest.py::test_resume_does_not_duplicate_manifest_rows
+  /workspace/scratch/10829f77c5da/work/Schain-mirza1/schain/expansion/loop.py:81: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+    known = int(facts.source_known.fillna(False).sum())
+
+tests/test_manifest.py::test_expand_writes_a_manifest_and_a_summary
+tests/test_manifest.py::test_resume_does_not_duplicate_manifest_rows
+tests/test_manifest.py::test_resume_does_not_duplicate_manifest_rows
+  /workspace/scratch/10829f77c5da/work/Schain-mirza1/schain/expansion/loop.py:82: FutureWarning: Downcasting object dtype arrays on .fillna, .ffill, .bfill is deprecated and will change in a future version. Call result.infer_objects(copy=False) instead. To opt-in to the future behavior, set `pd.set_option('future.no_silent_downcasting', True)`
+    unknown = int((~facts.source_known.fillna(False)).sum())
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+421 passed, 4 skipped, 6 warnings in 86.39s (0:01:26)

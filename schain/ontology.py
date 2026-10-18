@@ -93,8 +93,7 @@ def render_schema(schema: dict) -> str:
     return "\n".join(lines)
 
 
-# Worked example from the architecture brief, shown to the model so the expected shape
-# (including evidence) is unambiguous.
+# Worked examples for Prompt 1 — positive cases and near-miss non-relations.
 EXTRACTION_EXAMPLES = """\
 Input text: "CATL supplies battery cells to BMW. The plant is located in Germany."
 Output:
@@ -105,18 +104,35 @@ Output:
 ],
 "relationships": [
   {"type": "suppliesTo", "start_node_id": "0", "end_node_id": "1",
-   "properties": {"evidence": "CATL supplies battery cells to BMW."}}
-]}\
+   "properties": {"evidence": "CATL supplies battery cells to BMW."}},
+  {"type": "locatedIn", "start_node_id": "0", "end_node_id": "2",
+   "properties": {"evidence": "The plant is located in Germany."}}
+]}
+
+Input text: "AutoParts Plus is a distributor of BMW replacement parts for independent repair shops."
+Output:
+{"nodes": [
+  {"id": "0", "label": "Company", "properties": {"name": "AutoParts Plus"}},
+  {"id": "1", "label": "Company", "properties": {"name": "BMW"}}
+],
+"relationships": []}
+
+Input text: "Apollo Funds plans to acquire BatteryCo next year."
+Output:
+{"nodes": [
+  {"id": "0", "label": "Company", "properties": {"name": "Apollo Funds"}},
+  {"id": "1", "label": "Company", "properties": {"name": "BatteryCo"}}
+],
+"relationships": []}
 """
 
 
 class SupplyChainERTemplate(ERExtractionTemplate):
     """Prompt 1 - schema-constrained entity and relation extraction.
 
-    Extends the library template with supply-chain framing, an explicit direction rule
-    for ``suppliesTo`` (the most error-prone relation), and the evidence requirement.
-    The ``{schema}``, ``{examples}`` and ``{text}`` placeholders are required by the
-    library and must be kept.
+    Extends the library template with supply-chain framing, explicit ontology
+    relation meanings, and the evidence requirement. The ``{schema}``,
+    ``{examples}`` and ``{text}`` placeholders are required by the library.
     """
 
     DEFAULT_TEMPLATE = """\
@@ -130,16 +146,63 @@ Extract entities and relationships from the input text below. Return JSON only:
 Use only the following node labels, relationship types and allowed patterns:
 {schema}
 
-Rules:
-- Extract only facts stated in the input text. Never use outside knowledge, and never guess.
-- Use the entity name as written in the text; do not expand or abbreviate it.
-- suppliesTo points from the supplier to the customer. In "X supplies Y to Z" the
-  relationship is X suppliesTo Z, and Y is the supplied product or material.
-- Every relationship must include an "evidence" property containing the verbatim
-  sentence from the input text that supports it.
-- Assign a unique string id to each node and reuse it in the relationships.
+ONTOLOGY RELATION MEANINGS (exact; do not stretch meanings):
+
+suppliesTo (A → B):
+- Means A is a supplier/vendor providing a product, component, material, or other
+  supply input TO B as the customer/recipient in the supply chain.
+- Direction is always supplier → customer.
+- Evidence must establish that B receives / is supplied by A (for example:
+  "A supplies components to B", "B selected A as a supplier",
+  "A will deliver parts to B plants").
+- Do NOT use suppliesTo for: partnership, collaboration, strategic alliance,
+  cooperation, investment, generic commercial association, using a product,
+  selling a branded product in the market, being a reseller/distributor/stockist
+  of replacement/aftermarket parts, retailing parts FOR a brand's vehicles to
+  shops/consumers, or servicing products.
+- Critical: "A sells BMW parts" or "A is a distributor of BMW parts" usually means
+  A sells parts for BMW vehicles to the aftermarket — NOT that A supplies BMW.
+  Only create A --suppliesTo--> BMW when BMW / BMW Group / its manufacturing
+  operation is clearly the receiving customer.
+- Sample shipments, prototypes, C-samples, qualification/evaluation batches, or
+  prospective supply talks alone do NOT establish commercial suppliesTo.
+
+owns (A → B):
+- Means CURRENT ownership or control of B by A.
+- Accept completed acquisition / subsidiary / controlled-by language.
+- Do NOT use owns for: proposed/announced/planned acquisition, agreement to
+  acquire, bid, investment without control, partnership, employment, management.
+
+produces (A → B):
+- Means A actually manufactures / produces / makes B.
+- Do NOT use produces for: uses, sells, distributes, offers, integrates,
+  co-designs, develops jointly, buys, supplies, advertises, or merely lists B
+  in a product ecosystem — unless manufacturing is explicitly established.
+
+locatedIn (A → Location):
+- Means A itself has an established physical / headquarters / facility location.
+- Do NOT attach a location because the article mentions it, a partner is there,
+  a project/event happened there, or an acquisition target is based there.
+- Resolve pronouns ("the company") only when the antecedent is unambiguous.
+  If multiple organizations are possible, omit locatedIn.
+
+Additional rules:
+- Extract only facts stated in the input text. Never use outside knowledge.
+- Use the entity name as written; do not expand or abbreviate it.
+- In "X supplies Y to Z", the relationship is X suppliesTo Z (Y is product/material).
+- Vehicle model names (BMW i7, Tesla Model 3) are Product, not Company.
+- A Product or Material is NEVER a suppliesTo customer.
+- If the text only supports partnership / distribution / investment / planned
+  acquisition / co-design / usage, and NO ontology relation fits: output NO
+  relationship for that pair. Do not force the closest ontology type.
+- Publisher names in titles/bylines are provenance, not actors, unless the
+  evidence describes their own supply-chain activity.
+- Prefer specific named organizations over category phrases.
+- Every relationship must include an "evidence" property with the verbatim
+  supporting sentence from the input text.
+- Assign unique string ids to nodes and reuse them in relationships.
 - Skip anything that does not fit the allowed labels, types and patterns.
-- Return the JSON object on its own, with no backticks and no commentary.
+- Return the JSON object alone, with no backticks and no commentary.
 
 Examples:
 {examples}

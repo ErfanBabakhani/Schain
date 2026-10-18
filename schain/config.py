@@ -7,10 +7,9 @@ Three concerns are kept apart:
 * ``config/ontology.yaml`` the static ontology, so the entity and relation types are
   stated in one place rather than in the code.
 
-A config file may list ``include:`` paths (a single path string or a YAML list).
-Those are loaded first and the including file's own keys are merged over them, so
-``config/ingest.yaml`` and ``config/expansion.yaml`` share one copy of the LLM, Neo4j
-and storage settings.
+A config file may list ``include:`` paths. Those are loaded first and the including
+file's own keys are merged over them, so ``config/ingest.yaml`` and
+``config/expansion.yaml`` share one copy of the LLM, Neo4j and storage settings.
 """
 
 from __future__ import annotations
@@ -53,47 +52,34 @@ def resolve_path(value: str | Path) -> Path:
     return path if path.is_absolute() else REPO_ROOT / path
 
 
-def _normalize_includes(value: Any) -> list[str]:
-    """Normalize ``include:`` to a list of path strings.
-
-    YAML accepts either a single path or a list. A bare string must not be iterated as
-    characters (``include: ingest.yaml`` would otherwise try to open ``i``, ``n``, …).
-    """
-    if value is None or value == [] or value == "":
-        return []
-    if isinstance(value, Path):
-        return [str(value)]
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, list):
-        paths: list[str] = []
-        for entry in value:
-            if isinstance(entry, (str, Path)):
-                paths.append(str(entry))
-            else:
-                raise ValueError(
-                    "include must be a path string or a list of path strings"
-                )
-        return paths
-    raise ValueError("include must be a path string or a list of path strings")
-
-
 def load_config(path: str | Path, _seen: Optional[set[Path]] = None) -> dict[str, Any]:
     """Read a YAML config, apply its ``include:`` chain, and load .env into the environment."""
     load_dotenv(REPO_ROOT / ".env")  # does nothing if .env is absent
 
     path = resolve_path(path).resolve()
-    seen = _seen or set()
+    seen = _seen if _seen is not None else set()
     if path in seen:
         raise ValueError(f"circular config include detected at {path}")
     seen.add(path)
 
-    raw = _read_yaml(path)
-    includes = _normalize_includes(raw.pop("include", None))
-    config: dict[str, Any] = {}
-    for included in includes:
-        config = _deep_merge(config, load_config(included, seen))
-    config = _deep_merge(config, raw)
+    try:
+        raw = _read_yaml(path)
+        includes = raw.pop("include", []) or []
+        runtime_overlay = raw.pop("runtime_overlay", False)
+        if runtime_overlay and (
+            "seeds" in raw or "max_tier" in (raw.get("expansion") or {})
+        ):
+            raise ValueError(
+                f"Runtime overlay {path.name} cannot replace seeds or max_tier; "
+                "edit expansion.yaml or use explicit CLI --seed/--seeds/--max-tier."
+            )
+        config: dict[str, Any] = {}
+        for included in includes:
+            config = _deep_merge(config, load_config(included, seen))
+        config = _deep_merge(config, raw)
+    finally:
+        # Track the recursion stack, not every file ever included (diamond includes).
+        seen.remove(path)
 
     if _seen is None:
         logger.info("loaded config %s (includes: %s)", path.name, includes or "none")
@@ -155,7 +141,10 @@ def resolve_tier_queries(config: dict[str, Any], tier: int) -> list[dict[str, An
     A tier marked ``expand: false`` yields no queries at all: it is terminal, so its
     entities are stored but never searched.
     """
-    search = config.get("expansion", {}).get("search", {})
+    expansion = config.get("expansion", {})
+    if "max_tier" in expansion and tier >= int(expansion["max_tier"]):
+        return []
+    search = expansion.get("search", {})
     global_defaults = search.get("defaults", {}) or {}
     tiers = search.get("tiers", {}) or {}
     # YAML may key tiers as ints or strings; accept both.
@@ -169,6 +158,13 @@ def resolve_tier_queries(config: dict[str, Any], tier: int) -> list[dict[str, An
         entry = dict(entry)
         spec: dict[str, Any] = {"query": entry.pop("query"), "tier": tier}
         for field in INHERITABLE_QUERY_FIELDS:
+            if field == "max_results_by_provider":
+                inherited: dict[str, Any] = {}
+                for source in (global_defaults, tier_defaults, entry):
+                    inherited.update(source.get(field) or {})
+                if inherited:
+                    spec[field] = inherited
+                continue
             for source in (entry, tier_defaults, global_defaults):  # closest first
                 if field in source and source[field] is not None:
                     spec[field] = source[field]
@@ -188,7 +184,11 @@ def query_limit(spec: dict[str, Any], provider: str) -> int:
 
 
 def seed_entities(config: dict[str, Any]) -> list[str]:
-    """Flatten the ``seeds:`` block into one ordered, de-duplicated list of names."""
+    """Flatten the ``seeds:`` block into one ordered, de-duplicated list of names.
+
+    Only active (uncommented) YAML entries are present after ``yaml.safe_load``.
+    Commented seed groups never appear in the config dict and are not loaded.
+    """
     seeds = config.get("seeds", {}) or {}
     if isinstance(seeds, list):
         groups: list[Any] = [seeds]
@@ -197,6 +197,92 @@ def seed_entities(config: dict[str, Any]) -> list[str]:
     names: list[str] = []
     for group in groups:
         for name in group or []:
-            if name not in names:
-                names.append(name)
+            if name and name not in names:
+                names.append(str(name))
     return names
+
+
+def seed_groups(config: dict[str, Any]) -> dict[str, list[str]]:
+    """Return active seed groups as ``{group_name: [names...]}``."""
+    seeds = config.get("seeds", {}) or {}
+    if isinstance(seeds, list):
+        return {"seeds": [str(name) for name in seeds if name]}
+    result: dict[str, list[str]] = {}
+    for group_name, names in seeds.items():
+        cleaned = [str(name) for name in (names or []) if name]
+        if cleaned:
+            result[str(group_name)] = cleaned
+    return result
+
+
+def apply_runtime_overrides(
+    config: dict[str, Any],
+    overrides: Optional[dict[str, Any]] = None,
+    *,
+    protect_seeds: bool = True,
+    protect_max_tier: bool = True,
+) -> dict[str, Any]:
+    """Merge runtime overrides onto config.
+
+    By default ``seeds`` from expansion.yaml are preserved. Runtime overlays must not
+    silently replace seeds. Pass ``protect_seeds=False`` only for an explicit user
+    seed override (CLI ``--seeds``); in that case ``seeds`` are replaced wholesale.
+    """
+    if not overrides:
+        return config
+    overrides = copy.deepcopy(overrides)
+    if protect_max_tier:
+        overrides.get("expansion", {}).pop("max_tier", None)
+    if protect_seeds:
+        overrides.pop("seeds", None)
+        return _deep_merge(config, overrides)
+    # Explicit seed override: replace seeds entirely, then merge the rest.
+    seed_override = overrides.pop("seeds", None)
+    merged = _deep_merge(config, overrides)
+    if seed_override is not None:
+        merged["seeds"] = copy.deepcopy(seed_override)
+    return merged
+
+
+def log_effective_expansion_config(config: dict[str, Any]) -> None:
+    """Log the effective EXPAND settings so seed/policy mistakes are visible."""
+    expansion = config.get("expansion") or {}
+    retrieval = expansion.get("retrieval") or {}
+    seeds = seed_entities(config)
+    groups = seed_groups(config)
+    providers = [name for name in expansion.get("search", {}).get("defaults", {}).get("providers", [])
+                 if expansion.get("sources", {}).get(name, {}).get("enabled", True)]
+    logger.info(
+        "expansion config: seeds=%s seed_count=%s seed_groups=%s max_tier=%s max_documents=%s "
+        "target_documents_by_tier=%s max_documents_by_tier=%s max_documents_per_entity=%s "
+        "frontier_caps=%s providers=%s model=%s runtime_minutes=%s",
+        seeds,
+        len(seeds),
+        {name: len(members) for name, members in groups.items()},
+        expansion.get("max_tier"),
+        expansion.get("max_documents"),
+        retrieval.get("target_documents_by_tier", retrieval.get("target_documents_per_entity")),
+        retrieval.get("max_documents_by_tier"),
+        retrieval.get("max_documents_per_entity"),
+        expansion.get("max_expandable_entities_by_tier"),
+        providers,
+        config.get("llm", {}).get("model"),
+        config.get("runtime", {}).get("max_minutes"),
+    )
+
+
+def validate_expansion_config(config: dict[str, Any]) -> None:
+    """Catch invalid ceilings before a restart can clear any checkpoint files."""
+    expansion = config.get("expansion", {})
+    for key in ("max_tier", "max_documents"):
+        if int(expansion.get(key, 0)) < 0:
+            raise ValueError(f"expansion.{key} must be nonnegative")
+    if float(config.get("runtime", {}).get("max_minutes", 110)) < 0:
+        raise ValueError("runtime.max_minutes must be nonnegative")
+    retrieval = expansion.get("retrieval", {})
+    for key in ("target_documents_per_entity", "max_documents_per_entity"):
+        if key in retrieval and int(retrieval[key]) < 0:
+            raise ValueError(f"expansion.retrieval.{key} must be nonnegative")
+    for key in ("target_documents_by_tier", "max_documents_by_tier"):
+        if any(int(v) < 0 for v in (retrieval.get(key) or {}).values()):
+            raise ValueError(f"expansion.retrieval.{key} values must be nonnegative")

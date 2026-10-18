@@ -1,0 +1,578 @@
+{
+  "schema_version": "1.0",
+  "metadata": {
+    "demo": true,
+    "generated_at": "2026-09-08",
+    "description": "Entirely synthetic. No model calls. Not measured research results."
+  },
+  "nodes": [
+    {
+      "id": "demo:aster",
+      "name": "Aster Motors",
+      "type": "Company",
+      "aliases": [
+        "Aster Motors"
+      ],
+      "discovery_tier": 0,
+      "is_seed": true
+    },
+    {
+      "id": "demo:boreal",
+      "name": "Boreal Mobility",
+      "type": "Company",
+      "aliases": [
+        "Boreal Mobility"
+      ],
+      "discovery_tier": 0,
+      "is_seed": true
+    },
+    {
+      "id": "demo:cell",
+      "name": "Cobalt Cellworks",
+      "type": "Company",
+      "aliases": [
+        "Cobalt Cellworks"
+      ],
+      "discovery_tier": 1,
+      "is_seed": false
+    },
+    {
+      "id": "demo:chip",
+      "name": "Helix Semiconductors",
+      "type": "Company",
+      "aliases": [
+        "Helix Semiconductors"
+      ],
+      "discovery_tier": 1,
+      "is_seed": false
+    },
+    {
+      "id": "demo:drive",
+      "name": "Meridian Drives",
+      "type": "Company",
+      "aliases": [
+        "Meridian Drives"
+      ],
+      "discovery_tier": 1,
+      "is_seed": false
+    },
+    {
+      "id": "demo:refine",
+      "name": "Lumen Refining",
+      "type": "Company",
+      "aliases": [
+        "Lumen Refining"
+      ],
+      "discovery_tier": 2,
+      "is_seed": false
+    },
+    {
+      "id": "demo:metals",
+      "name": "Rivet Metals",
+      "type": "Company",
+      "aliases": [
+        "Rivet Metals"
+      ],
+      "discovery_tier": 2,
+      "is_seed": false
+    },
+    {
+      "id": "demo:mine",
+      "name": "Orchard Mine",
+      "type": "Mine",
+      "aliases": [
+        "Orchard Mine"
+      ],
+      "discovery_tier": 3,
+      "is_seed": false
+    },
+    {
+      "id": "demo:silicon",
+      "name": "Quartz Materials",
+      "type": "Company",
+      "aliases": [
+        "Quartz Materials"
+      ],
+      "discovery_tier": 2,
+      "is_seed": false
+    },
+    {
+      "id": "demo:port",
+      "name": "Northport",
+      "type": "Location",
+      "aliases": [
+        "Northport"
+      ],
+      "discovery_tier": null,
+      "is_seed": false
+    },
+    {
+      "id": "demo:cells",
+      "name": "Battery cells",
+      "type": "Product",
+      "aliases": [
+        "Battery cells"
+      ],
+      "discovery_tier": null,
+      "is_seed": false
+    },
+    {
+      "id": "demo:lithium",
+      "name": "Lithium carbonate",
+      "type": "Material",
+      "aliases": [
+        "Lithium carbonate"
+      ],
+      "discovery_tier": null,
+      "is_seed": false
+    }
+  ],
+  "edges": [
+    {
+      "id": "demo-edge-0",
+      "source": "demo:cell",
+      "target": "demo:aster",
+      "relation": "suppliesTo",
+      "source_doc_ids": [
+        "synthetic-01"
+      ],
+      "support_count": 1,
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "doc_id": "synthetic-01",
+          "fact_id": "demo-fact-0",
+          "quote": "Cobalt Cellworks supplies battery cells to Aster Motors.",
+          "document_title": "Fictional interface fixture",
+          "source_url": null,
+          "content_source": "synthetic_fixture",
+          "provider": "demo",
+          "chunk_index": 0,
+          "model": null,
+          "evidence_quote_grounded": true
+        }
+      ],
+      "quality": {
+        "status": "unchecked",
+        "evidence_validated": false,
+        "evidence_quote_grounded": true,
+        "contested": false
+      },
+      "expansion_relevant": true
+    },
+    {
+      "id": "demo-edge-1",
+      "source": "demo:cell",
+      "target": "demo:boreal",
+      "relation": "suppliesTo",
+      "source_doc_ids": [
+        "synthetic-02"
+      ],
+      "support_count": 1,
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "doc_id": "synthetic-02",
+          "fact_id": "demo-fact-1",
+          "quote": "Cobalt Cellworks supplies battery cells to Boreal Mobility.",
+          "document_title": "Fictional interface fixture",
+          "source_url": null,
+          "content_source": "synthetic_fixture",
+          "provider": "demo",
+          "chunk_index": 0,
+          "model": null,
+          "evidence_quote_grounded": true
+        }
+      ],
+      "quality": {
+        "status": "unchecked",
+        "evidence_validated": false,
+        "evidence_quote_grounded": true,
+        "contested": false
+      },
+      "expansion_relevant": true
+    },
+    {
+      "id": "demo-edge-2",
+      "source": "demo:chip",
+      "target": "demo:aster",
+      "relation": "suppliesTo",
+      "source_doc_ids": [
+        "synthetic-03"
+      ],
+      "support_count": 1,
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "doc_id": "synthetic-03",
+          "fact_id": "demo-fact-2",
+          "quote": "Helix Semiconductors supplies chips to Aster Motors.",
+          "document_title": "Fictional interface fixture",
+          "source_url": null,
+          "content_source": "synthetic_fixture",
+          "provider": "demo",
+          "chunk_index": 0,
+          "model": null,
+          "evidence_quote_grounded": true
+        }
+      ],
+      "quality": {
+        "status": "unchecked",
+        "evidence_validated": false,
+        "evidence_quote_grounded": true,
+        "contested": false
+      },
+      "expansion_relevant": true
+    },
+    {
+      "id": "demo-edge-3",
+      "source": "demo:drive",
+      "target": "demo:boreal",
+      "relation": "suppliesTo",
+      "source_doc_ids": [
+        "synthetic-04"
+      ],
+      "support_count": 1,
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "doc_id": "synthetic-04",
+          "fact_id": "demo-fact-3",
+          "quote": "Meridian Drives supplies motors to Boreal Mobility.",
+          "document_title": "Fictional interface fixture",
+          "source_url": null,
+          "content_source": "synthetic_fixture",
+          "provider": "demo",
+          "chunk_index": 0,
+          "model": null,
+          "evidence_quote_grounded": true
+        }
+      ],
+      "quality": {
+        "status": "unchecked",
+        "evidence_validated": false,
+        "evidence_quote_grounded": true,
+        "contested": false
+      },
+      "expansion_relevant": true
+    },
+    {
+      "id": "demo-edge-4",
+      "source": "demo:refine",
+      "target": "demo:cell",
+      "relation": "suppliesTo",
+      "source_doc_ids": [
+        "synthetic-05"
+      ],
+      "support_count": 1,
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "doc_id": "synthetic-05",
+          "fact_id": "demo-fact-4",
+          "quote": "Lumen Refining supplies lithium carbonate to Cobalt Cellworks.",
+          "document_title": "Fictional interface fixture",
+          "source_url": null,
+          "content_source": "synthetic_fixture",
+          "provider": "demo",
+          "chunk_index": 0,
+          "model": null,
+          "evidence_quote_grounded": true
+        }
+      ],
+      "quality": {
+        "status": "unchecked",
+        "evidence_validated": false,
+        "evidence_quote_grounded": true,
+        "contested": false
+      },
+      "expansion_relevant": true
+    },
+    {
+      "id": "demo-edge-5",
+      "source": "demo:metals",
+      "target": "demo:drive",
+      "relation": "suppliesTo",
+      "source_doc_ids": [
+        "synthetic-06"
+      ],
+      "support_count": 1,
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "doc_id": "synthetic-06",
+          "fact_id": "demo-fact-5",
+          "quote": "Rivet Metals supplies metal parts to Meridian Drives.",
+          "document_title": "Fictional interface fixture",
+          "source_url": null,
+          "content_source": "synthetic_fixture",
+          "provider": "demo",
+          "chunk_index": 0,
+          "model": null,
+          "evidence_quote_grounded": true
+        }
+      ],
+      "quality": {
+        "status": "unchecked",
+        "evidence_validated": false,
+        "evidence_quote_grounded": true,
+        "contested": false
+      },
+      "expansion_relevant": true
+    },
+    {
+      "id": "demo-edge-6",
+      "source": "demo:mine",
+      "target": "demo:refine",
+      "relation": "suppliesTo",
+      "source_doc_ids": [
+        "synthetic-07"
+      ],
+      "support_count": 1,
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "doc_id": "synthetic-07",
+          "fact_id": "demo-fact-6",
+          "quote": "Orchard Mine supplies ore to Lumen Refining.",
+          "document_title": "Fictional interface fixture",
+          "source_url": null,
+          "content_source": "synthetic_fixture",
+          "provider": "demo",
+          "chunk_index": 0,
+          "model": null,
+          "evidence_quote_grounded": true
+        }
+      ],
+      "quality": {
+        "status": "unchecked",
+        "evidence_validated": false,
+        "evidence_quote_grounded": true,
+        "contested": false
+      },
+      "expansion_relevant": true
+    },
+    {
+      "id": "demo-edge-7",
+      "source": "demo:silicon",
+      "target": "demo:chip",
+      "relation": "suppliesTo",
+      "source_doc_ids": [
+        "synthetic-08"
+      ],
+      "support_count": 1,
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "doc_id": "synthetic-08",
+          "fact_id": "demo-fact-7",
+          "quote": "Quartz Materials supplies silicon to Helix Semiconductors.",
+          "document_title": "Fictional interface fixture",
+          "source_url": null,
+          "content_source": "synthetic_fixture",
+          "provider": "demo",
+          "chunk_index": 0,
+          "model": null,
+          "evidence_quote_grounded": true
+        }
+      ],
+      "quality": {
+        "status": "unchecked",
+        "evidence_validated": false,
+        "evidence_quote_grounded": true,
+        "contested": false
+      },
+      "expansion_relevant": true
+    },
+    {
+      "id": "demo-edge-8",
+      "source": "demo:cell",
+      "target": "demo:cells",
+      "relation": "produces",
+      "source_doc_ids": [
+        "synthetic-09"
+      ],
+      "support_count": 1,
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "doc_id": "synthetic-09",
+          "fact_id": "demo-fact-8",
+          "quote": "Cobalt Cellworks produces battery cells.",
+          "document_title": "Fictional interface fixture",
+          "source_url": null,
+          "content_source": "synthetic_fixture",
+          "provider": "demo",
+          "chunk_index": 0,
+          "model": null,
+          "evidence_quote_grounded": true
+        }
+      ],
+      "quality": {
+        "status": "unchecked",
+        "evidence_validated": false,
+        "evidence_quote_grounded": true,
+        "contested": false
+      },
+      "expansion_relevant": false
+    },
+    {
+      "id": "demo-edge-9",
+      "source": "demo:refine",
+      "target": "demo:lithium",
+      "relation": "produces",
+      "source_doc_ids": [
+        "synthetic-10"
+      ],
+      "support_count": 1,
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "doc_id": "synthetic-10",
+          "fact_id": "demo-fact-9",
+          "quote": "Lumen Refining produces lithium carbonate.",
+          "document_title": "Fictional interface fixture",
+          "source_url": null,
+          "content_source": "synthetic_fixture",
+          "provider": "demo",
+          "chunk_index": 0,
+          "model": null,
+          "evidence_quote_grounded": true
+        }
+      ],
+      "quality": {
+        "status": "unchecked",
+        "evidence_validated": false,
+        "evidence_quote_grounded": true,
+        "contested": false
+      },
+      "expansion_relevant": false
+    },
+    {
+      "id": "demo-edge-10",
+      "source": "demo:cell",
+      "target": "demo:port",
+      "relation": "locatedIn",
+      "source_doc_ids": [
+        "synthetic-11"
+      ],
+      "support_count": 1,
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "doc_id": "synthetic-11",
+          "fact_id": "demo-fact-10",
+          "quote": "Cobalt Cellworks is located in Northport.",
+          "document_title": "Fictional interface fixture",
+          "source_url": null,
+          "content_source": "synthetic_fixture",
+          "provider": "demo",
+          "chunk_index": 0,
+          "model": null,
+          "evidence_quote_grounded": true
+        }
+      ],
+      "quality": {
+        "status": "unchecked",
+        "evidence_validated": false,
+        "evidence_quote_grounded": true,
+        "contested": false
+      },
+      "expansion_relevant": false
+    },
+    {
+      "id": "demo-edge-11",
+      "source": "demo:refine",
+      "target": "demo:mine",
+      "relation": "owns",
+      "source_doc_ids": [
+        "synthetic-12"
+      ],
+      "support_count": 1,
+      "evidence_count": 1,
+      "evidence": [
+        {
+          "doc_id": "synthetic-12",
+          "fact_id": "demo-fact-11",
+          "quote": "Lumen Refining owns Orchard Mine.",
+          "document_title": "Fictional interface fixture",
+          "source_url": null,
+          "content_source": "synthetic_fixture",
+          "provider": "demo",
+          "chunk_index": 0,
+          "model": null,
+          "evidence_quote_grounded": true
+        }
+      ],
+      "quality": {
+        "status": "unchecked",
+        "evidence_validated": false,
+        "evidence_quote_grounded": true,
+        "contested": false
+      },
+      "expansion_relevant": false
+    }
+  ],
+  "documents": [
+    {
+      "doc_id": "synthetic-01",
+      "title": "Fictional interface fixture",
+      "text": "Cobalt Cellworks supplies battery cells to Aster Motors."
+    },
+    {
+      "doc_id": "synthetic-02",
+      "title": "Fictional interface fixture",
+      "text": "Cobalt Cellworks supplies battery cells to Boreal Mobility."
+    },
+    {
+      "doc_id": "synthetic-03",
+      "title": "Fictional interface fixture",
+      "text": "Helix Semiconductors supplies chips to Aster Motors."
+    },
+    {
+      "doc_id": "synthetic-04",
+      "title": "Fictional interface fixture",
+      "text": "Meridian Drives supplies motors to Boreal Mobility."
+    },
+    {
+      "doc_id": "synthetic-05",
+      "title": "Fictional interface fixture",
+      "text": "Lumen Refining supplies lithium carbonate to Cobalt Cellworks."
+    },
+    {
+      "doc_id": "synthetic-06",
+      "title": "Fictional interface fixture",
+      "text": "Rivet Metals supplies metal parts to Meridian Drives."
+    },
+    {
+      "doc_id": "synthetic-07",
+      "title": "Fictional interface fixture",
+      "text": "Orchard Mine supplies ore to Lumen Refining."
+    },
+    {
+      "doc_id": "synthetic-08",
+      "title": "Fictional interface fixture",
+      "text": "Quartz Materials supplies silicon to Helix Semiconductors."
+    },
+    {
+      "doc_id": "synthetic-09",
+      "title": "Fictional interface fixture",
+      "text": "Cobalt Cellworks produces battery cells."
+    },
+    {
+      "doc_id": "synthetic-10",
+      "title": "Fictional interface fixture",
+      "text": "Lumen Refining produces lithium carbonate."
+    },
+    {
+      "doc_id": "synthetic-11",
+      "title": "Fictional interface fixture",
+      "text": "Cobalt Cellworks is located in Northport."
+    },
+    {
+      "doc_id": "synthetic-12",
+      "title": "Fictional interface fixture",
+      "text": "Lumen Refining owns Orchard Mine."
+    }
+  ]
+}

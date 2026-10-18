@@ -98,8 +98,10 @@ def test_new_alias_attaches_to_an_existing_canonical_entity():
          "canonical_id": "company:contemporary-amperex-technology",
          "canonical_name": "Contemporary Amperex Technology Co. Limited", "method": "llm"},
     ])
-    llm = GroupingLLM([["CATL Ningde", "Contemporary Amperex Technology Co. Limited"]])
-    resolution, _ = resolve_entities(graph(("Company", "CATL Ningde")), llm=llm, cache=cache)
+    # A real acronym may attach; a qualified subsidiary name must stay separate.
+    llm = GroupingLLM([["CATL", "Contemporary Amperex Technology Co. Limited"]])
+    cache = {"company:known-parent": next(iter(cache.values()))}
+    resolution, _ = resolve_entities(graph(("Company", "CATL")), llm=llm, cache=cache)
     assert list(resolution.values())[0]["canonical_id"] == (
         "company:contemporary-amperex-technology"
     )
