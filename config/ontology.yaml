@@ -49,6 +49,11 @@ ontology:
       MMC Norilsk Nickel: Norilsk Nickel
       Ganfeng: Ganfeng Lithium Co Ltd
       Tianqi: Tianqi Lithium
+      # Common OEM name variants seen in news headlines (seed may be the short form).
+      BMW Group: BMW
+      BMW AG: BMW
+      Bayerische Motoren Werke AG: BMW
+      Bayerische Motoren Werke: BMW
 
   # Allowed (source, relation, target) combinations. The frozen decisions fix the type
   # lists but not the combinations, so they are stated explicitly here.

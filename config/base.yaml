@@ -5,15 +5,53 @@
 
 ontology_file: config/ontology.yaml
 
+# Applies to both INGEST and EXPAND; a failed chunk remains retryable.
+ingest:
+  on_error: RAISE
+
 runtime:
   # Resume is the default: work already completed in a previous run is not redone.
   resume: true
   # Set true (or pass --restart) to clear checkpoint state and recompute from scratch.
   restart_from_scratch: false
+  # Wall-clock budget for a whole run (minutes). Soft stop: finish current unit, persist, export.
+  # Professor / Colab runs may use ~120 minutes when useful evidence remains.
+  max_minutes: 120
+  max_consecutive_failures: 5
+  max_document_attempts: 2
+
+source_reputation:
+  enabled: true
+  path: config/source_reputation.yaml
+
+# Ontology gate + selective evidence entailment (before edge aggregation).
+# Source reputation is informational only and does not gate acceptance or frontier.
+validation:
+  ontology:
+    enabled: true
+    repair_invalid_relation: true
+    max_repair_attempts: 1
+  evidence:
+    enabled: true
+    # Reject evidence that does not occur in the supplied source text.
+    require_source_quote: true
+    validate_tier_advancing_edges: true
+    validate_risky_relations:
+      - owns
+      - locatedIn
+      - produces
+    batch_size: 10
+    # Relation-specific lexical + directional policy (assists LLM; not a lone filter).
+    policy_file: config/relation_evidence.yaml
+
+# Multi-source / second-source verification is disabled.
+# Kept as an explicit off-switch so old configs do not re-enable dead behavior.
+verification:
+  enabled: false
 
 llm:
   provider: local              # local = OpenAI-compatible server (vLLM) | api = hosted API
-  model: Qwen/Qwen3.8-27B
+  model: Qwen/Qwen3-4B-Instruct-2507
   backend: vllm
   base_url: http://localhost:8000/v1
   enable_thinking: false       # sent to vLLM as chat_template_kwargs.enable_thinking
@@ -25,6 +63,9 @@ llm:
   # enough in practice. Independent of json_mode, which still constrains Prompt 2.
   structured_output: false
   request_timeout_seconds: 120
+  max_tokens: 2048
+  client_max_retries: 0
+  rate_limit_max_attempts: 1
 
 neo4j:
   database: neo4j
@@ -46,4 +87,9 @@ storage:
   extractions: data/processed/extractions
   search_results: data/processed/search_results.parquet
   entity_resolution: data/processed/entity_resolution.parquet
+  rejected_facts: data/processed/rejected_facts.parquet
+  edge_support: data/processed/edge_support.parquet
+  verification_evidence: data/processed/verification_evidence.parquet
   state_db: data/state/state.db
+  # Derived frontend-ready semantic graph (not a source of truth; regenerated on demand).
+  graph_export: outputs/supply_chain_graph.v1.json

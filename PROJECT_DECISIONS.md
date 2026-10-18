@@ -14,17 +14,14 @@ Existing-edge monitoring is not part of V1.
 
 ## 2. Seeds
 
-The default seed configuration contains the 13 AlMahri-style companies:
-- Toyota, Tesla Inc., BMW, BYD Co., Ltd.
-- Samsung SDI, CATL, Panasonic
-- Zijin Mining, Albemarle Corporation, Tianqi Lithium, Ganfeng Lithium Co Ltd, Norilsk Nickel, Jinchuan Group
-
-Seeds are user-configurable and may be expanded.
+The current experiment enables Toyota, Tesla Inc., BMW and BYD Co., Ltd. as Tier 0.
+The battery and mining seed groups remain commented examples for a separate paper
+replication experiment. `config/expansion.yaml` is authoritative; changes are explicit.
 
 ## 3. Boundary
 
-Tier 0 contains seed entities. Upstream discovery continues through at most Tier 6 by
-default (raised from 3 for the production experiment); Tier 6 is terminal, so its entities
+Tier 0 contains seed entities. Upstream discovery continues through at most Tier 5 by
+default; Tier 5 is terminal, so its entities
 and relations are stored but never searched. `max_tier` remains configurable, and smoke
 tests use a much smaller depth.
 
@@ -62,7 +59,7 @@ Prompt 1 performs schema-guided entity and relation extraction.
 Prompt 2 performs entity disambiguation/canonicalization to prevent duplicate graph nodes.
 
 Primary local model:
-`Qwen/Qwen3.8-27B`, non-thinking/instruct behavior, served with vLLM.
+`Qwen/Qwen3-4B-Instruct-2507`, non-thinking/instruct behavior, served with vLLM.
 
 The LLM is accessed through one provider interface so another API/local provider can be substituted without rewriting KG logic.
 
@@ -114,3 +111,28 @@ The primary final output of V1 is the knowledge graph stored in **Neo4j**.
 Intermediate source data, extracted facts, and checkpoint state are also retained outside Neo4j so the pipeline remains reproducible and resumable.
 
 For visualization, use **Neo4j Browser** for basic graph inspection and demonstration. No custom visualization dashboard or frontend is required in V1.
+
+## 12. User-authorized evidence and visualization upgrade (2026-09-08)
+
+The user requested a paper/code review, efficiency improvements, a useful graph view,
+and a new code version. Release 0.2.0 adds a local offline HTML evidence explorer;
+this is an explicit exception to the earlier no-custom-visualization scope.
+INGEST/EXPAND, static ontology, configurable seeds and one-explicit-source acceptance
+remain the operating design. Source reputation is descriptive, not a confidence score.
+
+Newly processed evidence must occur in the source text after Unicode/whitespace
+normalization. Successful extraction chunks are checkpointed; default chunk errors
+raise for resumable recovery. Distinct quote/chunk witnesses are persisted separately
+and aggregate into one semantic edge. New validation/gold.py adds exact held-out
+relation scoring; it is separate from external-reference coverage. These changes
+are engineering improvements, not measured replication or accuracy claims.
+
+See START_HERE.md, docs/UPGRADE_REVIEW.md and docs/TEST_RESULTS.md. Completed legacy
+checkpoints are reused; re-extract into separate paths/database to compare quality.
+
+## v0.3.0 audited policy
+
+See `docs/AUDIT_V0.3.0.md`: one grounded valid source remains sufficient; reputation is
+informational; only suppliesTo advances tiers; type-preserving frontier and cumulative
+document/runtime budgets are required. Legacy unknown-grounding facts remain global
+but cannot establish the core. The frontend was not changed.

@@ -17,6 +17,14 @@ ARTICLE = (
 )
 
 
+@pytest.fixture(autouse=True)
+def no_live_canonical_resolution(monkeypatch):
+    """These orchestration fixtures do not provide publisher pages."""
+    async def unresolved(*args, **kwargs):
+        return None
+    monkeypatch.setattr(retrieve, "resolve_canonical_url", unresolved)
+
+
 @pytest.fixture
 def two_provider_config(expand_config):
     """One query, two providers, so the assertions are about orchestration only."""

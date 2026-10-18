@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+from html import unescape
 from typing import Any
 from xml.etree import ElementTree
 
@@ -25,8 +26,31 @@ _TAG_PATTERN = re.compile(r"<[^>]+>")
 
 def strip_html(text: str) -> str:
     """RSS descriptions carry markup; the LLM should not see tags or the gaps they leave."""
-    without_tags = _TAG_PATTERN.sub(" ", text or "").replace("&nbsp;", " ")
+    without_tags = unescape(_TAG_PATTERN.sub(" ", text or "")).replace("\xa0", " ")
     return re.sub(r"\s+", " ", without_tags).strip()
+
+
+def clean_attribution(text: str, publisher: str | None) -> str:
+    """Remove only a known RSS publisher attribution, never a guessed article actor."""
+    text = " ".join(str(text or "").split())
+    if not publisher:
+        return text
+    return re.sub(r"\s+[-–—|]\s+" + re.escape(publisher) + r"\s*$", "", text,
+                  flags=re.IGNORECASE).strip()
+
+
+def clean_description(raw: str, publisher: str | None, title: str) -> str:
+    """Google RSS repeats its publisher in a final font tag, outside the headline."""
+    if publisher:
+        raw = re.sub(
+            r"<font\b[^>]*>\s*" + re.escape(publisher) + r"\s*</font>\s*$",
+            "", raw, flags=re.IGNORECASE,
+        )
+    text = clean_attribution(strip_html(raw), publisher)
+    # Some feeds omit font markup but still append exactly headline + attribution.
+    if publisher and text.casefold() == f"{title} {publisher}".casefold():
+        return title
+    return text
 
 
 async def search(
@@ -38,10 +62,7 @@ async def search(
     options = options or {}
     language = options.get("language", "en-US")
     country = language.split("-")[-1] if "-" in language else "US"
-    url = (
-        f"{FEED_URL}?q={httpx.QueryParams({'q': query})['q']}"
-        f"&hl={language}&gl={country}&ceid={country}:{language.split('-')[0]}"
-    )
+    url = f"{FEED_URL}?{httpx.QueryParams({'q': query, 'hl': language, 'gl': country, 'ceid': country + ':' + language.split('-')[0]})}"
 
     body = await get_text(client, url)
     if not body:
@@ -53,17 +74,25 @@ async def search(
         return []
 
     results = []
-    for item in root.iterfind(".//item")   :
+    for item in root.iterfind(".//item"):
         link = (item.findtext("link") or "").strip()
         if not link:
             continue
+        source = item.find("source")
+        publisher = (source.text or "").strip() if source is not None else None
+        publisher_url = source.get("url") if source is not None else None
+        raw_title = (item.findtext("title") or "").strip()
+        title = clean_attribution(raw_title, publisher)
         results.append(
             SearchResult(
                 provider="google_news",
                 query=query,
-                title=(item.findtext("title") or "").strip(),
+                title=title,
                 url=link,
-                snippet=strip_html(item.findtext("description") or ""),
+                snippet=clean_description(item.findtext("description") or "", publisher, title),
+                publisher_name=publisher or None,
+                publisher_url=publisher_url,
+                raw_title=raw_title,
                 published=(item.findtext("pubDate") or "").strip() or None,
                 language=language,
             )

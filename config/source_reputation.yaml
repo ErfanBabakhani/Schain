@@ -1,0 +1,656 @@
+# SChain Source Reputation Policy
+# ------------------------------------------------------------
+# Purpose:
+#   Provide a configurable PRIOR for source quality as DISPLAY / ANALYSIS
+#   metadata on documents, facts, and graph export.
+#
+# Important (current pipeline):
+#   - Source reputation is INFORMATIONAL only.
+#   - It does NOT reject facts, block edges, or gate frontier expansion.
+#   - A high source score never overrides invalid ontology or unsupported evidence.
+#   - One ontology-valid + evidence-supported source is enough for an edge
+#     and for suppliesTo frontier advancement (including Google News wrappers).
+#   - Legacy "verification" / "independence" blocks below are documentation-only
+#     and are not used for runtime decisions.
+#
+# Matching rule expected in code:
+#   normalized_host == configured_domain
+#   OR normalized_host.endswith("." + configured_domain)
+# Never use naive substring matching.
+
+version: 1
+
+policy:
+  enabled: true
+
+  # Unknown domains remain usable so the system is not too strict.
+  unknown:
+    base_score: 50
+    tier: unknown
+    allow_for_discovery: true
+    allow_for_candidate: true
+    allow_for_verification: true
+    can_advance_frontier_alone: false
+
+  # Scores below this threshold are retained only for audit/discovery.
+  minimum_countable_score: 35
+
+  # Scores at or above this level may qualify as a strong single-source candidate
+  # if all other requirements are also satisfied.
+  strong_source_score: 85
+
+  # "Trusted" here means a useful project prior, not a guarantee of factual correctness.
+  trusted_source_score: 75
+
+  # These sources may be kept in audit logs but cannot promote an edge.
+  hard_reject_below: 20
+
+  # A source score can never rescue a semantically invalid fact.
+  require_ontology_valid: true
+  require_evidence_entailment: true
+
+  # Do not automatically reject old sources. Supplier relationships can be historical.
+  # Publication time should be stored separately and interpreted at query time.
+  use_recency_in_score: false
+
+content_quality:
+  # Additive modifiers applied after domain/category score.
+  full_text_bonus: 5
+  title_snippet_penalty: 15
+  canonical_url_resolved_bonus: 2
+
+  # Prevent title/snippet-only evidence from being treated like a full article.
+  title_snippet_score_cap: 60
+
+  # A single title/snippet can remain a candidate, but cannot become strong_candidate.
+  title_snippet_can_be_strong_candidate: false
+
+  # Supported status requires at least one full-text source.
+  supported_requires_full_text: true
+
+  # Verified status requires at least two full-text independent source groups.
+  verified_min_full_text_groups: 2
+
+verification:
+  statuses:
+    candidate:
+      description: "One usable supporting source, or evidence below promotion thresholds."
+      min_independent_source_groups: 1
+
+    strong_candidate:
+      description: "One high-quality explicit full-text source with valid ontology and entailed evidence."
+      min_independent_source_groups: 1
+      min_max_source_score: 85
+      require_full_text: true
+      require_ontology_valid: true
+      require_evidence_entailment: true
+
+    supported:
+      description: "At least two genuinely independent supporting source groups."
+      min_independent_source_groups: 2
+      min_each_source_score: 35
+      min_average_source_score: 45
+      require_at_least_one_full_text: true
+      require_ontology_valid: true
+      require_evidence_entailment: true
+
+    verified:
+      description: "At least three independent credible source groups."
+      min_independent_source_groups: 3
+      min_each_source_score: 45
+      min_average_source_score: 55
+      require_at_least_one_trusted_source: true
+      require_min_full_text_groups: 2
+      require_ontology_valid: true
+      require_evidence_entailment: true
+
+  # Unknown-source behavior requested for SChain:
+  # two independent unknown domains may still become supported.
+  unknown_source_rule:
+    allow_two_unknown_independent_sources_as_supported: true
+    minimum_score_per_unknown_source: 35
+    require_at_least_one_full_text: true
+    require_both_evidence_entailment: true
+
+  # Conflicting sources should not be silently averaged.
+  conflict_policy:
+    mark_as_contested: true
+    contested_can_advance_frontier: false
+
+frontier:
+  allow_statuses:
+    - supported
+    - verified
+    - strong_candidate
+
+  # Weak single-source candidates stay visible in the graph,
+  # but do not drive deeper expansion.
+  candidate_can_advance: false
+
+  # One primary/official source may advance if it is explicit and full-text.
+  strong_candidate_can_advance: true
+
+independence:
+  # Same publisher/domain normally counts once per edge.
+  one_group_per_registered_domain: true
+
+  # Syndicated copies should collapse even when hosted on different domains.
+  cluster_syndicated_content: true
+
+  content_hash_exact_match_is_same_group: true
+
+  # Suggested threshold for normalized title/body similarity.
+  near_duplicate_similarity_threshold: 0.92
+
+  # Press-release distributors and mirrors must resolve to the original release
+  # when possible and must not inflate independent support count.
+  collapse_press_release_syndication: true
+
+  # Retrieval wrappers are never counted as publishers themselves.
+  wrapper_domains_do_not_count_as_independent_sources: true
+
+source_classes:
+  official_primary:
+    default_score: 95
+    count_for_verification: true
+    notes: "Official company/institution source. Strong for explicit claims made by that organization."
+
+  regulatory_government:
+    default_score: 96
+    count_for_verification: true
+    notes: "Government, regulator, exchange, or statutory filing source."
+
+  international_organization:
+    default_score: 92
+    count_for_verification: true
+
+  major_wire_news:
+    default_score: 90
+    count_for_verification: true
+
+  major_financial_news:
+    default_score: 88
+    count_for_verification: true
+
+  established_general_news:
+    default_score: 82
+    count_for_verification: true
+
+  established_industry_trade:
+    default_score: 80
+    count_for_verification: true
+
+  academic_publisher_repository:
+    default_score: 78
+    count_for_verification: true
+    notes: "Useful for historical/background claims; not automatically authoritative for current supplier status."
+
+  press_release_distributor:
+    default_score: 72
+    count_for_verification: true
+    notes: "Useful primary-company evidence, but syndicated copies must collapse to one source group."
+
+  market_aggregator:
+    default_score: 58
+    count_for_verification: true
+    notes: "May republish third-party content; resolve original publisher when possible."
+
+  user_generated:
+    default_score: 30
+    count_for_verification: false
+
+  unknown:
+    default_score: 50
+    count_for_verification: true
+
+  retrieval_wrapper:
+    default_score: 0
+    count_for_verification: false
+    notes: "Not an original publisher; resolve canonical source URL."
+
+# -------------------------------------------------------------------
+# Domain registry
+# Scores are project priors and should be reviewed periodically.
+# The list is intentionally not exhaustive: unknown domains fall back
+# to policy.unknown.base_score instead of being rejected.
+# -------------------------------------------------------------------
+domains:
+
+  # ----- Regulators / government / official data -----
+  sec.gov:
+    score: 98
+    class: regulatory_government
+  europa.eu:
+    score: 96
+    class: regulatory_government
+  ec.europa.eu:
+    score: 96
+    class: regulatory_government
+  gov.uk:
+    score: 95
+    class: regulatory_government
+  bundesregierung.de:
+    score: 95
+    class: regulatory_government
+  bund.de:
+    score: 95
+    class: regulatory_government
+  federalregister.gov:
+    score: 97
+    class: regulatory_government
+  commerce.gov:
+    score: 96
+    class: regulatory_government
+  energy.gov:
+    score: 96
+    class: regulatory_government
+  transportation.gov:
+    score: 96
+    class: regulatory_government
+  nhtsa.gov:
+    score: 96
+    class: regulatory_government
+  census.gov:
+    score: 96
+    class: regulatory_government
+  usgs.gov:
+    score: 97
+    class: regulatory_government
+  data.gov:
+    score: 95
+    class: regulatory_government
+  bts.gov:
+    score: 96
+    class: regulatory_government
+
+  # ----- International / multilateral organizations -----
+  oecd.org:
+    score: 92
+    class: international_organization
+  worldbank.org:
+    score: 92
+    class: international_organization
+  imf.org:
+    score: 92
+    class: international_organization
+  wto.org:
+    score: 93
+    class: international_organization
+  un.org:
+    score: 92
+    class: international_organization
+  unece.org:
+    score: 92
+    class: international_organization
+  ilo.org:
+    score: 91
+    class: international_organization
+  iea.org:
+    score: 92
+    class: international_organization
+
+  # ----- Major wire / news agencies -----
+  reuters.com:
+    score: 92
+    class: major_wire_news
+  apnews.com:
+    score: 91
+    class: major_wire_news
+  afp.com:
+    score: 89
+    class: major_wire_news
+
+  # ----- Major financial / business news -----
+  bloomberg.com:
+    score: 90
+    class: major_financial_news
+  ft.com:
+    score: 90
+    class: major_financial_news
+  wsj.com:
+    score: 89
+    class: major_financial_news
+  cnbc.com:
+    score: 83
+    class: major_financial_news
+  marketwatch.com:
+    score: 78
+    class: major_financial_news
+  barrons.com:
+    score: 82
+    class: major_financial_news
+  nikkei.com:
+    score: 86
+    class: major_financial_news
+
+  # ----- Established general news -----
+  bbc.com:
+    score: 86
+    class: established_general_news
+  bbc.co.uk:
+    score: 86
+    class: established_general_news
+  theguardian.com:
+    score: 81
+    class: established_general_news
+  nytimes.com:
+    score: 85
+    class: established_general_news
+  washingtonpost.com:
+    score: 84
+    class: established_general_news
+  dw.com:
+    score: 83
+    class: established_general_news
+  france24.com:
+    score: 80
+    class: established_general_news
+  aljazeera.com:
+    score: 80
+    class: established_general_news
+
+  # ----- Automotive / supply-chain / industry trade publications -----
+  automotiveworld.com:
+    score: 82
+    class: established_industry_trade
+  just-auto.com:
+    score: 81
+    class: established_industry_trade
+  autonews.com:
+    score: 82
+    class: established_industry_trade
+  electrive.com:
+    score: 80
+    class: established_industry_trade
+  automotive-news.com:
+    score: 76
+    class: established_industry_trade
+  supplychaindive.com:
+    score: 81
+    class: established_industry_trade
+  freightwaves.com:
+    score: 79
+    class: established_industry_trade
+  theloadstar.com:
+    score: 78
+    class: established_industry_trade
+  joc.com:
+    score: 82
+    class: established_industry_trade
+  semiconductorengineering.com:
+    score: 81
+    class: established_industry_trade
+  eetimes.com:
+    score: 80
+    class: established_industry_trade
+  mining.com:
+    score: 78
+    class: established_industry_trade
+  miningweekly.com:
+    score: 78
+    class: established_industry_trade
+  mining-technology.com:
+    score: 76
+    class: established_industry_trade
+  spglobal.com:
+    score: 88
+    class: major_financial_news
+  argusmedia.com:
+    score: 84
+    class: established_industry_trade
+  fastmarkets.com:
+    score: 85
+    class: established_industry_trade
+
+  # ----- Academic publishers / repositories -----
+  doi.org:
+    score: 78
+    class: academic_publisher_repository
+  tandfonline.com:
+    score: 80
+    class: academic_publisher_repository
+  sciencedirect.com:
+    score: 80
+    class: academic_publisher_repository
+  springer.com:
+    score: 80
+    class: academic_publisher_repository
+  link.springer.com:
+    score: 80
+    class: academic_publisher_repository
+  wiley.com:
+    score: 80
+    class: academic_publisher_repository
+  ieee.org:
+    score: 82
+    class: academic_publisher_repository
+  ieeexplore.ieee.org:
+    score: 82
+    class: academic_publisher_repository
+  arxiv.org:
+    score: 70
+    class: academic_publisher_repository
+  hal.science:
+    score: 74
+    class: academic_publisher_repository
+
+  # ----- Press-release distributors -----
+  prnewswire.com:
+    score: 72
+    class: press_release_distributor
+    syndicated: true
+  businesswire.com:
+    score: 73
+    class: press_release_distributor
+    syndicated: true
+  globenewswire.com:
+    score: 70
+    class: press_release_distributor
+    syndicated: true
+
+  # ----- Aggregators / mirrors -----
+  finance.yahoo.com:
+    score: 62
+    class: market_aggregator
+    resolve_original_source: true
+  yahoo.com:
+    score: 58
+    class: market_aggregator
+    resolve_original_source: true
+  tradingview.com:
+    score: 58
+    class: market_aggregator
+    resolve_original_source: true
+  msn.com:
+    score: 55
+    class: market_aggregator
+    resolve_original_source: true
+  marketscreener.com:
+    score: 62
+    class: market_aggregator
+    resolve_original_source: true
+  finanznachrichten.de:
+    score: 55
+    class: market_aggregator
+    resolve_original_source: true
+
+  # ----- Retrieval wrappers: never count as original publishers -----
+  news.google.com:
+    score: 0
+    class: retrieval_wrapper
+    resolve_original_source: true
+  google.com:
+    score: 0
+    class: retrieval_wrapper
+    resolve_original_source: true
+
+  # ----- User-generated / open publishing -----
+  reddit.com:
+    score: 25
+    class: user_generated
+  medium.com:
+    score: 40
+    class: user_generated
+  substack.com:
+    score: 35
+    class: user_generated
+  blogspot.com:
+    score: 25
+    class: user_generated
+  wordpress.com:
+    score: 25
+    class: user_generated
+  facebook.com:
+    score: 20
+    class: user_generated
+  x.com:
+    score: 20
+    class: user_generated
+  twitter.com:
+    score: 20
+    class: user_generated
+  youtube.com:
+    score: 30
+    class: user_generated
+
+  # -----------------------------------------------------------------
+  # Official company sources relevant to the current BMW demo.
+  # These are strong evidence for explicit statements made by the
+  # organization itself, but a source's own claim should still pass
+  # ontology + evidence validation.
+  # -----------------------------------------------------------------
+  bmwgroup.com:
+    score: 95
+    class: official_primary
+  bmw.com:
+    score: 92
+    class: official_primary
+  borgwarner.com:
+    score: 94
+    class: official_primary
+  brembo.com:
+    score: 94
+    class: official_primary
+  bridgestone.com:
+    score: 94
+    class: official_primary
+  bridgestoneamericas.com:
+    score: 94
+    class: official_primary
+  qualcomm.com:
+    score: 94
+    class: official_primary
+  thyssenkrupp.com:
+    score: 94
+    class: official_primary
+  mahle.com:
+    score: 94
+    class: official_primary
+  elringklinger.com:
+    score: 94
+    class: official_primary
+  micron.com:
+    score: 94
+    class: official_primary
+  continental.com:
+    score: 94
+    class: official_primary
+  goodyear.com:
+    score: 94
+    class: official_primary
+  michelin.com:
+    score: 94
+    class: official_primary
+  broadcom.com:
+    score: 94
+    class: official_primary
+  apple.com:
+    score: 94
+    class: official_primary
+  stellantis.com:
+    score: 94
+    class: official_primary
+  volkswagen-group.com:
+    score: 94
+    class: official_primary
+  volkswagen-newsroom.com:
+    score: 93
+    class: official_primary
+  tesla.com:
+    score: 94
+    class: official_primary
+  toyota-global.com:
+    score: 94
+    class: official_primary
+  mercedes-benz-group.com:
+    score: 94
+    class: official_primary
+  group.mercedes-benz.com:
+    score: 94
+    class: official_primary
+  ford.com:
+    score: 94
+    class: official_primary
+  gm.com:
+    score: 94
+    class: official_primary
+  panasonic.com:
+    score: 94
+    class: official_primary
+  catl.com:
+    score: 94
+    class: official_primary
+  albemarle.com:
+    score: 94
+    class: official_primary
+  ganfenglithium.com:
+    score: 94
+    class: official_primary
+
+# -------------------------------------------------------------------
+# Optional dynamic rules.
+# These are evaluated after exact/suffix domain registry matching.
+# They should not rely on arbitrary text; use metadata available in SChain.
+# -------------------------------------------------------------------
+dynamic_rules:
+
+  # If SChain later stores official domains on canonical Company entities,
+  # a match to the subject/object official domain receives primary-source status.
+  official_entity_domain_match:
+    enabled: true
+    score: 95
+    class: official_primary
+
+  # If a domain is absent from the registry:
+  fallback_unknown:
+    enabled: true
+    score: 50
+    class: unknown
+
+# -------------------------------------------------------------------
+# Recommended output metadata per evidence/document.
+# -------------------------------------------------------------------
+output_fields:
+  - retrieval_url
+  - canonical_source_url
+  - source_domain
+  - source_known
+  - source_class
+  - source_base_score
+  - source_effective_score
+  - content_source
+  - source_group_id
+  - evidence_entailment
+  - ontology_valid
+
+# Recommended aggregated edge fields:
+edge_output_fields:
+  - fact_count
+  - document_count
+  - independent_support_count
+  - max_source_score
+  - average_source_score
+  - full_text_support_count
+  - trusted_source_count
+  - verification_status
+  - frontier_eligible

@@ -11,12 +11,15 @@ repeating LLM calls.
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
 import pandas as pd
+
+from ..checkpoint import atomic_write_parquet
 from neo4j_graphrag.components.types import Neo4jGraph
 
 logger = logging.getLogger(__name__)
@@ -27,12 +30,35 @@ FACT_COLUMNS = [
     "relation",
     "object_id", "object_type", "object_name", "object_mention",
     "evidence", "model", "extracted_at",
+    # Quality / provenance (additive; empty for legacy rows).
+    "validation_status", "ontology_valid", "evidence_validated",
+    "retrieval_url", "canonical_source_url", "source_domain",
+    "source_known", "source_class", "source_base_score", "source_effective_score",
+    "content_source", "source_group_id",
+    "provider", "query", "origin_entity", "tier",
+    "expansion_relevant",
+    "direction_explicit", "evidence_quote_grounded",
 ]
 
 
-def fact_id(doc_id: str, subject_id: str, relation: str, object_id: str) -> str:
-    """Deterministic row identifier, so re-running a document cannot duplicate facts."""
-    payload = "|".join([doc_id, subject_id, relation, object_id])
+def fact_id(
+    doc_id: str, subject_id: str, relation: str, object_id: str,
+    evidence: Optional[str] = None, chunk_index: Optional[int] = None,
+) -> str:
+    """Identify a witnessed triple without collapsing its other supporting quotes.
+
+    The four-argument form retains the legacy document/triple identity for callers
+    reading older artifacts. New extraction includes the quote and chunk. Resume
+    continues to load existing artifacts; a fresh run is needed to recover quotes
+    already discarded by older versions.
+    """
+    if evidence is None and chunk_index is None:
+        payload = "|".join([doc_id, subject_id, relation, object_id])
+    else:
+        payload = json.dumps(
+            [doc_id, subject_id, relation, object_id, evidence, chunk_index],
+            ensure_ascii=False, separators=(",", ":"),
+        )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
 
 
@@ -40,6 +66,23 @@ def chunk_index_of(node_id: str, chunk_index_by_id: dict[str, int]) -> int:
     """Recover the chunk a node came from; the extractor prefixes ids with the chunk id."""
     prefix = node_id.split(":", 1)[0]
     return int(chunk_index_by_id.get(prefix, -1))
+
+
+def is_expansion_relevant_fact(
+    *,
+    relation: str,
+    object_id: str,
+    subject_type: str,
+    origin_entity: Optional[str],
+) -> bool:
+    """True when the fact is an upstream suppliesTo edge into the document origin entity."""
+    if not origin_entity:
+        return False
+    if relation != "suppliesTo":
+        return False
+    if subject_type not in ("Company", "Mine"):
+        return False
+    return object_id == origin_entity
 
 
 def graph_to_facts(
@@ -52,6 +95,7 @@ def graph_to_facts(
     """Build the facts table for one document."""
     extracted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
     rows: list[dict[str, Any]] = []
+    origin = document.get("origin_entity")
 
     for relationship in graph.relationships:
         subject = resolution.get(relationship.start_node_id)
@@ -62,14 +106,23 @@ def graph_to_facts(
                 relationship.type,
             )
             continue
+        expansion_relevant = is_expansion_relevant_fact(
+            relation=relationship.type,
+            object_id=target["canonical_id"],
+            subject_type=subject["label"],
+            origin_entity=origin,
+        )
+        evidence = (relationship.properties or {}).get("evidence", "")
+        chunk_index = chunk_index_of(relationship.start_node_id, chunk_index_by_id)
         rows.append(
             {
                 "fact_id": fact_id(
                     document["doc_id"], subject["canonical_id"],
                     relationship.type, target["canonical_id"],
+                    evidence=evidence, chunk_index=chunk_index,
                 ),
                 "doc_id": document["doc_id"],
-                "chunk_index": chunk_index_of(relationship.start_node_id, chunk_index_by_id),
+                "chunk_index": chunk_index,
                 "source_url": document.get("source_url"),
                 "subject_id": subject["canonical_id"],
                 "subject_type": subject["label"],
@@ -80,9 +133,27 @@ def graph_to_facts(
                 "object_type": target["label"],
                 "object_name": target["canonical_name"],
                 "object_mention": target["mention"],
-                "evidence": (relationship.properties or {}).get("evidence", ""),
+                "evidence": evidence,
                 "model": model,
                 "extracted_at": extracted_at,
+                "validation_status": None,
+                "ontology_valid": None,
+                "evidence_validated": None,
+                "retrieval_url": document.get("retrieval_url") or document.get("source_url"),
+                "canonical_source_url": document.get("canonical_source_url"),
+                "source_domain": document.get("source_domain"),
+                "source_known": document.get("source_known"),
+                "source_class": document.get("source_class"),
+                "source_base_score": document.get("source_base_score"),
+                "source_effective_score": document.get("source_effective_score"),
+                "content_source": document.get("content_source"),
+                "source_group_id": document.get("source_group_id"),
+                "provider": document.get("provider"),
+                "query": document.get("query"),
+                "origin_entity": origin,
+                "tier": document.get("tier"),
+                "expansion_relevant": expansion_relevant,
+                "direction_explicit": None,
             }
         )
 
@@ -95,12 +166,12 @@ def upsert_facts_parquet(frame: pd.DataFrame, path: Path) -> int:
     Returns the total row count after the write.
     """
     if frame.empty and not path.exists():
-        frame.to_parquet(path, index=False)
+        atomic_write_parquet(frame, path)
         return 0
     if path.exists():
         frame = pd.concat([pd.read_parquet(path), frame], ignore_index=True)
     frame = frame.drop_duplicates(subset="fact_id", keep="last").reset_index(drop=True)
-    frame.to_parquet(path, index=False)
+    atomic_write_parquet(frame, path)
     return len(frame)
 
 
@@ -121,6 +192,8 @@ def upstream_companies(
     subjects of a tier-advancing relation whose object is this entity. Relations such as
     locatedIn, owns and produces are not in ``tier_relations`` and therefore never add
     supply-chain depth.
+
+    When ``expansion_relevant`` is present, only those facts advance the frontier.
     """
     if facts.empty:
         return []
@@ -129,4 +202,6 @@ def upstream_companies(
         & facts.object_id.isin(list(entity_ids))
         & (facts.subject_type == "Company")
     ]
+    if "expansion_relevant" in matches.columns:
+        matches = matches[matches.expansion_relevant == True]  # noqa: E712
     return list(dict.fromkeys(matches.subject_name.tolist()))
