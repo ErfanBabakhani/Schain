@@ -124,11 +124,34 @@ def _run_validate(args: argparse.Namespace, config: dict[str, Any]) -> int:
 
 
 def _run_export(args: argparse.Namespace, config: dict[str, Any]) -> int:
-    from .graph_export import export_graph
+    from .audit_trace import configure_run_audit
+    from .graph_export import export_graph, export_path
 
-    path = export_graph(config, output=args.output, mode="export")
-    print(json.dumps({"graph_export": str(path)}, indent=2))
-    return 0
+    graph_path = export_path(config, args.output)
+    audit = configure_run_audit(
+        config, mode="export", graph_path=graph_path,
+        input_path=None, neo4j_enabled=False,
+    )
+    error = None
+    report = None
+    try:
+        path = export_graph(config, output=args.output, mode="export")
+        report = {"graph_export": str(path)}
+        if audit:
+            report["audit_trace"] = str(audit.output_path)
+        print(json.dumps(report, indent=2))
+        return 0
+    except Exception as caught:
+        error = caught
+        raise
+    finally:
+        if audit:
+            audit.finalize(
+                complete=error is None,
+                status="completed" if error is None else "failed",
+                summary=report,
+                error=error,
+            )
 
 
 def _attach_graph_export(
@@ -194,10 +217,23 @@ def main(argv: Optional[list[str]] = None) -> int:
         removed = clear_generated_data(config)
         logger.warning("restart: removed %d generated file(s)", len(removed))
 
-    ontology = load_ontology(config)
-    connection = state.connect(storage_path(config, "state_db"))
+    from .audit_trace import configure_run_audit
+    from .graph_export import export_path
+
+    audit = configure_run_audit(
+        config,
+        mode=args.mode,
+        graph_path=export_path(config),
+        input_path=getattr(args, "input", None),
+        neo4j_enabled=not args.no_neo4j,
+    )
+    connection = None
     driver = None
+    summary = None
+    run_error = None
     try:
+        ontology = load_ontology(config)
+        connection = state.connect(storage_path(config, "state_db"))
         llm = build_llm(config)
         if not args.no_neo4j:
             driver = open_driver(config)
@@ -207,6 +243,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             summary = run_expand(config, connection, llm, ontology, driver)
         summary = _attach_graph_export(config, summary, args.mode)
     except LLMGenerationError as error:
+        run_error = error
         logger.error(
             "LLM call failed (%s). Check that the server at %s is running and that "
             "llm.model matches what it serves.",
@@ -214,12 +251,35 @@ def main(argv: Optional[list[str]] = None) -> int:
         )
         return 1
     except Exception as error:  # noqa: BLE001 - report what failed, then stop
+        run_error = error
         logger.error("%s failed: %s: %s", args.mode, type(error).__name__, error)
         return 1
     finally:
         if driver is not None:
             driver.close()
-        connection.close()
+        if connection is not None:
+            connection.close()
+        if audit is not None:
+            status = (
+                "failed" if run_error is not None
+                else "completed_with_document_failures"
+                if summary and summary.get("documents_failed")
+                else "completed"
+            )
+            try:
+                audit.finalize(
+                    complete=(
+                        run_error is None
+                        and not (summary and summary.get("documents_failed"))
+                    ),
+                    status=status,
+                    summary=summary,
+                    error=run_error,
+                )
+                if summary is not None:
+                    summary["audit_trace"] = str(audit.output_path)
+            except Exception:  # noqa: BLE001 - graph result must survive audit finalization
+                logger.exception("could not finalize audit trace %s", audit.output_path)
 
     logger.info(
         "done documents=%s facts=%s nodes=%s relationships=%s frontier=%s "

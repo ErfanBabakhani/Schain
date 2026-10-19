@@ -38,6 +38,8 @@ FACT_COLUMNS = [
     "provider", "query", "origin_entity", "tier",
     "expansion_relevant",
     "direction_explicit", "evidence_quote_grounded",
+    "original_evidence", "evidence_repair_attempted",
+    "evidence_repair_status", "evidence_repair_reason",
 ]
 
 
@@ -68,6 +70,21 @@ def chunk_index_of(node_id: str, chunk_index_by_id: dict[str, int]) -> int:
     return int(chunk_index_by_id.get(prefix, -1))
 
 
+def extraction_relationship_id(doc_id: str, relationship: Any) -> str:
+    payload = [doc_id, relationship.model_dump(mode="json")]
+    return "relationship-" + hashlib.sha256(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def candidate_fact_id_for_audit(
+    doc_id: str, subject_id: str, relation: str, object_id: str, evidence: str,
+) -> str:
+    """Mirror validation's stable pre-repair identity without adding a dependency."""
+    payload = "|".join([doc_id, subject_id, relation, object_id, evidence or ""])
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
 def is_expansion_relevant_fact(
     *,
     relation: str,
@@ -91,6 +108,7 @@ def graph_to_facts(
     chunk_index_by_id: dict[str, int],
     resolution: dict[str, dict[str, Any]],
     model: Optional[str] = None,
+    audit=None,
 ) -> pd.DataFrame:
     """Build the facts table for one document."""
     extracted_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -98,6 +116,7 @@ def graph_to_facts(
     origin = document.get("origin_entity")
 
     for relationship in graph.relationships:
+        relationship_id = extraction_relationship_id(document["doc_id"], relationship)
         subject = resolution.get(relationship.start_node_id)
         target = resolution.get(relationship.end_node_id)
         if subject is None or target is None:
@@ -105,6 +124,25 @@ def graph_to_facts(
                 "dropping %s: an endpoint was not resolved to a canonical entity",
                 relationship.type,
             )
+            if audit is not None:
+                audit.emit(
+                    "relationship_lost_unresolved_endpoint",
+                    stage="fact_construction",
+                    extraction_relationship_id=relationship_id,
+                    relation_type=relationship.type,
+                    start_node_id=relationship.start_node_id,
+                    end_node_id=relationship.end_node_id,
+                    missing_resolution_ids=[
+                        node_id for node_id in (
+                            relationship.start_node_id, relationship.end_node_id,
+                        ) if node_id not in resolution
+                    ],
+                    original_relationship=(
+                        relationship.model_dump(mode="json")
+                        if audit.capture_content else None
+                    ),
+                    action="excluded_before_candidate_fact",
+                )
             continue
         expansion_relevant = is_expansion_relevant_fact(
             relation=relationship.type,
@@ -114,8 +152,7 @@ def graph_to_facts(
         )
         evidence = (relationship.properties or {}).get("evidence", "")
         chunk_index = chunk_index_of(relationship.start_node_id, chunk_index_by_id)
-        rows.append(
-            {
+        row = {
                 "fact_id": fact_id(
                     document["doc_id"], subject["canonical_id"],
                     relationship.type, target["canonical_id"],
@@ -154,8 +191,40 @@ def graph_to_facts(
                 "tier": document.get("tier"),
                 "expansion_relevant": expansion_relevant,
                 "direction_explicit": None,
+                "original_evidence": evidence,
+                "evidence_repair_attempted": False,
+                "evidence_repair_status": "not_needed",
+                "evidence_repair_reason": None,
             }
-        )
+        rows.append(row)
+        if audit is not None:
+            candidate_id = candidate_fact_id_for_audit(
+                str(row["doc_id"]), str(row["subject_id"]), str(row["relation"]),
+                str(row["object_id"]), str(row["evidence"] or ""),
+            )
+            audit.emit(
+                "candidate_fact_created",
+                stage="fact_construction",
+                candidate_fact_id=candidate_id,
+                fact_id=row["fact_id"],
+                extraction_relationship_id=relationship_id,
+                chunk_id=str(relationship.start_node_id).split(":", 1)[0],
+                chunk_index=chunk_index,
+                subject_id=row["subject_id"], object_id=row["object_id"],
+                subject_mention=row["subject_mention"] if audit.capture_content else None,
+                object_mention=row["object_mention"] if audit.capture_content else None,
+                subject_name=row["subject_name"] if audit.capture_content else None,
+                object_name=row["object_name"] if audit.capture_content else None,
+                predicate=row["relation"],
+                original_evidence=evidence if audit.capture_content else None,
+                originating_llm_call_ids=audit.contextual_llm_call_ids(
+                    "extraction", "chunk_id",
+                    str(relationship.start_node_id).split(":", 1)[0],
+                ),
+                creation_path="parsed_relationship_to_canonical_fact",
+                status="candidate",
+                created_at=extracted_at,
+            )
 
     return pd.DataFrame(rows, columns=FACT_COLUMNS)
 

@@ -1,6 +1,10 @@
 > **Updated code: 0.3.0 (8 September 2026).** Start with [START_HERE.md](START_HERE.md)
 > for setup and migration; read [the v0.3.0 audit](docs/AUDIT_V0.3.0.md) for corrected retrieval, tiers, budgets and tests. See
 > [docs/UPGRADE_REVIEW.md](docs/UPGRADE_REVIEW.md) for the paper comparison.
+> Targeted graph-integrity, evidence-recovery, event-loop, and optional audit-trace fixes
+> are documented in [docs/RELIABILITY_FIXES_V030.md](docs/RELIABILITY_FIXES_V030.md).
+> The downloadable end-to-end companion JSON is documented in
+> [docs/AUDIT_TRACE_JSON.md](docs/AUDIT_TRACE_JSON.md).
 > This dated addendum supersedes older statements below that exclude a local viewer.
 
 # Supply Chain Knowledge Graph — V1
@@ -105,6 +109,8 @@ cannot be auto-detected.
 | `NEO4J_PASSWORD` | yes | not needed only when running with `--no-neo4j` |
 | `LLM_API_BASE_URL` | no | overrides `llm.base_url` from the config |
 | `LLM_API_KEY` | no | required only for `llm.provider: api`; vLLM ignores its value |
+| `SCHAIN_AUDIT_TRACE` | no | `1` writes `<graph-stem>.audit.json` beside the graph |
+| `SCHAIN_AUDIT_FULL_CONTENT` | no | `1` includes source, chunks, exact model inputs and available responses |
 
 The retrieval providers (Wikipedia, GDELT, Google News) need no credentials.
 

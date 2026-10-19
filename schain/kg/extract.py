@@ -10,7 +10,6 @@ evidence trail in the facts Parquet layer instead.
 
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import logging
@@ -26,8 +25,12 @@ from neo4j_graphrag.components.types import Neo4jGraph, TextChunks
 from neo4j_graphrag.llm import LLMInterface
 
 from ..checkpoint import atomic_write_json
+from ..async_runtime import run_async
+from ..audit import llm_call_context, prompt_hash
 from ..llm.provider import RuntimeDeadlineExceeded
 from ..ontology import EXTRACTION_EXAMPLES, SupplyChainERTemplate, build_graph_schema
+from .facts import extraction_relationship_id
+from .integrity import enforce_referential_integrity
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +88,8 @@ def extract_graph(
     max_retries: int = 1,
     origin_name: str | None = None,
     evidence_policy_file: str | None = None,
+    integrity_failures: list[dict[str, Any]] | None = None,
+    audit=None,
 ) -> tuple[Neo4jGraph, dict[str, int]]:
     """Extract a graph from one normalized document record.
 
@@ -104,8 +109,15 @@ def extract_graph(
         raise ValueError("max_chunks_per_document must be positive when supplied")
     metrics = metrics if metrics is not None else {}
     splitter = FixedSizeSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    chunks = asyncio.run(splitter.run(text=document["text"]))
+    chunks = run_async(splitter.run(text=document["text"]))
     logger.info("split doc %s into %d chunk(s)", document["doc_id"], len(chunks.chunks))
+    # FixedSizeSplitter normally generates random ids.  Assign provenance ids
+    # before applying a cap so omitted chunks are traceable too.
+    for chunk in chunks.chunks:
+        chunk.uid = hashlib.sha256(
+            f"{document['doc_id']}:{chunk.index}:{chunk.text}".encode("utf-8")
+        ).hexdigest()[:32]
+    all_chunks = list(chunks.chunks)
     available = len(chunks.chunks)
     selection = "all"
     if max_chunks_per_document is not None and available > max_chunks_per_document:
@@ -131,6 +143,20 @@ def extract_graph(
             "retained, remaining chunks are unexamined", document["doc_id"],
             max_chunks_per_document, available, selection,
         )
+    selected_ids = {chunk.chunk_id for chunk in chunks.chunks}
+    if audit is not None:
+        for chunk in all_chunks:
+            processed = chunk.chunk_id in selected_ids
+            audit.emit(
+                "chunk_discovered", stage="chunking",
+                chunk_id=chunk.chunk_id, chunk_index=chunk.index,
+                character_count=len(chunk.text), chunk_size=chunk_size,
+                chunk_overlap=chunk_overlap,
+                disposition="processed" if processed else "omitted",
+                omission_reason=(None if processed else "max_chunks_per_document_cap"),
+                selection_strategy=selection,
+                source_text=chunk.text if audit.capture_content else None,
+            )
     metrics.update(
         extraction_chunks_available=available, extraction_chunks=len(chunks.chunks),
         extraction_chunks_omitted=available - len(chunks.chunks),
@@ -152,14 +178,9 @@ def extract_graph(
         use_structured_output=structured_output,
     )
 
-    # FixedSizeSplitter normally generates random ids. Stable ids preserve provenance
-    # when old and newly extracted chunks are combined during resume.
-    for chunk in chunks.chunks:
-        chunk.uid = hashlib.sha256(
-            f"{document['doc_id']}:{chunk.index}:{chunk.text}".encode("utf-8")
-        ).hexdigest()[:32]
-
     async def _run_extract() -> Neo4jGraph:
+        import asyncio
+
         semaphore = asyncio.Semaphore(max_concurrency)
 
         async def extract_chunk(chunk) -> Neo4jGraph:
@@ -193,27 +214,97 @@ def extract_graph(
                     else:
                         logger.info("doc %s: reusing chunk %d", document["doc_id"], chunk.index)
                         metrics["extraction_cache_hits"] += 1
+                        if audit is not None:
+                            audit.emit(
+                                "extraction_cache_hit",
+                                stage="extraction",
+                                chunk_id=chunk.chunk_id,
+                                chunk_index=chunk.index,
+                                checkpoint=str(cache_file),
+                                cache_key=digest,
+                                parsed_artifact=(cached.model_dump(mode="json")
+                                                 if audit.capture_content else None),
+                                node_count=len(cached.nodes),
+                                relationship_count=len(cached.relationships),
+                                historical_prompt="unavailable_from_chunk_checkpoint",
+                                historical_model_response="unavailable_from_chunk_checkpoint",
+                            )
                         return cached
 
             async with semaphore:
                 for attempt in range(max_retries + 1):
+                    attempt_id = (
+                        f"extract-{str(document['doc_id'])[:12]}-"
+                        f"{chunk.index}-{attempt + 1}"
+                    )
                     try:
                         metrics["extraction_calls"] += 1
-                        result = await extractor.run(
-                            chunks=TextChunks(chunks=[chunk]), schema=schema,
-                            examples=EXTRACTION_EXAMPLES,
-                        )
+                        if audit is not None:
+                            audit.emit(
+                                "chunk_extraction_attempt_started", stage="extraction",
+                                chunk_id=chunk.chunk_id, chunk_index=chunk.index,
+                                extraction_attempt_id=attempt_id,
+                                attempt_number=attempt + 1,
+                            )
+                        with llm_call_context(
+                            chunk_id=chunk.chunk_id,
+                            chunk_index=chunk.index,
+                            extraction_attempt_id=attempt_id,
+                            prompt_template_id="SupplyChainERTemplate.DEFAULT_TEMPLATE",
+                            prompt_template_hash=prompt_hash(template.DEFAULT_TEMPLATE),
+                            retry_attempt=attempt,
+                        ):
+                            result = await extractor.run(
+                                chunks=TextChunks(chunks=[chunk]), schema=schema,
+                                examples=EXTRACTION_EXAMPLES,
+                            )
+                        if audit is not None:
+                            audit.emit(
+                                "chunk_extraction_parsed", stage="extraction",
+                                chunk_id=chunk.chunk_id, chunk_index=chunk.index,
+                                extraction_attempt_id=attempt_id,
+                                attempt_number=attempt + 1,
+                                node_count=len(result.nodes),
+                                relationship_count=len(result.relationships),
+                                graph=(result.model_dump(mode="json")
+                                       if audit.capture_content else None),
+                                related_llm_call_ids=audit.contextual_llm_call_ids(
+                                    "extraction", "extraction_attempt_id", attempt_id,
+                                ),
+                            )
                         break
                     except Exception as error:  # noqa: BLE001
                         category = classify_extraction_error(error)
                         reasons = metrics.setdefault("extraction_first_failure_reasons", {})
                         if attempt == 0:
                             reasons[category] = int(reasons.get(category, 0)) + 1
+                        if audit is not None:
+                            audit.emit(
+                                "chunk_extraction_attempt_failed", stage="extraction",
+                                chunk_id=chunk.chunk_id, chunk_index=chunk.index,
+                                extraction_attempt_id=attempt_id,
+                                attempt_number=attempt + 1,
+                                error_type=type(error).__name__, error=str(error),
+                                failure_kind=("parser_or_schema_error"
+                                              if not _is_transient_llm_error(error)
+                                              else "transient_llm_error"),
+                            )
                         if attempt >= max_retries or not _is_transient_llm_error(error):
                             raise
                         metrics["extraction_retries"] += 1
                         retry_reasons = metrics.setdefault("extraction_retry_reasons", {})
                         retry_reasons[category] = int(retry_reasons.get(category, 0)) + 1
+                        if audit is not None:
+                            audit.emit(
+                                "llm_retry",
+                                stage="extraction",
+                                chunk_id=chunk.chunk_id,
+                                chunk_index=chunk.index,
+                                attempt=attempt + 1,
+                                max_retries=max_retries,
+                                error_type=type(error).__name__,
+                                error=str(error),
+                            )
                         logger.warning(
                             "transient LLM error on doc %s chunk %d (%s/%s); retry %d/%d",
                             document["doc_id"], chunk.index, category, error,
@@ -233,7 +324,83 @@ def extract_graph(
                 raise result
         return extractor.combine_chunk_graphs(None, results)
 
-    graph = asyncio.run(_run_extract())
+    graph = run_async(_run_extract())
+    parsed_graph = graph
+    chunk_index = {chunk.chunk_id: chunk.index for chunk in chunks.chunks}
+    graph, failures = enforce_referential_integrity(
+        graph,
+        document_id=str(document["doc_id"]),
+        chunk_index_by_id=chunk_index,
+    )
+    if integrity_failures is not None:
+        integrity_failures.extend(failures)
+    metrics["extraction_integrity_failures"] = len(failures)
+    if failures:
+        logger.warning(
+            "doc %s: rejected %d dangling extracted relationship(s)",
+            document["doc_id"],
+            len(failures),
+        )
+    if audit is not None:
+        node_ids = {node.id for node in parsed_graph.nodes}
+        for relationship in parsed_graph.relationships:
+            payload = relationship.model_dump(mode="json")
+            missing = [endpoint for endpoint in (
+                relationship.start_node_id, relationship.end_node_id,
+            ) if endpoint not in node_ids]
+            relationship_id = extraction_relationship_id(
+                str(document["doc_id"]), relationship,
+            )
+            chunk_id = str(relationship.start_node_id).split(":", 1)[0]
+            if chunk_id not in chunk_index:
+                chunk_id = str(relationship.end_node_id).split(":", 1)[0]
+            audit.emit(
+                "relationship_integrity_result", stage="extraction_integrity",
+                extraction_relationship_id=relationship_id,
+                chunk_id=chunk_id if chunk_id in chunk_index else None,
+                chunk_index=chunk_index.get(chunk_id),
+                source_node_exists=relationship.start_node_id in node_ids,
+                target_node_exists=relationship.end_node_id in node_ids,
+                missing_node_ids=missing,
+                action="dropped_missing_endpoint" if missing else "retained",
+                original_relationship=(payload if audit.capture_content else {
+                    "start_node_id": relationship.start_node_id,
+                    "end_node_id": relationship.end_node_id,
+                    "type": relationship.type,
+                }),
+            )
+        audit.emit(
+            "parsed_extraction_graph",
+            stage="extraction",
+            node_count=len(parsed_graph.nodes),
+            relationship_count=len(parsed_graph.relationships),
+            graph=(
+                parsed_graph.model_dump(mode="json")
+                if audit.capture_content
+                else None
+            ),
+        )
+        audit.emit(
+            "structural_integrity_checked",
+            stage="extraction_integrity",
+            valid=not failures,
+            failure_count=len(failures),
+            failures=(
+                failures
+                if audit.capture_content
+                else [
+                    {
+                        "integrity_failure_id": failure["integrity_failure_id"],
+                        "chunk_id": failure["chunk_id"],
+                        "chunk_index": failure["chunk_index"],
+                        "relation_type": failure["relation_type"],
+                        "missing_node_ids": failure["missing_node_ids"],
+                        "reason": failure["reason"],
+                    }
+                    for failure in failures
+                ]
+            ),
+        )
 
     logger.info(
         "extracted %d node(s) and %d relationship(s) from doc %s",
@@ -241,4 +408,4 @@ def extract_graph(
         len(graph.relationships),
         document["doc_id"],
     )
-    return graph, {chunk.chunk_id: chunk.index for chunk in chunks.chunks}
+    return graph, chunk_index

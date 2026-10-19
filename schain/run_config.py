@@ -207,6 +207,10 @@ def effective_export_config(config: dict[str, Any]) -> tuple[dict[str, Any], dic
     snapshot = json.loads(path.read_text(encoding="utf-8"))
     if snapshot.get("schema_version") != 1 or not isinstance(snapshot.get("effective_config"), dict):
         raise ValueError(f"Invalid expansion run snapshot: {path}")
-    effective = copy.deepcopy(config)
+    # Runtime-only objects (notably the audit coordinator's thread lock) are not
+    # experiment configuration and are intentionally neither copied nor exported.
+    effective = copy.deepcopy({
+        key: value for key, value in config.items() if not str(key).startswith("_")
+    })
     effective.update(copy.deepcopy(snapshot["effective_config"]))
     return effective, snapshot

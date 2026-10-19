@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import re
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from typing import Any, Optional
 import pandas as pd
 from json_repair import repair_json
 
+from ..audit import llm_call_context, prompt_hash
 from ..config import storage_path
 from ..checkpoint import atomic_write_parquet
 from ..names import canonical_id, normalization_key
@@ -36,6 +38,8 @@ REJECTED_COLUMNS = [
     "subject_id", "subject_name", "subject_type",
     "relation", "object_id", "object_name", "object_type",
     "evidence", "source_url", "canonical_source_url", "source_domain",
+    "original_evidence", "evidence_repair_attempted",
+    "evidence_repair_status", "evidence_repair_reason",
     "rejection_stage", "rejection_reason",
     "repair_attempted", "repair_result",
     "model", "created_at",
@@ -43,6 +47,18 @@ REJECTED_COLUMNS = [
 
 # FACT_COLUMNS already includes the additive quality/provenance fields.
 QUALITY_FACT_COLUMNS = list(FACT_COLUMNS)
+
+
+def _coalesce(value: Any, fallback: Any) -> Any:
+    """Treat nullable Parquet/pandas scalars as absent without touching containers."""
+    if value is None:
+        return fallback
+    try:
+        if bool(pd.isna(value)):
+            return fallback
+    except (TypeError, ValueError):
+        pass
+    return value
 
 ONTOLOGY_REPAIR_PROMPT = """\
 You are repairing ONE ontology-invalid supply-chain relation.
@@ -235,6 +251,10 @@ def _reject_row(row: dict[str, Any], stage: str, reason: str, repair_attempted: 
         "object_name": row.get("object_name"),
         "object_type": row.get("object_type"),
         "evidence": row.get("evidence"),
+        "original_evidence": _coalesce(row.get("original_evidence"), row.get("evidence")),
+        "evidence_repair_attempted": bool(row.get("evidence_repair_attempted", False)),
+        "evidence_repair_status": row.get("evidence_repair_status") or "not_needed",
+        "evidence_repair_reason": row.get("evidence_repair_reason"),
         "source_url": row.get("source_url") or row.get("retrieval_url"),
         "canonical_source_url": row.get("canonical_source_url"),
         "source_domain": row.get("source_domain"),
@@ -261,7 +281,13 @@ def _repair_relation(llm, row: dict[str, Any], ontology: dict[str, Any]) -> Opti
         patterns=patterns or "(none)",
     )
     try:
-        raw = llm.invoke(prompt).content
+        with llm_call_context(
+            prompt_template_id="ONTOLOGY_REPAIR_PROMPT",
+            prompt_template_hash=prompt_hash(ONTOLOGY_REPAIR_PROMPT),
+            candidate_fact_id=row.get("candidate_fact_id"),
+            repair_type="ontology_relation",
+        ):
+            raw = llm.invoke(prompt).content
         payload = json.loads(repair_json(raw))
     except Exception as error:  # noqa: BLE001
         raise RuntimeError("ontology repair failed; document remains retryable") from error
@@ -314,7 +340,12 @@ def _batch_evidence_validate(llm, rows: list[dict[str, Any]]) -> dict[str, str]:
         relation_policy=render_relation_policy(policy, [str(row.get("relation") or "") for row in rows]),
     )
     try:
-        raw = llm.invoke(prompt).content
+        with llm_call_context(
+            prompt_template_id="EVIDENCE_BATCH_PROMPT",
+            prompt_template_hash=prompt_hash(EVIDENCE_BATCH_PROMPT),
+            candidate_fact_ids=[row["candidate_fact_id"] for row in rows],
+        ):
+            raw = llm.invoke(prompt).content
         payload = json.loads(repair_json(raw))
         results = payload.get("results", []) if isinstance(payload, dict) else []
     except Exception as error:  # noqa: BLE001
@@ -348,6 +379,86 @@ def normalize_evidence_text(value: Any) -> str:
     return " ".join(unicodedata.normalize("NFKC", str(value or "")).split())
 
 
+def _source_passages(source: str) -> list[str]:
+    """Return source substrings at sentence/newline boundaries without rewriting them."""
+    return [
+        part.strip()
+        for part in re.split(r"(?<=[.!?])\s+|[\r\n]+", source or "")
+        if part.strip()
+    ]
+
+
+def _surface_present(passage: str, values: list[Any]) -> bool:
+    normalized = normalize_evidence_text(passage).casefold()
+    return any(
+        normalize_evidence_text(value).casefold() in normalized
+        for value in values
+        if normalize_evidence_text(value)
+    )
+
+
+def _token_overlap(left: str, right: str) -> float:
+    tokens_left = set(re.findall(r"\w+", normalize_evidence_text(left).casefold()))
+    tokens_right = set(re.findall(r"\w+", normalize_evidence_text(right).casefold()))
+    return len(tokens_left & tokens_right) / max(1, len(tokens_left | tokens_right))
+
+
+def recover_evidence_quote(
+    row: dict[str, Any],
+    document_text: str,
+    *,
+    policy: dict[str, Any],
+) -> tuple[Optional[str], str]:
+    """Recover one exact source passage under strict endpoint/relation constraints.
+
+    Similarity ranks already-semantic candidates only; it can never make a passage
+    eligible by itself.  Ambiguous ties fail closed.
+    """
+    # Prefer the literal extracted mentions.  Falling back to a shorter canonical
+    # name when a mention is present could confuse similarly named organizations
+    # (for example, "BMW" versus "BMW Financial Services").
+    subject_forms = [row.get("subject_mention") or row.get("subject_name")]
+    object_forms = [row.get("object_mention") or row.get("object_name")]
+    model_evidence = str(row.get("evidence") or "")
+    if not (
+        _surface_present(model_evidence, subject_forms)
+        and _surface_present(model_evidence, object_forms)
+    ):
+        return None, "model_evidence_missing_endpoints"
+    candidates: list[tuple[float, str]] = []
+    for passage in _source_passages(document_text):
+        if not _surface_present(passage, subject_forms):
+            continue
+        if not _surface_present(passage, object_forms):
+            continue
+        # Recovery is deliberately stricter than ordinary lexical screening.  A
+        # passage containing an explicit negative must never be used to repair a
+        # positive assertion, even if it also contains the expected verb/endpoints.
+        if re.search(
+            r"\b(?:not|never|neither|no longer|doesn't|does not|do not|did not|"
+            r"isn't|is not|are not|was not|were not|won't|will not|cannot|can't)\b",
+            normalize_evidence_text(passage).casefold(),
+        ):
+            continue
+        lexical_ok, _reason = lexical_relation_gate(
+            str(row.get("relation") or ""),
+            passage,
+            policy=policy,
+        )
+        if lexical_ok is not True:
+            continue
+        candidates.append((_token_overlap(str(row.get("evidence") or ""), passage), passage))
+    if not candidates:
+        return None, "no_source_passage_with_endpoints_and_relation_cue"
+    candidates.sort(key=lambda item: (-item[0], len(item[1]), item[1]))
+    if len(candidates) > 1 and candidates[0][0] == candidates[1][0]:
+        return None, "ambiguous_source_passages"
+    recovered = candidates[0][1]
+    if normalize_evidence_text(recovered) not in normalize_evidence_text(document_text):
+        return None, "recovered_passage_failed_exact_grounding"
+    return recovered, "deterministic_endpoint_and_relation_match"
+
+
 def validate_facts_frame(
     facts: pd.DataFrame,
     *,
@@ -355,6 +466,7 @@ def validate_facts_frame(
     ontology: dict[str, Any],
     llm=None,
     document_text: Optional[str] = None,
+    audit=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Validate candidate facts; return (accepted, rejected)."""
     if facts is None or facts.empty:
@@ -373,10 +485,46 @@ def validate_facts_frame(
     # Normalize once per document; whitespace variation from PDF/text splitting is harmless.
     source_text = normalize_evidence_text(document_text) if document_text is not None else None
     require_quote = evidence_cfg.get("require_source_quote", True)
+    recovery_enabled = evidence_cfg.get("recover_source_quote", True)
 
     accepted_rows: list[dict[str, Any]] = []
     rejected_rows: list[dict[str, Any]] = []
     pending_evidence: list[dict[str, Any]] = []
+    check_order = [
+        "grounding", "entity_type", "generic_entity", "ontology",
+        "lexical_evidence", "direction", "semantic_entailment",
+    ]
+
+    def trace_check(row: dict[str, Any], name: str, *, executed: bool,
+                    decision: str, reason: str, details: Optional[dict[str, Any]] = None) -> None:
+        if audit is None:
+            return
+        audit.emit(
+            "validation_check",
+            stage="validation",
+            candidate_fact_id=row.get("candidate_fact_id"),
+            fact_id=row.get("fact_id"),
+            check=name,
+            executed=executed,
+            decision=decision,
+            reason=reason,
+            input_evidence=(row.get("evidence") if audit.capture_content else None),
+            details=details or {},
+            related_llm_call_ids=audit.contextual_llm_call_ids(
+                "validation", "candidate_fact_id", row.get("candidate_fact_id"),
+            ) + audit.contextual_llm_call_ids(
+                "validation", "candidate_fact_ids", row.get("candidate_fact_id"),
+            ),
+        )
+
+    def trace_skipped(row: dict[str, Any], after: str) -> None:
+        start = check_order.index(after) + 1
+        for name in check_order[start:]:
+            trace_check(
+                row, name, executed=False,
+                decision="skipped_due_to_earlier_rejection",
+                reason=f"rejected_at_{after}",
+            )
 
     for raw in facts.to_dict(orient="records"):
         row = dict(raw)
@@ -387,6 +535,22 @@ def validate_facts_frame(
             str(row.get("object_id") or ""),
             str(row.get("evidence") or ""),
         )
+        if audit is not None:
+            audit.emit(
+                "validation_candidate_started",
+                stage="validation",
+                candidate_fact_id=row["candidate_fact_id"],
+                fact_id=row.get("fact_id"),
+                subject_id=row.get("subject_id"), relation=row.get("relation"),
+                object_id=row.get("object_id"),
+                evidence=(row.get("evidence") if audit.capture_content else None),
+            )
+        row["original_evidence"] = _coalesce(
+            row.get("original_evidence"), row.get("evidence") or "",
+        )
+        row["evidence_repair_attempted"] = False
+        row["evidence_repair_status"] = "not_needed"
+        row["evidence_repair_reason"] = None
         if row.get("validation_status") is None:
             row["validation_status"] = "accepted"
         if row.get("ontology_valid") is None:
@@ -404,9 +568,99 @@ def validate_facts_frame(
         quote = normalize_evidence_text(row.get("evidence"))
         row["evidence_quote_grounded"] = bool(quote and quote in source_text) if source_text is not None else None
         if require_quote and source_text is not None and not row["evidence_quote_grounded"]:
-            rejected_rows.append(_reject_row(row, "grounding", "evidence_not_in_source"))
-            continue
-        repaired = False
+            row["evidence_repair_attempted"] = bool(recovery_enabled and document_text)
+            recovered = None
+            recovery_reason = "recovery_disabled"
+            if row["evidence_repair_attempted"]:
+                recovered, recovery_reason = recover_evidence_quote(
+                    row,
+                    document_text or "",
+                    policy=policy,
+                )
+            if recovered is None:
+                row["evidence_repair_status"] = "failed"
+                row["evidence_repair_reason"] = recovery_reason
+                if audit is not None:
+                    audit.emit(
+                        "grounding_checked",
+                        stage="grounding",
+                        candidate_fact_id=row["candidate_fact_id"],
+                        exact_match=False,
+                        repair_attempted=row["evidence_repair_attempted"],
+                        outcome="rejected",
+                    )
+                    audit.emit(
+                        "evidence_repair_failed",
+                        stage="grounding",
+                        candidate_fact_id=row["candidate_fact_id"],
+                        original_evidence=row["original_evidence"] if audit.capture_content else None,
+                        reason=recovery_reason,
+                    )
+                rejected_rows.append(_reject_row(row, "grounding", "evidence_not_in_source"))
+                trace_check(
+                    row, "grounding", executed=True, decision="fail",
+                    reason="evidence_not_in_source",
+                    details={"repair_attempted": row["evidence_repair_attempted"],
+                             "repair_reason": recovery_reason},
+                )
+                trace_skipped(row, "grounding")
+                continue
+            row["evidence"] = recovered
+            row["evidence_quote_grounded"] = True
+            row["evidence_repair_status"] = "succeeded"
+            row["evidence_repair_reason"] = recovery_reason
+            row["validation_status"] = "repaired"
+            row["fact_id"] = fact_id(
+                str(row.get("doc_id") or ""),
+                str(row.get("subject_id") or ""),
+                str(row.get("relation") or ""),
+                str(row.get("object_id") or ""),
+                recovered,
+                row.get("chunk_index"),
+            )
+            if audit is not None:
+                audit.emit(
+                    "grounding_checked",
+                    stage="grounding",
+                    candidate_fact_id=row["candidate_fact_id"],
+                    exact_match=False,
+                    repair_attempted=True,
+                    outcome="recovered_exact_source_passage",
+                )
+                audit.emit(
+                    "evidence_repair_succeeded",
+                    stage="grounding",
+                    candidate_fact_id=row["candidate_fact_id"],
+                    method="deterministic_source_extraction",
+                    reason=recovery_reason,
+                    original_evidence=row["original_evidence"] if audit.capture_content else None,
+                    grounded_evidence=recovered if audit.capture_content else None,
+                )
+            trace_check(
+                row, "grounding", executed=True, decision="pass",
+                reason="recovered_exact_source_passage",
+                details={"repair_attempted": True, "repair_reason": recovery_reason},
+            )
+        elif audit is not None:
+            audit.emit(
+                "grounding_checked",
+                stage="grounding",
+                candidate_fact_id=row["candidate_fact_id"],
+                exact_match=bool(row["evidence_quote_grounded"]),
+                repair_attempted=False,
+                outcome=("grounded" if row["evidence_quote_grounded"] else "not_checked"),
+            )
+        if not (require_quote and source_text is not None and not quote):
+            if row.get("evidence_repair_status") != "succeeded":
+                trace_check(
+                    row, "grounding",
+                    executed=bool(require_quote and source_text is not None),
+                    decision=("pass" if row.get("evidence_quote_grounded") else "not_applicable"),
+                    reason=("exact_source_quote" if row.get("evidence_quote_grounded")
+                            else "source_quote_check_not_required"),
+                )
+        evidence_repaired = row["evidence_repair_status"] == "succeeded"
+        repaired = evidence_repaired
 
         # Defense for both the production resolver and direct/legacy fact callers.
         type_rejected = False
@@ -417,6 +671,8 @@ def validate_facts_frame(
                 # Also covers a model already repaired by resolve_entities.
                 rejected_rows.append(_reject_row(row, "entity_type", f"invalid_product_supply_role:{side}"))
                 type_rejected = True
+                trace_check(row, "entity_type", executed=True, decision="fail",
+                            reason=f"invalid_product_supply_role:{side}")
                 break
             if row.get(f"{side}_type") != "Company":
                 continue
@@ -432,13 +688,22 @@ def validate_facts_frame(
                     rejected_rows.append(_reject_row(row, "entity_type", f"{type_reason}:{side}",
                                                      repair_attempted=True, repair_result=target_type))
                     type_rejected = True
+                    trace_check(row, "entity_type", executed=True, decision="fail",
+                                reason=f"{type_reason}:{side}",
+                                details={"repair_attempted": True,
+                                         "proposed_type": target_type})
                     break
             elif type_reason:
                 rejected_rows.append(_reject_row(row, "entity_type", f"{type_reason}:{side}"))
                 type_rejected = True
+                trace_check(row, "entity_type", executed=True, decision="fail",
+                            reason=f"{type_reason}:{side}")
                 break
         if type_rejected:
+            trace_skipped(row, "entity_type")
             continue
+        trace_check(row, "entity_type", executed=True, decision="pass",
+                    reason="entity_types_compatible")
         if repaired:
             row["fact_id"] = fact_id(str(row.get("doc_id") or ""), row["subject_id"],
                 row["relation"], row["object_id"], row.get("evidence"), row.get("chunk_index"))
@@ -463,7 +728,12 @@ def validate_facts_frame(
                     f"generic_company_phrase:{generic_side}:{generic_name}",
                 )
             )
+            trace_check(row, "generic_entity", executed=True, decision="fail",
+                        reason=f"generic_company_phrase:{generic_side}:{generic_name}")
+            trace_skipped(row, "generic_entity")
             continue
+        trace_check(row, "generic_entity", executed=True, decision="pass",
+                    reason="named_entities")
 
         if ontology_enabled and not is_ontology_valid(
             str(row.get("subject_type")), str(row.get("relation")),
@@ -472,8 +742,28 @@ def validate_facts_frame(
             row["ontology_valid"] = False
             new_relation = None
             if repair_enabled and max_repair >= 1:
+                calls_before = set(audit.llm_call_ids("validation")) if audit is not None else set()
+                original_relation = row.get("relation")
                 new_relation = _repair_relation(llm, row, ontology)
                 repaired = True
+                if audit is not None:
+                    audit.emit(
+                        "ontology_repair_attempted", stage="validation",
+                        candidate_fact_id=row.get("candidate_fact_id"),
+                        repair_trigger="ontology_invalid",
+                        original_fact=(dict(row) if audit.capture_content else None),
+                        original_relation=original_relation,
+                        proposed_relation=new_relation,
+                        attempt_number=1,
+                        accepted=bool(new_relation and is_ontology_valid(
+                            str(row.get("subject_type")), str(new_relation),
+                            str(row.get("object_type")), ontology,
+                        )),
+                        related_llm_call_ids=[
+                            call_id for call_id in audit.llm_call_ids("validation")
+                            if call_id not in calls_before
+                        ],
+                    )
             if new_relation and is_ontology_valid(
                 str(row.get("subject_type")), new_relation,
                 str(row.get("object_type")), ontology,
@@ -491,6 +781,11 @@ def validate_facts_frame(
                 )
                 row["ontology_valid"] = True
                 row["validation_status"] = "repaired"
+                trace_check(
+                    row, "ontology", executed=True, decision="pass",
+                    reason="ontology_relation_repaired",
+                    details={"repair_attempted": True, "repaired_relation": new_relation},
+                )
             else:
                 rejected_rows.append(
                     _reject_row(
@@ -499,7 +794,19 @@ def validate_facts_frame(
                         repair_result=new_relation,
                     )
                 )
+                trace_check(
+                    row, "ontology", executed=True, decision="fail",
+                    reason="ontology_invalid",
+                    details={"repair_attempted": repaired, "repair_result": new_relation},
+                )
+                trace_skipped(row, "ontology")
                 continue
+        else:
+            trace_check(
+                row, "ontology", executed=ontology_enabled,
+                decision="pass" if ontology_enabled else "not_applicable",
+                reason="ontology_pattern_allowed" if ontology_enabled else "ontology_check_disabled",
+            )
 
         # Deterministic relation-cue gate (assists; does not alone accept).
         lexical_ok, lexical_reason = lexical_relation_gate(
@@ -507,8 +814,14 @@ def validate_facts_frame(
             str(row.get("evidence") or ""),
             policy=policy,
         )
+        trace_check(
+            row, "lexical_evidence", executed=True,
+            decision="pass" if lexical_ok is True else "fail" if lexical_ok is False else "indeterminate",
+            reason=lexical_reason,
+        )
         if lexical_ok is False:
             rejected_rows.append(_reject_row(row, "evidence", lexical_reason))
+            trace_skipped(row, "lexical_evidence")
             continue
 
         # Directional suppliesTo: deterministic first; LLM adjudicates genuine ambiguity.
@@ -569,16 +882,25 @@ def validate_facts_frame(
                             row["validation_status"] = "repaired"
                     elif verdict.get("status") == "unsupported":
                         direction_reason = "ambiguous_supply_direction"
+            trace_check(
+                row, "direction", executed=True,
+                decision="pass" if direction_ok else "fail", reason=direction_reason,
+            )
             if not direction_ok:
                 rejected_rows.append(_reject_row(row, "evidence", direction_reason))
+                trace_skipped(row, "direction")
                 continue
         else:
             row["direction_explicit"] = True
+            trace_check(row, "direction", executed=False, decision="not_applicable",
+                        reason="relation_is_not_suppliesTo")
 
         if _needs_evidence_check(row, config, repaired=repaired or row.get("validation_status") == "repaired"):
             row["_relation_policy"] = policy
             pending_evidence.append(row)
         else:
+            trace_check(row, "semantic_entailment", executed=False,
+                        decision="not_applicable", reason="selective_validation_not_required")
             row["evidence_validated"] = False
             row["validation_status"] = row.get("validation_status") or "accepted"
             accepted_rows.append(row)
@@ -590,6 +912,24 @@ def validate_facts_frame(
             # Retain deterministic-only candidates for offline inspection without
             # asserting model entailment or allowing them to pass the frontier gate.
             for row in batch:
+                if row.get("evidence_repair_status") == "succeeded":
+                    row["evidence_repair_status"] = "failed"
+                    row["evidence_repair_reason"] = "semantic_validation_unavailable"
+                    rejected_rows.append(
+                        _reject_row(
+                            row,
+                            "grounding",
+                            "evidence_repair_semantic_unverified",
+                        )
+                    )
+                    trace_check(
+                        row, "semantic_entailment", executed=False, decision="fail",
+                        reason="evidence_repair_semantic_unverified",
+                    )
+                    continue
+                trace_check(row, "semantic_entailment", executed=False,
+                            decision="not_instrumented",
+                            reason="semantic_validator_unavailable")
                 row["evidence_validated"] = False
                 row["validation_status"] = "unchecked"
                 accepted_rows.append(row)
@@ -598,6 +938,8 @@ def validate_facts_frame(
         for row in batch:
             decision = decisions.get(row["candidate_fact_id"], "unclear")
             if decision == "supports":
+                trace_check(row, "semantic_entailment", executed=True,
+                            decision="pass", reason="evidence_entailed")
                 row["evidence_validated"] = True
                 row["validation_status"] = row.get("validation_status") or "accepted"
                 accepted_rows.append(row)
@@ -606,17 +948,35 @@ def validate_facts_frame(
                 from ..llm.adjudication import second_pass_evidence
                 second = second_pass_evidence(llm, config, row)
                 if second == "YES":
+                    trace_check(
+                        row, "semantic_entailment", executed=True,
+                        decision="pass", reason="second_pass_evidence_entailed",
+                        details={"first_pass": "unclear", "second_pass": second},
+                    )
                     row["evidence_validated"] = True
                     row["validation_status"] = row.get("validation_status") or "accepted"
                     accepted_rows.append(row)
                 else:
+                    rejection_reason = (
+                        "evidence_not_entailed"
+                        if second == "AMBIGUOUS" else "evidence_contradicts"
+                    )
+                    trace_check(
+                        row, "semantic_entailment", executed=True,
+                        decision="fail", reason=rejection_reason,
+                        details={"first_pass": "unclear", "second_pass": second},
+                    )
                     rejected_rows.append(
                         _reject_row(
-                            row, "evidence",
-                            "evidence_not_entailed" if second == "AMBIGUOUS" else "evidence_contradicts",
+                            row, "evidence", rejection_reason,
                         )
                     )
             else:
+                trace_check(
+                    row, "semantic_entailment", executed=True, decision="fail",
+                    reason=("evidence_not_entailed" if decision == "unclear"
+                            else "evidence_contradicts"),
+                )
                 rejected_rows.append(
                     _reject_row(row, "evidence", "evidence_contradicts")
                 )

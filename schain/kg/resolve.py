@@ -30,6 +30,7 @@ from json_repair import repair_json
 from neo4j_graphrag.components.types import Neo4jGraph
 from neo4j_graphrag.llm import LLMInterface
 
+from ..audit import llm_call_context, prompt_hash
 from ..names import canonical_id, mention_key, normalization_key, pick_canonical_name
 from .entity_types import company_type_hint
 
@@ -186,7 +187,12 @@ def _llm_groups(llm: LLMInterface, label: str, names: list[str]) -> list[list[st
     prompt = DISAMBIGUATION_PROMPT.format(
         entity_type=label, names="\n".join(f"- {name}" for name in names)
     )
-    raw = llm.invoke(prompt).content
+    with llm_call_context(
+        prompt_template_id="DISAMBIGUATION_PROMPT",
+        prompt_template_hash=prompt_hash(DISAMBIGUATION_PROMPT),
+        entity_type=label,
+    ):
+        raw = llm.invoke(prompt).content
     try:
         payload = json.loads(repair_json(raw))
         groups = [

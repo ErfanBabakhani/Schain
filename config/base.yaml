@@ -20,6 +20,13 @@ runtime:
   max_consecutive_failures: 5
   max_document_attempts: 2
 
+# Optional per-document JSONL trace. Content capture can include sensitive source text
+# and model output, so both tracing and full-content capture are disabled by default.
+audit:
+  enabled: false
+  capture_content: false
+  path: data/processed/audit
+
 source_reputation:
   enabled: true
   path: config/source_reputation.yaml
@@ -35,6 +42,9 @@ validation:
     enabled: true
     # Reject evidence that does not occur in the supplied source text.
     require_source_quote: true
+    # Conservatively recover an exact sentence only when endpoints and relation cues
+    # identify one unambiguous source passage; semantic validation still runs after it.
+    recover_source_quote: true
     validate_tier_advancing_edges: true
     validate_risky_relations:
       - owns
@@ -90,6 +100,7 @@ storage:
   rejected_facts: data/processed/rejected_facts.parquet
   edge_support: data/processed/edge_support.parquet
   verification_evidence: data/processed/verification_evidence.parquet
+  extraction_integrity: data/processed/extraction_integrity.json
   state_db: data/state/state.db
   # Derived frontend-ready semantic graph (not a source of truth; regenerated on demand).
   graph_export: outputs/supply_chain_graph.v1.json

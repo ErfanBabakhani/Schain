@@ -55,6 +55,11 @@ suppliesTo:
   - procurement agreement with
   - offtake agreement with
   direction_templates_supplier_first:
+  # Bounded same-clause gap permits a subject appositive, e.g.
+  # "Rimac Technology, a Croatian company, supplies ... to BMW".
+  - '{subject} .* supplies .* to {object}'
+  - '{subject} .* supplied .* to {object}'
+  - '{subject} .* will supply .* to {object}'
   - '{subject} supplies {object}'
   - '{subject} supplies .* to {object}'
   - '{subject} supply {object}'

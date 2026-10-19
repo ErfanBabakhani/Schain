@@ -46,11 +46,23 @@ def run_ingest(
     }
 
     for path in files:
+        run_audit = config.get("_audit_trace")
+        if run_audit is not None:
+            run_audit.emit(
+                "input_file_discovered", stage="document_loading",
+                path=str(path), filename=path.name,
+            )
         try:
             document = load_document(path)
         except (ValueError, OSError) as error:
             logger.error("could not read %s: %s", path, error)
             summary["documents_failed"] += 1
+            if run_audit is not None:
+                run_audit.emit(
+                    "document_load_failed", stage="document_loading",
+                    path=str(path), filename=path.name,
+                    error_type=type(error).__name__, error=str(error),
+                )
             continue
 
         try:
