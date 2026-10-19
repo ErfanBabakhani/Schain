@@ -376,7 +376,10 @@ def _usage_metrics(connection, config=None) -> dict[str, Any]:
     return metrics
 
 
-def run_expand(config: dict[str, Any], connection, llm, ontology: dict[str, Any], driver=None) -> dict[str, Any]:
+def run_expand(
+    config: dict[str, Any], connection, llm, ontology: dict[str, Any], driver=None,
+    checkpoint_manager=None,
+) -> dict[str, Any]:
     """Expand under persisted budgets; all accepted facts survive scheduling stops.
 
     Runtime is enforced at cancellable unit boundaries. An in-flight model call can
@@ -624,6 +627,10 @@ def run_expand(config: dict[str, Any], connection, llm, ontology: dict[str, Any]
                     doc_elapsed = time.monotonic() - doc_started
                     state.finish_document_usage(connection, doc_id, entity_key, completed=False, elapsed_seconds=doc_elapsed)
                     checkpoint_time()
+                    if checkpoint_manager is not None:
+                        checkpoint_manager.maybe_snapshot(
+                            connection, reason=f"document_failed:{doc_id}",
+                        )
                     manifest.record_document(result, doc_id, mf.LLM_FAILED)
                     summary["documents_failed"] += 1
                     if time_reason() or getattr(error, "stop_reason", None) == "runtime_deadline":
@@ -651,6 +658,10 @@ def run_expand(config: dict[str, Any], connection, llm, ontology: dict[str, Any]
                 state.finish_document_usage(connection, doc_id, entity_key, completed=True,
                     elapsed_seconds=time.monotonic() - doc_started, expansion_edges=gained, metrics=document_summary)
                 checkpoint_time()
+                if checkpoint_manager is not None:
+                    checkpoint_manager.maybe_snapshot(
+                        connection, reason=f"document_completed:{doc_id}",
+                    )
                 if document_summary.get("skipped"):
                     summary["documents_skipped"] += 1
                     manifest.record_document(result, doc_id, mf.SKIPPED)
@@ -731,6 +742,12 @@ def run_expand(config: dict[str, Any], connection, llm, ontology: dict[str, Any]
         manifest.flush()
     summary["frontier"] = state.frontier_counts(connection)
     summary["frontier_by_tier"] = state.frontier_tier_counts(connection)
+    summary["save"] = {
+        "enabled": driver is not None,
+        "backend": "neo4j" if driver is not None else None,
+        "mode": "incremental" if driver is not None else None,
+        "commits": state.neo4j_commit_summary(connection),
+    }
     summary["retrieval"] = manifest.summary()
     manifest.log_summary()
     summary["retrieval_manifest"] = str(manifest.path)

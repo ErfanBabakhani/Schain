@@ -20,7 +20,11 @@ from typing import Any, Optional
 from neo4j_graphrag.exceptions import LLMGenerationError
 
 from . import state
-from .config import load_config, storage_path, log_effective_expansion_config, validate_expansion_config
+from .config import (
+    load_config, storage_path, log_effective_expansion_config, save_settings,
+    validate_expansion_config,
+)
+from .durable import DurableCheckpointManager
 from .expansion.loop import run_expand
 from .ingest import run_ingest
 from .llm.provider import build_llm
@@ -39,14 +43,32 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_common(sub: argparse.ArgumentParser, default_config: str) -> None:
         sub.add_argument("--config", type=Path, default=Path(default_config))
-        sub.add_argument(
-            "--restart", action="store_true",
+        lifecycle = sub.add_mutually_exclusive_group()
+        lifecycle.add_argument(
+            "--restart", "--new-run", dest="restart", action="store_true",
             help="clear checkpoint state and generated data, then run from scratch",
         )
-        sub.add_argument(
-            "--no-neo4j", action="store_true",
-            help="stop after the facts table instead of merging into Neo4j",
+        lifecycle.add_argument(
+            "--resume", action="store_true",
+            help="explicitly resume the configured experiment (also the default)",
         )
+        save_group = sub.add_mutually_exclusive_group()
+        save_group.add_argument(
+            "--save", dest="save_override", action="store_true", default=None,
+            help="incrementally persist accepted facts to Neo4j",
+        )
+        save_group.add_argument(
+            "--no-save", dest="save_override", action="store_false",
+            help="disable Neo4j persistence without disabling local checkpoints",
+        )
+        save_group.add_argument(
+            "--no-neo4j", action="store_true",
+            help="legacy alias for --no-save",
+        )
+        sub.set_defaults(no_neo4j=False)
+        sub.add_argument("--experiment-id", default=None)
+        sub.add_argument("--checkpoint-store", type=Path, default=None)
+        sub.add_argument("--force-checkpoint-unlock", action="store_true")
 
     ingest = subparsers.add_parser("ingest", help="process documents already in hand")
     add_common(ingest, "config/ingest.yaml")
@@ -196,8 +218,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         return _run_export(args, config)
 
     # CLI flags override the config file. Seeds are replaced ONLY via --seeds.
-    if args.restart:
+    if args.resume:
+        config.setdefault("runtime", {})["restart_from_scratch"] = False
+        config["runtime"]["resume"] = True
+    elif args.restart:
         config.setdefault("runtime", {})["restart_from_scratch"] = True
+    if args.no_neo4j:
+        config.setdefault("save", {})["enabled"] = False
+    elif args.save_override is not None:
+        config.setdefault("save", {})["enabled"] = bool(args.save_override)
+    if args.experiment_id is not None:
+        config.setdefault("checkpoint_store", {})["experiment_id"] = args.experiment_id
+        config["checkpoint_store"]["enabled"] = True
+    if args.checkpoint_store is not None:
+        config.setdefault("checkpoint_store", {})["directory"] = str(args.checkpoint_store)
+        config["checkpoint_store"]["enabled"] = True
     if args.mode == "expand":
         if args.max_tier is not None:
             config.setdefault("expansion", {})["max_tier"] = args.max_tier
@@ -216,20 +251,37 @@ def main(argv: Optional[list[str]] = None) -> int:
         log_effective_expansion_config(config)
         validate_expansion_config(config)
 
-    if config.get("runtime", {}).get("restart_from_scratch"):
-        removed = clear_generated_data(config)
-        logger.warning("restart: removed %d generated file(s)", len(removed))
+    save = save_settings(config)
+    checkpoint_manager = DurableCheckpointManager.from_config(config, mode=args.mode)
+    checkpoint_status = None
+    if checkpoint_manager is not None:
+        try:
+            checkpoint_status = checkpoint_manager.prepare(
+                new_run=bool(config.get("runtime", {}).get("restart_from_scratch")),
+                force_unlock=bool(args.force_checkpoint_unlock),
+            )
+        except Exception as error:  # noqa: BLE001 - configuration/recovery boundary
+            logger.error("checkpoint preparation failed: %s", error)
+            return 2
 
     from .audit_trace import configure_run_audit
     from .graph_export import export_path
-
-    audit = configure_run_audit(
-        config,
-        mode=args.mode,
-        graph_path=export_path(config),
-        input_path=getattr(args, "input", None),
-        neo4j_enabled=not args.no_neo4j,
-    )
+    try:
+        if config.get("runtime", {}).get("restart_from_scratch"):
+            removed = clear_generated_data(config)
+            logger.warning("restart: removed %d generated file(s)", len(removed))
+        audit = configure_run_audit(
+            config,
+            mode=args.mode,
+            graph_path=export_path(config),
+            input_path=getattr(args, "input", None),
+            neo4j_enabled=save["enabled"],
+        )
+    except Exception as error:  # noqa: BLE001 - release an acquired durable lock
+        if checkpoint_manager is not None:
+            checkpoint_manager.release()
+        logger.error("run setup failed: %s", error)
+        return 2
     connection = None
     driver = None
     summary = None
@@ -238,12 +290,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         ontology = load_ontology(config)
         connection = state.connect(storage_path(config, "state_db"))
         llm = build_llm(config)
-        if not args.no_neo4j:
+        if save["enabled"]:
             driver = open_driver(config)
         if args.mode == "ingest":
-            summary = run_ingest(config, connection, llm, ontology, driver, args.input)
+            summary = run_ingest(
+                config, connection, llm, ontology, driver, args.input,
+                checkpoint_manager=checkpoint_manager,
+            )
         else:
-            summary = run_expand(config, connection, llm, ontology, driver)
+            summary = run_expand(
+                config, connection, llm, ontology, driver,
+                checkpoint_manager=checkpoint_manager,
+            )
+        if checkpoint_manager is not None:
+            summary["checkpoint_store"] = {
+                **checkpoint_manager.status(), **(checkpoint_status or {}),
+            }
         summary = _attach_graph_export(config, summary, args.mode)
     except LLMGenerationError as error:
         run_error = error
@@ -258,10 +320,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         logger.error("%s failed: %s: %s", args.mode, type(error).__name__, error)
         return 1
     finally:
-        if driver is not None:
-            driver.close()
-        if connection is not None:
-            connection.close()
         if audit is not None:
             status = (
                 "failed" if run_error is not None
@@ -283,6 +341,26 @@ def main(argv: Optional[list[str]] = None) -> int:
                     summary["audit_trace"] = str(audit.output_path)
             except Exception:  # noqa: BLE001 - graph result must survive audit finalization
                 logger.exception("could not finalize audit trace %s", audit.output_path)
+        if checkpoint_manager is not None and connection is not None:
+            try:
+                generation = checkpoint_manager.snapshot(connection, reason="run_finalized")
+                if summary is not None:
+                    summary.setdefault("checkpoint_store", {}).update(
+                        checkpoint_manager.status()
+                    )
+                    summary["checkpoint_store"]["last_snapshot"] = generation
+            except Exception as error:  # noqa: BLE001 - durability failure is a run failure
+                logger.error("final durable checkpoint failed: %s", error)
+                run_error = run_error or error
+        if driver is not None:
+            driver.close()
+        if connection is not None:
+            connection.close()
+        if checkpoint_manager is not None:
+            checkpoint_manager.release()
+
+    if run_error is not None:
+        return 1
 
     logger.info(
         "done documents=%s facts=%s nodes=%s relationships=%s frontier=%s "

@@ -233,14 +233,26 @@ def clear_generated_data(config: dict[str, Any]) -> list[str]:
 
 
 def open_driver(config: dict[str, Any]) -> neo4j.Driver:
-    """Open and verify a Neo4j connection using credentials from the environment."""
+    """Open and verify Neo4j with bounded retries for transient connectivity loss."""
     settings = neo4j_settings(config)
-    driver = neo4j.GraphDatabase.driver(
-        settings["uri"], auth=(settings["username"], settings["password"])
-    )
-    driver.verify_connectivity()
-    ensure_constraints(driver, settings["database"])
-    return driver
+    save = config.get("save") or {}
+    attempts = max(1, int(save.get("max_attempts", 3)))
+    backoff = max(0.0, float(save.get("retry_backoff_seconds", 1.0)))
+    for attempt in range(1, attempts + 1):
+        driver = neo4j.GraphDatabase.driver(
+            settings["uri"], auth=(settings["username"], settings["password"])
+        )
+        try:
+            driver.verify_connectivity()
+            ensure_constraints(driver, settings["database"])
+            return driver
+        except Exception as error:  # noqa: BLE001 - classify before retrying
+            driver.close()
+            if not _transient_neo4j_error(error) or attempt >= attempts:
+                raise
+            if backoff:
+                time.sleep(backoff * (2 ** (attempt - 1)))
+    raise RuntimeError("Neo4j connection retry loop exhausted")
 
 
 def commit_facts(
@@ -261,6 +273,74 @@ def commit_facts(
         settings["batch_size"],
     )
     return written_nodes, written_rels
+
+
+def _transient_neo4j_error(error: Exception) -> bool:
+    """Only retry failures Neo4j classifies as connectivity/transient failures."""
+    transient_types = (
+        neo4j.exceptions.ServiceUnavailable,
+        neo4j.exceptions.SessionExpired,
+        neo4j.exceptions.TransientError,
+    )
+    return isinstance(error, transient_types)
+
+
+def commit_facts_with_retry(
+    driver: neo4j.Driver,
+    config: dict[str, Any],
+    connection,
+    doc_id: str,
+    facts: pd.DataFrame,
+    ontology: dict[str, Any],
+    resolution: Optional[dict[str, dict[str, Any]]],
+    audit,
+) -> tuple[int, int]:
+    """Persist one accepted document with a bounded, auditable retry policy.
+
+    A retry may replay already-written nodes if connectivity failed between node and
+    relationship statements. Both writers use stable MERGE identities and set-union
+    provenance, so replay is idempotent. The SQLite ledger reports COMMITTED only
+    after the complete logical document save returns successfully.
+    """
+    save = config.get("save") or {}
+    max_attempts = max(1, int(save.get("max_attempts", 3)))
+    backoff = max(0.0, float(save.get("retry_backoff_seconds", 1.0)))
+    for local_attempt in range(1, max_attempts + 1):
+        lifetime_attempt = state.begin_neo4j_commit(connection, doc_id)
+        audit.emit(
+            "neo4j_save_attempt", stage="commit", attempt_number=local_attempt,
+            lifetime_attempt=lifetime_attempt, accepted_fact_count=len(facts),
+        )
+        try:
+            nodes, relationships = commit_facts(
+                driver, config, facts, ontology, resolution,
+            )
+        except Exception as error:  # noqa: BLE001 - classify before retrying
+            state.finish_neo4j_commit(
+                connection, doc_id, success=False, error=str(error),
+            )
+            retryable = _transient_neo4j_error(error) and local_attempt < max_attempts
+            audit.emit(
+                "neo4j_save_failed", stage="commit", attempt_number=local_attempt,
+                lifetime_attempt=lifetime_attempt, retryable=retryable,
+                error_type=type(error).__name__, error=str(error),
+            )
+            if not retryable:
+                raise
+            if backoff:
+                time.sleep(backoff * (2 ** (local_attempt - 1)))
+            continue
+        state.finish_neo4j_commit(
+            connection, doc_id, success=True,
+            nodes_merged=nodes, relationships_merged=relationships,
+        )
+        audit.emit(
+            "neo4j_save_succeeded", stage="commit", attempt_number=local_attempt,
+            lifetime_attempt=lifetime_attempt, nodes_merged=nodes,
+            relationships_merged=relationships,
+        )
+        return nodes, relationships
+    raise RuntimeError("Neo4j save retry loop exhausted")
 
 
 def process_document(
@@ -829,7 +909,9 @@ def process_document(
             else:
                 if not resolution:
                     resolution = _load_resolution(config, doc_id)
-                nodes, rels = commit_facts(driver, config, facts, ontology, resolution)
+                nodes, rels = commit_facts_with_retry(
+                    driver, config, connection, doc_id, facts, ontology, resolution, audit,
+                )
                 state.set_document_status(connection, doc_id, state.COMMITTED)
                 status = state.COMMITTED
                 summary.update(nodes_merged=nodes, relationships_merged=rels)
