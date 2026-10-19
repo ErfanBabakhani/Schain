@@ -327,14 +327,30 @@ def extract_graph(
     graph = run_async(_run_extract())
     parsed_graph = graph
     chunk_index = {chunk.chunk_id: chunk.index for chunk in chunks.chunks}
+    recovery_outcomes: list[dict[str, Any]] = []
     graph, failures = enforce_referential_integrity(
         graph,
         document_id=str(document["doc_id"]),
         chunk_index_by_id=chunk_index,
+        ontology=ontology,
+        recovery_outcomes=recovery_outcomes,
     )
     if integrity_failures is not None:
         integrity_failures.extend(failures)
     metrics["extraction_integrity_failures"] = len(failures)
+    recovered_relationships = {
+        item["relationship_integrity_id"]
+        for item in recovery_outcomes
+        if item["event_type"] in {"endpoint_id_recovered", "endpoint_node_reconstructed"}
+    }
+    unresolved_relationships = {
+        item["relationship_integrity_id"]
+        for item in recovery_outcomes
+        if item["event_type"] in {"endpoint_recovery_ambiguous", "endpoint_unrecoverable"}
+    }
+    metrics["extraction_integrity_recovered_relationships"] = len(
+        recovered_relationships - unresolved_relationships
+    )
     if failures:
         logger.warning(
             "doc %s: rejected %d dangling extracted relationship(s)",
@@ -342,6 +358,17 @@ def extract_graph(
             len(failures),
         )
     if audit is not None:
+        for outcome in recovery_outcomes:
+            event_type = outcome["event_type"]
+            payload = {key: value for key, value in outcome.items() if key != "event_type"}
+            audit.emit(
+                event_type,
+                stage="extraction_integrity",
+                extraction_relationship_id=(
+                    "relationship-" + str(outcome["relationship_integrity_id"])
+                ),
+                **payload,
+            )
         node_ids = {node.id for node in parsed_graph.nodes}
         for relationship in parsed_graph.relationships:
             payload = relationship.model_dump(mode="json")
@@ -351,6 +378,17 @@ def extract_graph(
             relationship_id = extraction_relationship_id(
                 str(document["doc_id"]), relationship,
             )
+            integrity_id = relationship_id.removeprefix("relationship-")
+            relationship_outcomes = [
+                item for item in recovery_outcomes
+                if item["relationship_integrity_id"] == integrity_id
+            ]
+            unresolved = any(item["event_type"] in {
+                "endpoint_recovery_ambiguous", "endpoint_unrecoverable",
+            } for item in relationship_outcomes)
+            recovered = any(item["event_type"] in {
+                "endpoint_id_recovered", "endpoint_node_reconstructed",
+            } for item in relationship_outcomes)
             chunk_id = str(relationship.start_node_id).split(":", 1)[0]
             if chunk_id not in chunk_index:
                 chunk_id = str(relationship.end_node_id).split(":", 1)[0]
@@ -362,7 +400,11 @@ def extract_graph(
                 source_node_exists=relationship.start_node_id in node_ids,
                 target_node_exists=relationship.end_node_id in node_ids,
                 missing_node_ids=missing,
-                action="dropped_missing_endpoint" if missing else "retained",
+                action=(
+                    "dropped_missing_endpoint" if unresolved
+                    else "recovered_endpoint" if recovered
+                    else "retained"
+                ),
                 original_relationship=(payload if audit.capture_content else {
                     "start_node_id": relationship.start_node_id,
                     "end_node_id": relationship.end_node_id,
@@ -385,6 +427,9 @@ def extract_graph(
             stage="extraction_integrity",
             valid=not failures,
             failure_count=len(failures),
+            recovered_relationship_count=metrics[
+                "extraction_integrity_recovered_relationships"
+            ],
             failures=(
                 failures
                 if audit.capture_content

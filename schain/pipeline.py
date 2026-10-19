@@ -399,6 +399,12 @@ def process_document(
     stage_started = time.monotonic()
     extraction_metrics: dict[str, Any] = {}
     integrity_failures: list[dict[str, Any]] = []
+    origin_name = document.get("origin_entity_name")
+    if not origin_name and origin_entity:
+        origin_row = connection.execute(
+            "SELECT entity_name FROM frontier WHERE entity_key = ?", (origin_entity,),
+        ).fetchone()
+        origin_name = origin_row["entity_name"] if origin_row else None
 
     def advance_stage(name: str) -> None:
         nonlocal stage, stage_started
@@ -414,12 +420,6 @@ def process_document(
         if status in (state.PENDING, state.PROCESSING, state.FAILED):
             advance_stage("extraction")
             state.set_document_status(connection, doc_id, state.PROCESSING, increment_attempts=True)
-            origin_name = document.get("origin_entity_name")
-            if not origin_name and origin_entity:
-                origin_row = connection.execute(
-                    "SELECT entity_name FROM frontier WHERE entity_key = ?", (origin_entity,),
-                ).fetchone()
-                origin_name = origin_row["entity_name"] if origin_row else None
             graph, chunk_index = extract_graph(
                 measured_llm, document, ontology,
                 chunk_size=ingest_config.get("chunk_size", 2000),
@@ -465,16 +465,46 @@ def process_document(
                         historical_prompt="unavailable_from_document_checkpoint",
                         historical_model_response="unavailable_from_document_checkpoint",
                     )
+                resumed_outcomes: list[dict[str, Any]] = []
                 graph, resumed_failures = enforce_referential_integrity(
                     graph,
                     document_id=doc_id,
                     chunk_index_by_id=chunk_index,
+                    ontology=ontology,
+                    recovery_outcomes=resumed_outcomes,
                 )
-                if resumed_failures:
+                for outcome in resumed_outcomes:
+                    event_type = outcome["event_type"]
+                    payload = {
+                        key: value for key, value in outcome.items()
+                        if key != "event_type"
+                    }
+                    audit.emit(
+                        event_type,
+                        stage="extraction_integrity",
+                        source="document_checkpoint",
+                        extraction_relationship_id=(
+                            "relationship-" + str(outcome["relationship_integrity_id"])
+                        ),
+                        **payload,
+                    )
+                resumed_recoveries = [
+                    item for item in resumed_outcomes
+                    if item["event_type"] in {
+                        "endpoint_id_recovered", "endpoint_node_reconstructed",
+                    }
+                ]
+                if resumed_failures or resumed_recoveries:
                     integrity_failures.extend(resumed_failures)
                     extraction_metrics["extraction_integrity_failures"] = len(
                         resumed_failures
                     )
+                    extraction_metrics[
+                        "extraction_integrity_recovered_relationships"
+                    ] = len({
+                        item["relationship_integrity_id"]
+                        for item in resumed_recoveries
+                    })
                     # Upgrade the checkpoint in place without discarding the invalid
                     # payload: the diagnostic keeps the original relationship.
                     save_extraction(
@@ -530,19 +560,33 @@ def process_document(
                     relation_chunk = str(relationship.start_node_id).split(":", 1)[0]
                     if relation_chunk not in chunk_index:
                         relation_chunk = str(relationship.end_node_id).split(":", 1)[0]
+                    relationship_id = extraction_relationship_id(doc_id, relationship)
+                    integrity_id = relationship_id.removeprefix("relationship-")
+                    endpoint_outcomes = [
+                        item for item in resumed_outcomes
+                        if item["relationship_integrity_id"] == integrity_id
+                    ]
+                    unresolved = any(item["event_type"] in {
+                        "endpoint_recovery_ambiguous", "endpoint_unrecoverable",
+                    } for item in endpoint_outcomes)
+                    recovered = any(item["event_type"] in {
+                        "endpoint_id_recovered", "endpoint_node_reconstructed",
+                    } for item in endpoint_outcomes)
                     audit.emit(
                         "relationship_integrity_result",
                         stage="extraction_integrity",
-                        extraction_relationship_id=extraction_relationship_id(
-                            doc_id, relationship,
-                        ),
+                        extraction_relationship_id=relationship_id,
                         chunk_id=(relation_chunk if relation_chunk in chunk_index else None),
                         chunk_index=chunk_index.get(relation_chunk),
                         source="document_checkpoint",
                         source_node_exists=relationship.start_node_id in parsed_node_ids,
                         target_node_exists=relationship.end_node_id in parsed_node_ids,
                         missing_node_ids=missing,
-                        action="dropped_missing_endpoint" if missing else "retained",
+                        action=(
+                            "dropped_missing_endpoint" if unresolved
+                            else "recovered_endpoint" if recovered
+                            else "retained"
+                        ),
                         original_relationship=(
                             relationship.model_dump(mode="json")
                             if audit.capture_content else {
@@ -554,7 +598,12 @@ def process_document(
                     )
             cache = state.load_resolution_cache(connection)
             resolution, new_entries = resolve_entities(
-                graph, llm=measured_llm, cache=cache, aliases=ontology.get("aliases")
+                graph,
+                llm=measured_llm,
+                cache=cache,
+                aliases=ontology.get("aliases"),
+                document_text=document.get("text") or "",
+                audit=audit,
             )
             if new_entries:
                 state.save_resolution(connection, new_entries)
@@ -794,6 +843,12 @@ def process_document(
         state.set_document_status(connection, doc_id, keep, error=str(error))
         logger.error("doc %s failed after %s (kept as %s): %s", doc_id, status, keep, error)
         summary.update(status=keep, error=str(error))
+        # Keep the live object attached: the finally block below adds extraction,
+        # timing, and LLM counters before the exception reaches run_ingest.
+        try:
+            setattr(error, "_schain_document_summary", summary)
+        except (AttributeError, TypeError):
+            pass
         audit.emit(
             "document_failed",
             stage=stage,

@@ -49,7 +49,7 @@ def _fact(subject: str, relation: str, object_name: str, evidence: str, *,
     return pd.DataFrame([row], columns=FACT_COLUMNS)
 
 
-def test_missing_endpoint_is_rejected_with_lossless_diagnostic():
+def test_missing_location_endpoint_is_conservatively_reconstructed():
     graph = Neo4jGraph.model_validate({
         "nodes": [
             {"id": "chunk-a:0", "label": "Company", "properties": {"name": "Rimac Technology"}},
@@ -68,14 +68,11 @@ def test_missing_endpoint_is_rejected_with_lossless_diagnostic():
         chunk_index_by_id={"chunk-a": 3},
     )
 
-    assert clean.relationships == []
-    assert len(failures) == 1
-    failure = failures[0]
-    assert failure["chunk_id"] == "chunk-a" and failure["chunk_index"] == 3
-    assert failure["missing_node_ids"] == ["chunk-a:9"]
-    assert failure["reason"] == "missing_relationship_endpoint"
-    assert failure["repair_attempted"] is False
-    assert failure["original_relationship"]["properties"]["evidence"].endswith("Croatia.")
+    assert failures == []
+    assert len(clean.relationships) == 1
+    location = next(node for node in clean.nodes if node.label == "Location")
+    assert location.properties["name"] == "Croatia"
+    assert clean.relationships[0].end_node_id == location.id
 
 
 def test_legacy_dangling_checkpoint_is_safely_upgraded(
@@ -105,13 +102,14 @@ def test_legacy_dangling_checkpoint_is_safely_upgraded(
     llm = StubLLM(disambiguation='{"groups": []}')
     result = process_document(document, ingest_config, connection, llm, ontology)
 
-    assert result["status"] == state.RESOLVED and result["facts"] == 0
+    assert result["status"] == state.RESOLVED and result["facts"] == 1
     assert llm.extraction_calls == 0
     upgraded = json.loads(extraction.read_text(encoding="utf-8"))
-    assert upgraded["graph"]["relationships"] == []
-    assert upgraded["integrity_failures"][0]["original_relationship"]["end_node_id"] == "legacy:1"
-    diagnostic = json.loads((tmp_path / "processed" / "extraction_integrity.json").read_text())
-    assert diagnostic[0]["reason"] == "missing_relationship_endpoint"
+    assert len(upgraded["graph"]["relationships"]) == 1
+    assert any(node["label"] == "Location" for node in upgraded["graph"]["nodes"])
+    assert upgraded["extraction_metrics"][
+        "extraction_integrity_recovered_relationships"
+    ] == 1
 
 
 def test_exact_evidence_remains_unchanged(ingest_config, ontology):
@@ -362,7 +360,7 @@ def test_audit_records_structure_repair_acceptance_and_cache_hit(
     document = make_document(source)
     llm = StubLLM(extraction=response, disambiguation='{"groups": []}')
     first = process_document(document, ingest_config, connection, llm, ontology)
-    assert first["accepted_facts"] == 1
+    assert first["accepted_facts"] == 2
     process_document(document, ingest_config, connection, llm, ontology)
 
     audit_file = tmp_path / "audit" / "audit-run" / f"{document['doc_id']}.jsonl"
@@ -373,14 +371,13 @@ def test_audit_records_structure_repair_acceptance_and_cache_hit(
         "structural_integrity_checked", "entity_resolution_completed",
         "candidate_facts_created", "grounding_checked", "evidence_repair_succeeded",
         "candidate_accepted", "validation_completed", "document_cache_hit",
+        "endpoint_node_reconstructed",
     }.issubset(events)
     structural = next(record for record in records if record["event"] == "structural_integrity_checked")
-    assert structural["valid"] is False
-    assert structural["failures"][0]["original_relationship"]["end_node_id"].endswith(":2")
+    assert structural["valid"] is True
+    assert structural["recovered_relationship_count"] == 1
     assert any("rendered_prompt" in record for record in records if record["event"] == "llm_call_started")
     assert any("raw_model_response" in record for record in records if record["event"] == "llm_call_finished")
-    diagnostic = json.loads((tmp_path / "processed" / "extraction_integrity.json").read_text())
-    assert diagnostic[0]["original_relationship"]["properties"]["evidence"].endswith("Croatia.")
 
 
 def test_audit_disabled_creates_no_audit_output(

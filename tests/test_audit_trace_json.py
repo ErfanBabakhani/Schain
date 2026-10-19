@@ -87,6 +87,12 @@ def test_full_cli_audit_is_companion_to_unchanged_graph(
     assert len(audit["accepted_facts"]) == 3
     assert all(item["fact_id"] for item in audit["accepted_facts"])
     assert audit["graph_export"]["status"] == "success"
+    assert graph["completion"] == graph["metadata"]["completion"]
+    assert graph["completion"]["export_success"] is True
+    assert graph["completion"]["pipeline_processing_complete"] is True
+    assert graph["completion"]["documents_failed"] == 0
+    assert graph["completion"]["graph_has_accepted_facts"] is True
+    assert audit["graph_export"]["completion"] == graph["completion"]
     exported_fact_ids = {
         fact_id for item in audit["graph_export"]["edge_fact_map"]
         for fact_id in item["fact_ids"]

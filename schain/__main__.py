@@ -160,8 +160,11 @@ def _attach_graph_export(
     """Write the derived graph JSON after a successful ingest/expand run."""
     from .graph_export import export_graph
 
-    path = export_graph(config, mode=mode, pipeline_summary=summary)
     summary = dict(summary)
+    completion = dict(summary.get("completion") or {})
+    completion["export_success"] = True
+    summary["completion"] = completion
+    path = export_graph(config, mode=mode, pipeline_summary=summary)
     summary["graph_export"] = str(path)
     return summary
 
