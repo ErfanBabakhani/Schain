@@ -317,9 +317,16 @@ def _needs_evidence_check(row: dict[str, Any], config: dict[str, Any], repaired:
     return relation in risky
 
 
-def _batch_evidence_validate(llm, rows: list[dict[str, Any]]) -> dict[str, str]:
+def _request_evidence_decisions(
+    llm,
+    rows: list[dict[str, Any]],
+    *,
+    attempt: int,
+    audit=None,
+) -> tuple[dict[str, str], set[str], dict[str, Any]]:
+    """Request one batch and classify every response defect without losing good rows."""
     if not rows:
-        return {}
+        return {}, set(), {}
     lines = []
     for row in rows:
         lines.append(
@@ -344,29 +351,133 @@ def _batch_evidence_validate(llm, rows: list[dict[str, Any]]) -> dict[str, str]:
             prompt_template_id="EVIDENCE_BATCH_PROMPT",
             prompt_template_hash=prompt_hash(EVIDENCE_BATCH_PROMPT),
             candidate_fact_ids=[row["candidate_fact_id"] for row in rows],
+            semantic_validation_attempt=attempt,
         ):
             raw = llm.invoke(prompt).content
-        payload = json.loads(repair_json(raw))
-        results = payload.get("results", []) if isinstance(payload, dict) else []
     except Exception as error:  # noqa: BLE001
-        # A service/parse failure is operational, not evidence against the fact.
-        # Let the document checkpoint retry from EXTRACTED on resume.
+        # Transport/service failures remain operational. They must not silently turn
+        # into negative scientific evidence.
         raise RuntimeError("evidence validation failed; document remains retryable") from error
+    try:
+        payload = json.loads(repair_json(raw))
+        results = payload.get("results", []) if isinstance(payload, dict) else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        results = None
+
+    expected = {str(row["candidate_fact_id"]) for row in rows}
     decisions: dict[str, str] = {}
+    invalid_ids: set[str] = set()
+    duplicate_ids: set[str] = set()
+    unknown_ids: list[str] = []
+    malformed_items = 0
     if not isinstance(results, list):
-        raise ValueError("evidence validation response results must be a list")
-    for item in results:
-        if not isinstance(item, dict):
-            continue
-        cid = str(item.get("candidate_fact_id") or "")
-        decision = str(item.get("decision") or "unclear").lower()
-        if decision not in ("supports", "contradicts", "unclear"):
-            raise ValueError("invalid evidence decision; document must retry validation")
-        if cid:
+        malformed_items = 1
+    else:
+        seen: set[str] = set()
+        for item in results:
+            if not isinstance(item, dict):
+                malformed_items += 1
+                continue
+            raw_cid = item.get("candidate_fact_id")
+            if not isinstance(raw_cid, str) or not raw_cid.strip():
+                malformed_items += 1
+                continue
+            cid = raw_cid.strip()
+            if cid not in expected:
+                unknown_ids.append(cid)
+                continue
+            if cid in seen:
+                duplicate_ids.add(cid)
+                decisions.pop(cid, None)
+                continue
+            seen.add(cid)
+            raw_decision = item.get("decision")
+            if not isinstance(raw_decision, str):
+                invalid_ids.add(cid)
+                continue
+            decision = raw_decision.strip().lower()
+            if decision not in ("supports", "contradicts", "unclear"):
+                invalid_ids.add(cid)
+                continue
             decisions[cid] = decision
-    missing = {row["candidate_fact_id"] for row in rows} - decisions.keys()
-    if missing:
-        raise ValueError("evidence validation response omitted candidate decisions; retry required")
+
+    unresolved = expected - decisions.keys()
+    unresolved.update(invalid_ids)
+    unresolved.update(duplicate_ids)
+    issues = {
+        "requested_candidate_fact_ids": sorted(expected),
+        "valid_candidate_fact_ids": sorted(decisions),
+        "missing_candidate_fact_ids": sorted(expected - seen),
+        "invalid_candidate_fact_ids": sorted(invalid_ids),
+        "duplicate_candidate_fact_ids": sorted(duplicate_ids),
+        "unknown_candidate_fact_ids": sorted(set(unknown_ids)),
+        "malformed_item_count": malformed_items,
+    }
+    if audit is not None:
+        audit.emit(
+            "semantic_validation_batch_response",
+            stage="validation",
+            attempt_number=attempt,
+            requested_count=len(expected),
+            valid_count=len(decisions),
+            unresolved_candidate_fact_ids=sorted(unresolved),
+            **issues,
+        )
+    return decisions, unresolved, issues
+
+
+def _batch_evidence_validate(llm, rows: list[dict[str, Any]]) -> dict[str, str]:
+    """Validate a batch with bounded retries only for unresolved candidate IDs.
+
+    Valid decisions from an incomplete response are retained. Missing, duplicate,
+    unknown, malformed, or invalid entries can never become an implicit approval.
+    """
+    if not rows:
+        return {}
+    options = rows[0].get("_semantic_validation_options") or {}
+    audit = rows[0].get("_audit_trace")
+    max_attempts = max(1, int(options.get("max_attempts", 2)))
+    retry_batch_size = max(1, int(options.get("retry_batch_size", 1)))
+
+    decisions, unresolved, _ = _request_evidence_decisions(
+        llm, rows, attempt=1, audit=audit,
+    )
+    by_id = {str(row["candidate_fact_id"]): row for row in rows}
+    attempt = 1
+    while unresolved and attempt < max_attempts:
+        attempt += 1
+        retry_ids = sorted(unresolved)
+        if audit is not None:
+            audit.emit(
+                "semantic_validation_targeted_retry",
+                stage="validation",
+                attempt_number=attempt,
+                candidate_fact_ids=retry_ids,
+                retry_batch_size=retry_batch_size,
+                preserved_decision_count=len(decisions),
+            )
+        next_unresolved: set[str] = set()
+        for start in range(0, len(retry_ids), retry_batch_size):
+            retry_rows = [by_id[cid] for cid in retry_ids[start:start + retry_batch_size]]
+            recovered, still_unresolved, _ = _request_evidence_decisions(
+                llm, retry_rows, attempt=attempt, audit=audit,
+            )
+            decisions.update(recovered)
+            next_unresolved.update(still_unresolved)
+        unresolved = next_unresolved
+
+    if unresolved:
+        for cid in unresolved:
+            decisions[cid] = "incomplete"
+        if audit is not None:
+            audit.emit(
+                "semantic_validation_unresolved",
+                stage="validation",
+                candidate_fact_ids=sorted(unresolved),
+                attempts=max_attempts,
+                final_policy="reject_fail_closed",
+                reason="semantic_validation_incomplete",
+            )
     return decisions
 
 
@@ -480,6 +591,8 @@ def validate_facts_frame(
     max_repair = int(ontology_cfg.get("max_repair_attempts", 1))
     evidence_cfg = validation.get("evidence") or {}
     evidence_batch = int(evidence_cfg.get("batch_size", 10))
+    incomplete_batch_attempts = int(evidence_cfg.get("incomplete_batch_max_attempts", 2))
+    incomplete_retry_batch = int(evidence_cfg.get("incomplete_retry_batch_size", 1))
     policy = load_relation_evidence(evidence_cfg.get("policy_file"))
 
     # Normalize once per document; whitespace variation from PDF/text splitting is harmless.
@@ -934,7 +1047,16 @@ def validate_facts_frame(
                 row["validation_status"] = "unchecked"
                 accepted_rows.append(row)
             continue
+        for row in batch:
+            row["_semantic_validation_options"] = {
+                "max_attempts": incomplete_batch_attempts,
+                "retry_batch_size": incomplete_retry_batch,
+            }
+            row["_audit_trace"] = audit
         decisions = _batch_evidence_validate(llm, batch)
+        for row in batch:
+            row.pop("_semantic_validation_options", None)
+            row.pop("_audit_trace", None)
         for row in batch:
             decision = decisions.get(row["candidate_fact_id"], "unclear")
             if decision == "supports":
@@ -971,6 +1093,15 @@ def validate_facts_frame(
                             row, "evidence", rejection_reason,
                         )
                     )
+            elif decision == "incomplete":
+                trace_check(
+                    row, "semantic_entailment", executed=True, decision="fail",
+                    reason="semantic_validation_incomplete",
+                    details={"policy": "reject_fail_closed"},
+                )
+                rejected_rows.append(
+                    _reject_row(row, "evidence", "semantic_validation_incomplete")
+                )
             else:
                 trace_check(
                     row, "semantic_entailment", executed=True, decision="fail",
