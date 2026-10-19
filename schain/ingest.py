@@ -37,6 +37,7 @@ def run_ingest(
     ontology: dict[str, Any],
     driver=None,
     input_path: Optional[Path] = None,
+    checkpoint_manager=None,
 ) -> dict[str, Any]:
     """Ingest every input document and return a summary."""
     ingest_config = config.get("ingest", {})
@@ -87,18 +88,36 @@ def run_ingest(
             failed_summary = getattr(error, "_schain_document_summary", None)
             if isinstance(failed_summary, dict):
                 _accumulate_document_metrics(summary, failed_summary)
+            if checkpoint_manager is not None:
+                checkpoint_manager.maybe_snapshot(
+                    connection, reason=f"document_failed:{document['doc_id']}",
+                )
             continue
 
         if document_summary["skipped"]:
             summary["documents_skipped"] += 1
+            if checkpoint_manager is not None:
+                checkpoint_manager.maybe_snapshot(
+                    connection, reason=f"document_skipped:{document_summary['doc_id']}",
+                )
             continue
         summary["documents_processed"] += 1
         summary["facts"] += document_summary["facts"]
         summary["nodes_merged"] += document_summary["nodes_merged"]
         summary["relationships_merged"] += document_summary["relationships_merged"]
         _accumulate_document_metrics(summary, document_summary)
+        if checkpoint_manager is not None:
+            checkpoint_manager.maybe_snapshot(
+                connection, reason=f"document_completed:{document_summary['doc_id']}",
+            )
 
     summary["documents"] = state.document_counts(connection)
+    summary["save"] = {
+        "enabled": driver is not None,
+        "backend": "neo4j" if driver is not None else None,
+        "mode": "incremental" if driver is not None else None,
+        "commits": state.neo4j_commit_summary(connection),
+    }
     summary["completion"] = {
         "complete": summary["documents_failed"] == 0,
         "export_success": False,

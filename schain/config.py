@@ -119,6 +119,23 @@ def neo4j_is_configured() -> bool:
     return bool(os.environ.get("NEO4J_PASSWORD"))
 
 
+def save_settings(config: dict[str, Any]) -> dict[str, Any]:
+    """Return and validate the explicit graph-database save policy."""
+    raw = config.get("save") or {}
+    settings = {
+        "enabled": bool(raw.get("enabled", False)),
+        "backend": str(raw.get("backend", "neo4j")),
+        "mode": str(raw.get("mode", "incremental")),
+        "max_attempts": max(1, int(raw.get("max_attempts", 3))),
+        "retry_backoff_seconds": max(0.0, float(raw.get("retry_backoff_seconds", 1.0))),
+    }
+    if settings["backend"] != "neo4j":
+        raise ValueError("save.backend must be 'neo4j'")
+    if settings["mode"] != "incremental":
+        raise ValueError("save.mode must be 'incremental'")
+    return settings
+
+
 # --- search limits: global defaults < tier defaults < per-query override ------------
 
 # Fields resolved independently through the hierarchy. Only these are inheritable.
