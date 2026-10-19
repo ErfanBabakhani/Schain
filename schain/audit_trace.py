@@ -301,7 +301,8 @@ class RunAuditTrace:
         categories = {key: [] for key in (
             "extraction_graphs", "integrity_checks", "entity_resolution",
             "candidate_facts", "validation_decisions", "repair_attempts",
-            "accepted_facts", "rejected_facts", "relationship_outcomes", "errors",
+            "accepted_facts", "rejected_facts", "relationship_outcomes",
+            "database_commits", "errors",
         )}
         graph_export: dict[str, Any] = {"path": str(self.graph_path), "status": "not_started"}
         for event in events:
@@ -361,6 +362,8 @@ class RunAuditTrace:
                 "semantic_validation_unresolved",
             }:
                 categories["validation_decisions"].append(event)
+            if kind.startswith("neo4j_save_"):
+                categories["database_commits"].append(event)
             if "repair" in kind:
                 categories["repair_attempts"].append(event)
             if kind == "candidate_accepted":

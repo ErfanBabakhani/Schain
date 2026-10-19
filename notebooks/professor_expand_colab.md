@@ -1,38 +1,12 @@
-# SChain — Professor Colab EXPAND setup
-#
-# Seeds and expansion policy come from config/expansion.yaml.
-# Do NOT set FOCAL_COMPANY / seeds = ["BMW"] in the normal path.
-#
-# Recommended:
-#   CONFIG = "config/colab_professor_expand.yaml"   # includes expansion.yaml
-#   MAX_DOCUMENTS = 150         # keep; 150 was not the bottleneck
-#   FRESH_RUN = True
-#   Runtime: expansion/colab overlay uses max_minutes=120
-#   MAX_TIER: prefer expansion.yaml (5); override only if intentional
-#
-# v0.3 recall fixes active:
-#   - broad "{entity} suppliers" query family
-#   - zero-yield rescue up to per-tier max after primary target
-#   - improved Google News title/publisher recovery
-#   - funnel / fetch-failure / rejection telemetry in run_metrics.json
+# SChain professor EXPAND notebook
 
-"""
-# --- Colab cell sketch (not executed by the repo CI) ---
+The earlier file was only a non-executable cell sketch and defaulted every session
+to a fresh `--no-neo4j` run. The runnable replacement is:
 
-CONFIG = "config/colab_professor_expand.yaml"
-MAX_DOCUMENTS = 150
-FRESH_RUN = True
-# Optional explicit overrides only:
-# MAX_TIER = 5
-# SEEDS_OVERRIDE = None
+- [`SChain_Expand_Persistent_Save.ipynb`](SChain_Expand_Persistent_Save.ipynb)
 
-cmd = [
-    "python", "-m", "schain", "expand",
-    "--config", CONFIG,
-    "--no-neo4j",
-]
-if FRESH_RUN:
-    cmd.append("--restart")
-if MAX_DOCUMENTS is not None:
-    cmd.extend(["--max-documents", str(MAX_DOCUMENTS)])
-"""
+It uses `config/colab_professor_expand.yaml` as the policy overlay, enables
+incremental Neo4j Save, keeps live SQLite on `/content`, and snapshots the same
+experiment to Google Drive for later resume. See
+[`docs/SAVE_AND_COLAB_RESUME.md`](../docs/SAVE_AND_COLAB_RESUME.md) for setup and
+recovery semantics.

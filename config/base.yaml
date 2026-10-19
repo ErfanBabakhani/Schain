@@ -85,6 +85,25 @@ neo4j:
   database: neo4j
   batch_size: 1000
 
+# Explicit graph-database persistence. Local Parquet/SQLite checkpoints and graph
+# JSON export remain active regardless of this switch.
+save:
+  enabled: false
+  backend: neo4j
+  mode: incremental
+  max_attempts: 3
+  retry_backoff_seconds: 1.0
+
+# Optional durable experiment snapshots. Colab overlays should point directory at
+# Google Drive while keeping storage.* on the fast local /content filesystem.
+checkpoint_store:
+  enabled: false
+  experiment_id: null
+  directory: null
+  snapshot_every_documents: 1
+  keep_snapshots: 3
+  lock_stale_seconds: 21600
+
 concurrency:
   # Bounded async retrieval. The LLM server does its own batching, so there is no
   # thread pool around the model here.
