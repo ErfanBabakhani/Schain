@@ -26,7 +26,20 @@ ingest:
   # Checkpoints/metrics record omitted chunks and partial coverage explicitly.
   max_chunks_per_document: 4
 
-# Run: python -m schain expand --config config/colab_professor_expand.yaml --no-neo4j
+save:
+  enabled: true
+  backend: neo4j
+  mode: incremental
+  max_attempts: 3
+  retry_backoff_seconds: 2.0
+
+# The runnable notebook supplies experiment_id, a Google Drive directory, and local
+# storage paths through an untracked runtime overlay.
+checkpoint_store:
+  enabled: false
+
+# Run without durable Colab snapshots:
+# python -m schain expand --config config/colab_professor_expand.yaml --save
 # Explicit experiment changes: --max-tier 5 --max-documents 320
 # Individual seed overrides safely preserve commas:
 # --seed Toyota --seed "Tesla Inc." --seed BMW --seed "BYD Co., Ltd."

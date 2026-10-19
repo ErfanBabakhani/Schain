@@ -374,3 +374,16 @@ MATCH ()-[r:suppliesTo]->() RETURN r.evidence, r.source_doc_ids LIMIT 25;
   and is off by default. Prompt 2 is a plain call, so it relies on `json_mode` regardless.
 - **No lexical graph in Neo4j.** `create_lexical_graph=False`, so Neo4j holds only the
   static ontology; the evidence trail lives in the facts Parquet layer.
+
+## Incremental Save and persistent Colab EXPAND
+
+Neo4j persistence is explicit: pass `--save` to merge each document's accepted,
+validated facts as it completes, or `--no-save`/legacy `--no-neo4j` for a completely
+Neo4j-free run. Local SQLite/Parquet checkpoints and Graph JSON export remain active
+in either mode.
+
+For restart-safe Colab expansion, use
+[`notebooks/SChain_Expand_Persistent_Save.ipynb`](notebooks/SChain_Expand_Persistent_Save.ipynb).
+It keeps live SQLite on local Colab storage and publishes verified backup generations
+to Google Drive. Configuration, security, resume, and crash-recovery details are in
+[`docs/SAVE_AND_COLAB_RESUME.md`](docs/SAVE_AND_COLAB_RESUME.md).

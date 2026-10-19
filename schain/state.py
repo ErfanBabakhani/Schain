@@ -147,6 +147,17 @@ CREATE TABLE IF NOT EXISTS verification_searches (
     updated_at   TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS verification_searches_edge_idx ON verification_searches(edge_key);
+
+CREATE TABLE IF NOT EXISTS neo4j_commits (
+    doc_id                TEXT PRIMARY KEY,
+    status                TEXT NOT NULL,
+    attempts              INTEGER NOT NULL DEFAULT 0,
+    nodes_merged          INTEGER NOT NULL DEFAULT 0,
+    relationships_merged  INTEGER NOT NULL DEFAULT 0,
+    error                 TEXT,
+    committed_at          TEXT,
+    updated_at            TEXT NOT NULL
+);
 """
 
 
@@ -407,6 +418,54 @@ def set_run_value(connection, key: str, value) -> None:
         (key, json.dumps(value)),
     )
     connection.commit()
+
+
+# --- incremental Neo4j save ledger ------------------------------------------------
+
+
+def begin_neo4j_commit(connection: sqlite3.Connection, doc_id: str) -> int:
+    """Record a logical document commit attempt before touching Neo4j."""
+    now = _now()
+    connection.execute(
+        "INSERT INTO neo4j_commits(doc_id,status,attempts,updated_at) VALUES (?, ?, 1, ?) "
+        "ON CONFLICT(doc_id) DO UPDATE SET status=excluded.status, "
+        "attempts=neo4j_commits.attempts+1, error=NULL, updated_at=excluded.updated_at",
+        (doc_id, "IN_PROGRESS", now),
+    )
+    connection.commit()
+    return int(connection.execute(
+        "SELECT attempts FROM neo4j_commits WHERE doc_id=?", (doc_id,),
+    ).fetchone()[0])
+
+
+def finish_neo4j_commit(
+    connection: sqlite3.Connection,
+    doc_id: str,
+    *,
+    success: bool,
+    nodes_merged: int = 0,
+    relationships_merged: int = 0,
+    error: Optional[str] = None,
+) -> None:
+    """Mark success only after all accepted rows were written without error."""
+    now = _now()
+    connection.execute(
+        "UPDATE neo4j_commits SET status=?, nodes_merged=?, relationships_merged=?, "
+        "error=?, committed_at=?, updated_at=? WHERE doc_id=?",
+        (
+            "COMMITTED" if success else "FAILED",
+            int(nodes_merged), int(relationships_merged), error,
+            now if success else None, now, doc_id,
+        ),
+    )
+    connection.commit()
+
+
+def neo4j_commit_summary(connection: sqlite3.Connection) -> dict[str, int]:
+    rows = connection.execute(
+        "SELECT status, COUNT(*) AS n FROM neo4j_commits GROUP BY status"
+    ).fetchall()
+    return {str(row["status"]): int(row["n"]) for row in rows}
 
 
 # --- expansion frontier ------------------------------------------------------------
