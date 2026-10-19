@@ -43,11 +43,18 @@ class MeasuredLLM:
     explicitly disables layered SDK/rate-handler retries by default below.
     """
 
-    def __init__(self, llm, metrics: dict[str, Any], deadline: float | None = None) -> None:
+    def __init__(
+        self,
+        llm,
+        metrics: dict[str, Any],
+        deadline: float | None = None,
+        audit=None,
+    ) -> None:
         self._schain_wrapped_llm = llm
         self.metrics = metrics
         self.stage = "extraction"
         self.deadline = deadline
+        self.audit = audit
 
     def __getattr__(self, name):
         return getattr(self._schain_wrapped_llm, name)
@@ -66,17 +73,80 @@ class MeasuredLLM:
         times = self.metrics.setdefault("llm_seconds_by_stage", {})
         times[stage] = round(times.get(stage, 0.0) + time.monotonic() - started, 4)
 
+    @staticmethod
+    def _audit_request(args, kwargs) -> dict[str, Any]:
+        """Describe the real invocation boundary without reconstructing a prompt."""
+        return {
+            "input": args[0] if args else kwargs.get("input"),
+            "message_history": (
+                args[1] if len(args) > 1 else kwargs.get("message_history")
+            ),
+            "system_instruction": (
+                args[2] if len(args) > 2 else kwargs.get("system_instruction")
+            ),
+            "keyword_arguments": {
+                key: value for key, value in kwargs.items()
+                if key not in {"input", "message_history", "system_instruction"}
+            },
+        }
+
     def invoke(self, *args, **kwargs):
         stage, started = self._begin()
+        audit_started = None
+        if self.audit is not None and self.audit.enabled:
+            audit_started = self.audit.llm_started(
+                stage=stage,
+                request=self._audit_request(args, kwargs),
+                model=getattr(self, "model_name", None),
+                parameters=getattr(self, "model_params", None),
+            )
         try:
-            return self._schain_wrapped_llm.invoke(*args, **kwargs)
+            response = self._schain_wrapped_llm.invoke(*args, **kwargs)
+            if audit_started is not None:
+                self.audit.llm_finished(
+                    stage=stage,
+                    started=audit_started,
+                    response=response,
+                )
+            return response
+        except Exception as error:
+            if audit_started is not None:
+                self.audit.llm_finished(
+                    stage=stage,
+                    started=audit_started,
+                    error=error,
+                )
+            raise
         finally:
             self._finish(stage, started)
 
     async def ainvoke(self, *args, **kwargs):
         stage, started = self._begin()
+        audit_started = None
+        if self.audit is not None and self.audit.enabled:
+            audit_started = self.audit.llm_started(
+                stage=stage,
+                request=self._audit_request(args, kwargs),
+                model=getattr(self, "model_name", None),
+                parameters=getattr(self, "model_params", None),
+            )
         try:
-            return await self._schain_wrapped_llm.ainvoke(*args, **kwargs)
+            response = await self._schain_wrapped_llm.ainvoke(*args, **kwargs)
+            if audit_started is not None:
+                self.audit.llm_finished(
+                    stage=stage,
+                    started=audit_started,
+                    response=response,
+                )
+            return response
+        except Exception as error:
+            if audit_started is not None:
+                self.audit.llm_finished(
+                    stage=stage,
+                    started=audit_started,
+                    error=error,
+                )
+            raise
         finally:
             self._finish(stage, started)
 

@@ -136,14 +136,13 @@ class SupplyChainERTemplate(ERExtractionTemplate):
     """
 
     DEFAULT_TEMPLATE = """\
-You are an information extraction system building a supply-chain knowledge graph.
-
-Extract entities and relationships from the input text below. Return JSON only:
-{{"nodes": [{{"id": "0", "label": "Company", "properties": {{"name": "CATL"}}}}],
+Extract a supply-chain knowledge graph. Return JSON only:
+{{"nodes": [{{"id": "0", "label": "Company", "properties": {{"name": "CATL"}}}},
+{{"id": "1", "label": "Company", "properties": {{"name": "BMW"}}}}],
 "relationships": [{{"type": "suppliesTo", "start_node_id": "0", "end_node_id": "1",
-"properties": {{"evidence": "verbatim sentence from the input text"}}}}]}}
+"properties": {{"evidence": "CATL supplies battery cells to BMW."}}}}]}}
 
-Use only the following node labels, relationship types and allowed patterns:
+Allowed schema:
 {schema}
 
 ONTOLOGY RELATION MEANINGS (exact; do not stretch meanings):

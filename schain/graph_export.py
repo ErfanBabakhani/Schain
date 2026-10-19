@@ -12,6 +12,7 @@ import json
 import logging
 import math
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -1354,5 +1355,45 @@ def export_graph(
 ) -> Path:
     """Build and write the frontend-ready graph JSON. Returns the output path."""
     path = export_path(config, output)
-    bundle = build_graph_bundle(config, mode=mode, pipeline_summary=pipeline_summary)
-    return write_graph_bundle(bundle, path)
+    audit = config.get("_audit_trace")
+    started = time.monotonic()
+    if audit is not None:
+        audit.emit("graph_export_started", stage="graph_export", path=str(path), mode=mode)
+    try:
+        bundle = build_graph_bundle(config, mode=mode, pipeline_summary=pipeline_summary)
+        written = write_graph_bundle(bundle, path)
+    except Exception as error:
+        if audit is not None:
+            audit.emit(
+                "graph_export_failed", stage="graph_export", path=str(path),
+                error_type=type(error).__name__, error=str(error),
+                duration_seconds=round(time.monotonic() - started, 6),
+            )
+        raise
+    if audit is not None:
+        edge_fact_map = [
+            {"edge_id": edge.get("id"), "fact_ids": list(edge.get("fact_ids") or [])}
+            for edge in bundle.get("edges", [])
+        ]
+        included = {
+            fact_id for item in edge_fact_map for fact_id in item["fact_ids"] if fact_id
+        }
+        facts = _load_facts(config)
+        accepted_ids = {
+            str(value) for value in facts.get("fact_id", pd.Series(dtype=str)).dropna().tolist()
+        } if not facts.empty else set()
+        audit.emit(
+            "graph_export_completed", stage="graph_export", path=str(written),
+            node_count=len(bundle.get("nodes", [])), edge_count=len(bundle.get("edges", [])),
+            edge_fact_map=edge_fact_map,
+            accepted_fact_ids_in_export=sorted(included),
+            accepted_facts_omitted=[
+                {"fact_id": fact_id,
+                 "reason": "not_represented_after_export_filtering_or_aggregation"}
+                for fact_id in sorted(accepted_ids - included)
+            ],
+            graph_schema_version=bundle.get("schema_version"),
+            graph_fingerprint=(bundle.get("metadata") or {}).get("graph_fingerprint"),
+            duration_seconds=round(time.monotonic() - started, 6),
+        )
+    return written

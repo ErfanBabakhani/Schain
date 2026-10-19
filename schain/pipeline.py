@@ -28,11 +28,16 @@ from neo4j_graphrag.components.types import Neo4jGraph
 import pandas as pd
 
 from . import state
+from .audit import audit_for_document
 from .checkpoint import atomic_write_json, atomic_write_parquet
 from .config import neo4j_settings, storage_dir, storage_path
 from .documents import append_raw_jsonl, upsert_normalized_parquet
 from .kg.extract import extract_graph
-from .kg.facts import facts_for_document, graph_to_facts, upsert_facts_parquet
+from .kg.facts import (
+    candidate_fact_id_for_audit, extraction_relationship_id, facts_for_document, graph_to_facts,
+    upsert_facts_parquet,
+)
+from .kg.integrity import enforce_referential_integrity
 from .kg.resolve import resolve_entities
 from .kg.support import refresh_edge_support
 from .kg.validate import persist_rejected, validate_facts_frame
@@ -54,12 +59,43 @@ def _extraction_file(config: dict[str, Any], doc_id: str) -> Path:
 def save_extraction(
     config: dict[str, Any], doc_id: str, graph: Neo4jGraph, chunk_index: dict[str, int],
     metrics: Optional[dict[str, Any]] = None,
+    integrity_failures: Optional[list[dict[str, Any]]] = None,
 ) -> None:
     """Persist Prompt 1 output before anything else can fail."""
     payload = {"graph": graph.model_dump(), "chunk_index": chunk_index}
     if metrics is not None:
         payload["extraction_metrics"] = dict(metrics)
+    if integrity_failures:
+        payload["integrity_failures"] = list(integrity_failures)
     atomic_write_json(_extraction_file(config, doc_id), payload)
+
+
+def _persist_integrity_failures(
+    config: dict[str, Any], failures: list[dict[str, Any]],
+) -> None:
+    """Keep dangling-edge payloads in a separate, idempotent diagnostic artifact."""
+    if not failures:
+        return
+    storage = config.get("storage") or {}
+    path = (
+        storage_path(config, "extraction_integrity")
+        if storage.get("extraction_integrity")
+        else storage_dir(config, "extractions").parent / "extraction_integrity.json"
+    )
+    previous: list[dict[str, Any]] = []
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                previous = loaded
+        except (OSError, ValueError):
+            logger.warning("replacing damaged extraction-integrity artifact %s", path)
+    by_id = {
+        row.get("integrity_failure_id"): row
+        for row in [*previous, *failures]
+        if row.get("integrity_failure_id")
+    }
+    atomic_write_json(path, list(by_id.values()))
 
 
 def load_extraction(
@@ -176,6 +212,11 @@ def clear_generated_data(config: dict[str, Any]) -> list[str]:
         if path.exists():
             path.unlink()
             removed.append(str(path))
+    if (config.get("storage") or {}).get("extraction_integrity"):
+        integrity_path = storage_path(config, "extraction_integrity")
+        if integrity_path.exists():
+            integrity_path.unlink()
+            removed.append(str(integrity_path))
     extractions = storage_dir(config, "extractions")
     for file in extractions.glob("*.json"):
         file.unlink()
@@ -257,6 +298,27 @@ def process_document(
     }
 
     status = state.document_status(connection, doc_id) or state.PENDING
+    audit = audit_for_document(config, doc_id)
+    audit.emit(
+        "document_observed",
+        stage="persistence",
+        filename=Path(str(document.get("source_path") or "")).name or None,
+        source_path=document.get("source_path"),
+        title=document.get("title"),
+        source_url=document.get("source_url"),
+        retrieval_url=document.get("retrieval_url"),
+        canonical_source_url=document.get("canonical_source_url"),
+        content_hash=document.get("content_hash"),
+        character_count=len(document.get("text") or ""),
+        normalized_source_text=(document.get("text") if audit.capture_content else None),
+        initial_checkpoint_status=status,
+    )
+    audit.emit(
+        "document_registered",
+        stage="persistence",
+        checkpoint_status=status,
+        is_new=is_new,
+    )
     if not is_new and doc_id != document["doc_id"]:
         # A changed fetch at the same URL must resume the saved original source when
         # unfinished, never pair new text with an old extraction/checkpoint identity.
@@ -266,6 +328,16 @@ def process_document(
         original = _load_persisted_document(config, doc_id) if unfinished else None
         if original is None or not original.get("text"):
             summary.update(skipped="duplicate", status=status)
+            audit.emit(
+                "document_cache_hit",
+                stage="checkpoint",
+                checkpoint_status=status,
+                disposition="duplicate",
+            )
+            audit.emit(
+                "document_skipped", stage="checkpoint",
+                reason="duplicate", checkpoint_status=status,
+            )
             logger.info("doc %s is duplicate of %s, skipping", document["doc_id"], doc_id)
             return summary
         document = original
@@ -274,10 +346,30 @@ def process_document(
     if status == state.COMMITTED and resume:
         summary.update(skipped="already committed", status=status)
         logger.info("doc %s already committed, skipping", doc_id)
+        audit.emit(
+            "document_cache_hit",
+            stage="checkpoint",
+            checkpoint_status=status,
+            disposition="already_committed",
+        )
+        audit.emit(
+            "document_skipped", stage="checkpoint",
+            reason="already_committed", checkpoint_status=status,
+        )
         return summary
     if status == state.RESOLVED and driver is None and resume:
         summary.update(skipped="already resolved", status=status)
         logger.info("doc %s already resolved without Neo4j, skipping", doc_id)
+        audit.emit(
+            "document_cache_hit",
+            stage="checkpoint",
+            checkpoint_status=status,
+            disposition="already_resolved",
+        )
+        audit.emit(
+            "document_skipped", stage="checkpoint",
+            reason="already_resolved", checkpoint_status=status,
+        )
         return summary
 
     title = (document.get("title") or "")[:80]
@@ -301,10 +393,12 @@ def process_document(
     resolution: dict[str, dict[str, Any]] = {}
     measured_llm = MeasuredLLM(
         llm, summary, deadline=config.get("_runtime_deadline_monotonic"),
+        audit=audit,
     ) if llm is not None else None
     stage = "persistence"
     stage_started = time.monotonic()
     extraction_metrics: dict[str, Any] = {}
+    integrity_failures: list[dict[str, Any]] = []
 
     def advance_stage(name: str) -> None:
         nonlocal stage, stage_started
@@ -340,9 +434,19 @@ def process_document(
                 origin_name=origin_name,
                 evidence_policy_file=(config.get("validation", {}).get("evidence", {})
                                       .get("policy_file")),
+                integrity_failures=integrity_failures,
+                audit=audit,
             )
             summary.update(extraction_metrics)
-            save_extraction(config, doc_id, graph, chunk_index, extraction_metrics)
+            save_extraction(
+                config,
+                doc_id,
+                graph,
+                chunk_index,
+                extraction_metrics,
+                integrity_failures,
+            )
+            _persist_integrity_failures(config, integrity_failures)
             state.set_document_status(connection, doc_id, state.EXTRACTED)
             status = state.EXTRACTED
 
@@ -352,6 +456,102 @@ def process_document(
             if graph is None:
                 graph, chunk_index = load_extraction(config, doc_id)
                 logger.info("doc %s: reusing stored Prompt 1 output", doc_id)
+                parsed_graph = graph
+                for chunk_id, index in chunk_index.items():
+                    audit.emit(
+                        "chunk_checkpoint_reused", stage="extraction",
+                        chunk_id=chunk_id, chunk_index=index,
+                        disposition="reused_document_extraction_checkpoint",
+                        historical_prompt="unavailable_from_document_checkpoint",
+                        historical_model_response="unavailable_from_document_checkpoint",
+                    )
+                graph, resumed_failures = enforce_referential_integrity(
+                    graph,
+                    document_id=doc_id,
+                    chunk_index_by_id=chunk_index,
+                )
+                if resumed_failures:
+                    integrity_failures.extend(resumed_failures)
+                    extraction_metrics["extraction_integrity_failures"] = len(
+                        resumed_failures
+                    )
+                    # Upgrade the checkpoint in place without discarding the invalid
+                    # payload: the diagnostic keeps the original relationship.
+                    save_extraction(
+                        config,
+                        doc_id,
+                        graph,
+                        chunk_index,
+                        extraction_metrics,
+                        integrity_failures,
+                    )
+                    _persist_integrity_failures(config, integrity_failures)
+                audit.emit(
+                    "parsed_extraction_graph",
+                    stage="extraction",
+                    source="checkpoint",
+                    node_count=len(parsed_graph.nodes),
+                    relationship_count=len(parsed_graph.relationships),
+                    graph=(
+                        parsed_graph.model_dump(mode="json")
+                        if audit.capture_content
+                        else None
+                    ),
+                )
+                audit.emit(
+                    "structural_integrity_checked",
+                    stage="extraction_integrity",
+                    source="checkpoint",
+                    valid=not resumed_failures,
+                    failure_count=len(resumed_failures),
+                    failures=(
+                        resumed_failures
+                        if audit.capture_content
+                        else [
+                            {
+                                "integrity_failure_id": failure["integrity_failure_id"],
+                                "chunk_id": failure["chunk_id"],
+                                "chunk_index": failure["chunk_index"],
+                                "relation_type": failure["relation_type"],
+                                "missing_node_ids": failure["missing_node_ids"],
+                                "reason": failure["reason"],
+                            }
+                            for failure in resumed_failures
+                        ]
+                    ),
+                )
+                parsed_node_ids = {node.id for node in parsed_graph.nodes}
+                for relationship in parsed_graph.relationships:
+                    missing = [
+                        endpoint for endpoint in (
+                            relationship.start_node_id, relationship.end_node_id,
+                        ) if endpoint not in parsed_node_ids
+                    ]
+                    relation_chunk = str(relationship.start_node_id).split(":", 1)[0]
+                    if relation_chunk not in chunk_index:
+                        relation_chunk = str(relationship.end_node_id).split(":", 1)[0]
+                    audit.emit(
+                        "relationship_integrity_result",
+                        stage="extraction_integrity",
+                        extraction_relationship_id=extraction_relationship_id(
+                            doc_id, relationship,
+                        ),
+                        chunk_id=(relation_chunk if relation_chunk in chunk_index else None),
+                        chunk_index=chunk_index.get(relation_chunk),
+                        source="document_checkpoint",
+                        source_node_exists=relationship.start_node_id in parsed_node_ids,
+                        target_node_exists=relationship.end_node_id in parsed_node_ids,
+                        missing_node_ids=missing,
+                        action="dropped_missing_endpoint" if missing else "retained",
+                        original_relationship=(
+                            relationship.model_dump(mode="json")
+                            if audit.capture_content else {
+                                "start_node_id": relationship.start_node_id,
+                                "end_node_id": relationship.end_node_id,
+                                "type": relationship.type,
+                            }
+                        ),
+                    )
             cache = state.load_resolution_cache(connection)
             resolution, new_entries = resolve_entities(
                 graph, llm=measured_llm, cache=cache, aliases=ontology.get("aliases")
@@ -359,7 +559,62 @@ def process_document(
             if new_entries:
                 state.save_resolution(connection, new_entries)
             _write_resolution_parquet(config, doc_id, resolution)
-            facts = graph_to_facts(graph, document, chunk_index, resolution, model=model)
+            audit.emit(
+                "entity_resolution_completed",
+                stage="resolution",
+                resolved_count=len(resolution),
+                new_entry_count=len(new_entries),
+                results=resolution if audit.capture_content else None,
+            )
+            original_nodes = {node.id: node for node in graph.nodes}
+            for node_id, entry in resolution.items():
+                original = original_nodes.get(node_id)
+                audit.emit(
+                    "entity_resolution_item",
+                    stage="resolution",
+                    node_id=node_id,
+                    original_text=(
+                        (original.properties or {}).get("name")
+                        if original is not None and audit.capture_content else None
+                    ),
+                    original_type=original.label if original is not None else None,
+                    canonical_id=entry.get("canonical_id"),
+                    canonical_name=(entry.get("canonical_name") if audit.capture_content else None),
+                    mention=(entry.get("mention") if audit.capture_content else None),
+                    aliases=(entry.get("aliases") if audit.capture_content else None),
+                    method=entry.get("method"),
+                    related_llm_call_ids=(
+                        audit.contextual_llm_call_ids(
+                            "resolution", "entity_type",
+                            original.label if original is not None else "",
+                        ) if "llm" in str(entry.get("method")) else []
+                    ),
+                    merged_with_multiple_names=len(entry.get("aliases") or []) > 1,
+                    possible_duplicates_remaining="not_observable",
+                )
+            unresolved_relationships = [
+                {
+                    "relation_type": rel.type,
+                    "start_node_id": rel.start_node_id,
+                    "end_node_id": rel.end_node_id,
+                    "missing_resolution_ids": [
+                        node_id
+                        for node_id in (rel.start_node_id, rel.end_node_id)
+                        if node_id not in resolution
+                    ],
+                }
+                for rel in graph.relationships
+                if rel.start_node_id not in resolution or rel.end_node_id not in resolution
+            ]
+            audit.emit(
+                "entity_resolution_integrity_checked",
+                stage="resolution",
+                valid=not unresolved_relationships,
+                failures=unresolved_relationships,
+            )
+            facts = graph_to_facts(
+                graph, document, chunk_index, resolution, model=model, audit=audit,
+            )
             # Deterministic supplier-list path (complements Prompt 1; still validated).
             try:
                 from .kg.list_extract import extract_supplier_list_facts
@@ -375,16 +630,60 @@ def process_document(
                     aliases=origin_aliases,
                     source_url=document.get("source_url") or document.get("canonical_source_url"),
                 )
+                for list_row in list_rows:
+                    candidate_id = candidate_fact_id_for_audit(
+                        str(list_row.get("doc_id") or ""),
+                        str(list_row.get("subject_id") or ""),
+                        str(list_row.get("relation") or ""),
+                        str(list_row.get("object_id") or ""),
+                        str(list_row.get("evidence") or ""),
+                    )
+                    audit.emit(
+                        "candidate_fact_created",
+                        stage="fact_construction",
+                        candidate_fact_id=candidate_id,
+                        fact_id=list_row.get("fact_id"),
+                        extraction_relationship_id=None,
+                        chunk_id=None,
+                        chunk_index=list_row.get("chunk_index"),
+                        subject_id=list_row.get("subject_id"),
+                        object_id=list_row.get("object_id"),
+                        subject_mention=(
+                            list_row.get("subject_mention") if audit.capture_content else None
+                        ),
+                        object_mention=(
+                            list_row.get("object_mention") if audit.capture_content else None
+                        ),
+                        subject_name=(
+                            list_row.get("subject_name") if audit.capture_content else None
+                        ),
+                        object_name=(
+                            list_row.get("object_name") if audit.capture_content else None
+                        ),
+                        predicate=list_row.get("relation"),
+                        original_evidence=(
+                            list_row.get("evidence") if audit.capture_content else None
+                        ),
+                        originating_llm_call_ids=[],
+                        creation_path="deterministic_supplier_list_extraction",
+                        status="candidate",
+                    )
                 if list_rows:
-                    import pandas as pd
                     facts = pd.concat([facts, pd.DataFrame(list_rows)], ignore_index=True)
             except Exception as list_error:  # noqa: BLE001
                 logger.warning("structured list extraction skipped: %s", list_error)
             summary["candidate_facts"] = len(facts)
+            audit.emit(
+                "candidate_facts_created",
+                stage="fact_construction",
+                candidate_fact_ids=facts.fact_id.tolist(),
+                count=len(facts),
+            )
             advance_stage("validation")
             accepted, rejected = validate_facts_frame(
                 facts, config=config, ontology=ontology, llm=measured_llm,
                 document_text=document.get("text") or "",
+                audit=audit,
             )
             advance_stage("facts_persistence")
             persist_rejected(config, rejected)
@@ -395,6 +694,63 @@ def process_document(
             summary["facts"] = len(accepted)
             summary["accepted_facts"] = len(accepted)
             summary["rejected_facts"] = len(rejected)
+            audit.emit(
+                "validation_completed",
+                stage="validation",
+                accepted_fact_ids=accepted.fact_id.tolist(),
+                accepted=[
+                    {
+                        "fact_id": row.get("fact_id"),
+                        "expansion_relevant": bool(row.get("expansion_relevant")),
+                        "tier_disposition": (
+                            "eligible_for_quality_aggregation"
+                            if bool(row.get("expansion_relevant"))
+                            else "context_only_not_upstream"
+                        ),
+                    }
+                    for row in accepted.to_dict(orient="records")
+                ],
+                rejected=[
+                    {
+                        "candidate_fact_id": row.get("candidate_fact_id"),
+                        "stage": row.get("rejection_stage"),
+                        "reason": row.get("rejection_reason"),
+                    }
+                    for row in rejected.to_dict(orient="records")
+                ],
+            )
+            for row in accepted.to_dict(orient="records"):
+                audit.emit(
+                    "candidate_accepted",
+                    stage="validation",
+                    candidate_fact_id=row.get("candidate_fact_id"),
+                    fact_id=row.get("fact_id"),
+                    final_evidence=(row.get("evidence") if audit.capture_content else None),
+                    validation_status=row.get("validation_status"),
+                    evidence_repaired=row.get("evidence_repair_status") == "succeeded",
+                    expansion_relevant=bool(row.get("expansion_relevant")),
+                    related_llm_call_ids=audit.contextual_llm_call_ids(
+                        "validation", "candidate_fact_id", row.get("candidate_fact_id"),
+                    ) + audit.contextual_llm_call_ids(
+                        "validation", "candidate_fact_ids", row.get("candidate_fact_id"),
+                    ),
+                )
+            for row in rejected.to_dict(orient="records"):
+                audit.emit(
+                    "candidate_rejected",
+                    stage="validation",
+                    candidate_fact_id=row.get("candidate_fact_id"),
+                    rejection_stage=row.get("rejection_stage"),
+                    rejection_reason=row.get("rejection_reason"),
+                    evidence=(row.get("evidence") if audit.capture_content else None),
+                    repair_attempted=bool(row.get("repair_attempted")),
+                    repair_result=row.get("repair_result"),
+                    related_llm_call_ids=audit.contextual_llm_call_ids(
+                        "validation", "candidate_fact_id", row.get("candidate_fact_id"),
+                    ) + audit.contextual_llm_call_ids(
+                        "validation", "candidate_fact_ids", row.get("candidate_fact_id"),
+                    ),
+                )
             logger.info(
                 "document resolved facts=%d rejected=%d",
                 len(accepted), len(rejected),
@@ -438,6 +794,13 @@ def process_document(
         state.set_document_status(connection, doc_id, keep, error=str(error))
         logger.error("doc %s failed after %s (kept as %s): %s", doc_id, status, keep, error)
         summary.update(status=keep, error=str(error))
+        audit.emit(
+            "document_failed",
+            stage=stage,
+            checkpoint_status=keep,
+            error_type=type(error).__name__,
+            error=str(error),
+        )
         raise
     finally:
         summary.update(extraction_metrics)
@@ -463,6 +826,16 @@ def process_document(
                     doc_id, summary["elapsed_seconds"], summary["llm_calls"],
                     summary["extraction_chunks"], summary["extraction_cache_hits"],
                     summary["candidate_facts"], summary["accepted_facts"], summary["rejected_facts"])
+        audit.emit(
+            "document_finished",
+            stage=stage,
+            checkpoint_status=status,
+            elapsed_seconds=summary["elapsed_seconds"],
+            llm_calls=summary["llm_calls"],
+            extraction_cache_hits=summary["extraction_cache_hits"],
+            accepted_facts=summary["accepted_facts"],
+            rejected_facts=summary["rejected_facts"],
+        )
 
     summary["status"] = status
     return summary
