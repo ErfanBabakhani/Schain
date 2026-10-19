@@ -1278,6 +1278,9 @@ def build_graph_bundle(
                     conn.close()
         except Exception:  # noqa: BLE001
             completion = None
+    if isinstance(completion, dict):
+        completion = dict(completion)
+        completion["graph_has_accepted_facts"] = not facts.empty
 
     bundle = {
         "schema_version": SCHEMA_VERSION,
@@ -1394,6 +1397,8 @@ def export_graph(
             ],
             graph_schema_version=bundle.get("schema_version"),
             graph_fingerprint=(bundle.get("metadata") or {}).get("graph_fingerprint"),
+            export_success=True,
+            completion=bundle.get("completion"),
             duration_seconds=round(time.monotonic() - started, 6),
         )
     return written

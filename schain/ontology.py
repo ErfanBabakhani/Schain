@@ -109,6 +109,23 @@ Output:
    "properties": {"evidence": "The plant is located in Germany."}}
 ]}
 
+Input text: "Northstar Cells manufactures battery modules. Arbor Mobility builds the A4 electric vehicle. Northstar supplies modules to Arbor, but it does not manufacture the A4. Arbor could manufacture cells someday."
+Output:
+{"nodes": [
+  {"id": "0", "label": "Company", "properties": {"name": "Northstar Cells"}},
+  {"id": "1", "label": "Material", "properties": {"name": "battery modules"}},
+  {"id": "2", "label": "Company", "properties": {"name": "Arbor Mobility"}},
+  {"id": "3", "label": "Product", "properties": {"name": "A4 electric vehicle"}}
+],
+"relationships": [
+  {"type": "produces", "start_node_id": "0", "end_node_id": "1",
+   "properties": {"evidence": "Northstar Cells manufactures battery modules."}},
+  {"type": "produces", "start_node_id": "2", "end_node_id": "3",
+   "properties": {"evidence": "Arbor Mobility builds the A4 electric vehicle."}},
+  {"type": "suppliesTo", "start_node_id": "0", "end_node_id": "2",
+   "properties": {"evidence": "Northstar supplies modules to Arbor, but it does not manufacture the A4."}}
+]}
+
 Input text: "AutoParts Plus is a distributor of BMW replacement parts for independent repair shops."
 Output:
 {"nodes": [
@@ -174,6 +191,12 @@ owns (A → B):
 
 produces (A → B):
 - Means A actually manufactures / produces / makes B.
+- Extract each explicit current manufacturing statement, including "manufactures",
+  "makes", "builds", "fabricates", and "produces", even when the same passage also
+  contains suppliesTo, locatedIn, or owns facts.
+- A component maker produces the component, not the customer's final vehicle.
+- Negated, hypothetical, planned, corrected, or explicitly discredited manufacturing
+  claims do not establish a positive produces relation.
 - Do NOT use produces for: uses, sells, distributes, offers, integrates,
   co-designs, develops jointly, buys, supplies, advertises, or merely lists B
   in a product ecosystem — unless manufacturing is explicitly established.
@@ -197,6 +220,8 @@ Additional rules:
 - Publisher names in titles/bylines are provenance, not actors, unless the
   evidence describes their own supply-chain activity.
 - Prefer specific named organizations over category phrases.
+- Before returning, scan the text once for every allowed relation type. Do not stop
+  after finding supply relationships; include all independently supported facts.
 - Every relationship must include an "evidence" property with the verbatim
   supporting sentence from the input text.
 - Assign unique string ids to nodes and reuse them in relationships.

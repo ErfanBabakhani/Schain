@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections import defaultdict
 from typing import Any, Optional
 
@@ -98,7 +99,69 @@ def _is_acronym_of(short: str, long_key: str, long_name: str = "") -> bool:
     return bool(legal_limited and short == initials + "l")
 
 
-def identity_plausible(left: str, right: str) -> bool:
+def _document_supports_shorthand(
+    left: str,
+    right: str,
+    document_text: Optional[str],
+    candidate_names: Optional[list[str]],
+) -> bool:
+    """Return true only for explicit or collision-free in-document shorthand."""
+    if not document_text:
+        return False
+    ka, kb = normalization_key(left), normalization_key(right)
+    short, long_name = (left, right) if len(ka.split()) < len(kb.split()) else (right, left)
+    short_key, long_key = normalization_key(short), normalization_key(long_name)
+    if not short_key or not long_key.startswith(short_key + " "):
+        return False
+
+    text = document_text.casefold()
+    # A shared leading token is not an alias when the document describes a
+    # corporate relationship.  This check deliberately precedes the generic
+    # shorthand rules: subsidiaries and divisions remain distinct entities.
+    corporate_separation_patterns = (
+        rf"{re.escape(long_name.casefold())}\s+is\s+(?:a|an|the)\s+"
+        rf"(?:subsidiary|division|affiliate|business unit|brand)\s+of\s+"
+        rf"{re.escape(short.casefold())}",
+        rf"{re.escape(short.casefold())}(?:'s|\s+owned)\s+"
+        rf"(?:subsidiary|division|affiliate|business unit|brand)\s+"
+        rf"{re.escape(long_name.casefold())}",
+        rf"{re.escape(short.casefold())}\s+and\s+{re.escape(long_name.casefold())}"
+        rf"\s+are\s+(?:different|distinct|separate)",
+    )
+    if any(re.search(pattern, text) for pattern in corporate_separation_patterns):
+        return False
+
+    explicit_patterns = (
+        rf"{re.escape(long_name.casefold())}\s+is\s+also\s+abbreviated\s+as\s+{re.escape(short.casefold())}",
+        rf"{re.escape(short.casefold())}\s+and\s+{re.escape(long_name.casefold())}\s+refer\s+to\s+the\s+same",
+        rf"{re.escape(long_name.casefold())}\s+and\s+{re.escape(short.casefold())}\s+refer\s+to\s+the\s+same",
+    )
+    if any(re.search(pattern, text) for pattern in explicit_patterns):
+        return True
+
+    collisions = {
+        normalization_key(name)
+        for name in (candidate_names or [])
+        if normalization_key(name).startswith(short_key + " ")
+    }
+    if len(collisions) != 1:
+        return False
+    remainder = long_key[len(short_key):].strip()
+    # The short form must occur independently, not only as the prefix of the full name.
+    independent = re.search(
+        rf"(?<!\w){re.escape(short.casefold())}(?!\s+{re.escape(remainder)})(?!\w)",
+        text,
+    )
+    return bool(independent and long_name.casefold() in text)
+
+
+def identity_plausible(
+    left: str,
+    right: str,
+    *,
+    document_text: Optional[str] = None,
+    candidate_names: Optional[list[str]] = None,
+) -> bool:
     """Conservative check: refuse merges that are almost certainly false.
 
     Used to sanitize LLM groups. WHEN UNCERTAIN for this heuristic, returns False
@@ -134,7 +197,9 @@ def identity_plausible(left: str, right: str) -> bool:
         extras = larger - smaller
         # Shared corporate stem plus unit/product qualifier is not identity.
         if extras and len(smaller) >= 1:
-            return False
+            return _document_supports_shorthand(
+                left, right, document_text, candidate_names,
+            )
 
     if len(wa) >= 2 and len(wb) >= 2:
         jaccard = len(wa & wb) / len(wa | wb)
@@ -146,7 +211,14 @@ def identity_plausible(left: str, right: str) -> bool:
     return True
 
 
-def sanitize_llm_groups(groups: list[list[str]]) -> list[list[str]]:
+def sanitize_llm_groups(
+    groups: list[list[str]],
+    *,
+    document_text: Optional[str] = None,
+    candidate_names: Optional[list[str]] = None,
+    audit=None,
+    label: Optional[str] = None,
+) -> list[list[str]]:
     """Complete-link groups: every pair must be safe, with no acronym bridge."""
     sanitized: list[list[str]] = []
     seen: set[str] = set()
@@ -155,12 +227,34 @@ def sanitize_llm_groups(groups: list[list[str]]) -> list[list[str]]:
         for name in sorted({str(n) for n in group if n} - seen):
             seen.add(name)
             for bucket in buckets:
-                if all(identity_plausible(name, other) for other in bucket):
+                if all(identity_plausible(
+                    name,
+                    other,
+                    document_text=document_text,
+                    candidate_names=candidate_names,
+                ) for other in bucket):
                     bucket.append(name)
                     break
             else:
                 buckets.append([name])
         sanitized.extend(buckets)
+        if audit is not None and len(group) > 1:
+            accepted = len(buckets) == 1
+            audit.emit(
+                "alias_merge_evaluated",
+                stage="resolution",
+                entity_type=label,
+                proposed_names=sorted({str(name) for name in group if name}),
+                accepted_groups=buckets,
+                accepted=accepted,
+                reason=(
+                    "complete_link_identity_supported"
+                    if accepted else "unsafe_or_ambiguous_identity_pair"
+                ),
+                related_llm_call_ids=audit.contextual_llm_call_ids(
+                    "resolution", "entity_type", label or "",
+                ),
+            )
     return sanitized
 
 
@@ -182,7 +276,14 @@ def _mentions_by_label(graph: Neo4jGraph) -> dict[str, dict[str, str]]:
     return grouped
 
 
-def _llm_groups(llm: LLMInterface, label: str, names: list[str]) -> list[list[str]]:
+def _llm_groups(
+    llm: LLMInterface,
+    label: str,
+    names: list[str],
+    *,
+    document_text: Optional[str] = None,
+    audit=None,
+) -> list[list[str]]:
     """Ask Prompt 2 to group aliases for one entity type."""
     prompt = DISAMBIGUATION_PROMPT.format(
         entity_type=label, names="\n".join(f"- {name}" for name in names)
@@ -210,7 +311,13 @@ def _llm_groups(llm: LLMInterface, label: str, names: list[str]) -> list[list[st
     groups.extend([name] for name in names if name not in covered)
     groups = [group for group in groups if group]
     # Conservative post-filter: refuse clearly false merges even if the model emitted them.
-    return sanitize_llm_groups(groups)
+    return sanitize_llm_groups(
+        groups,
+        document_text=document_text,
+        candidate_names=names,
+        audit=audit,
+        label=label,
+    )
 
 
 def alias_lookup(aliases: Optional[dict[str, Any]], label: str) -> dict[str, str]:
@@ -233,6 +340,8 @@ def resolve_entities(
     llm: Optional[LLMInterface] = None,
     cache: Optional[dict[str, dict[str, Any]]] = None,
     aliases: Optional[dict[str, Any]] = None,
+    document_text: Optional[str] = None,
+    audit=None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Resolve every extracted node to a canonical entity.
 
@@ -308,7 +417,13 @@ def resolve_entities(
             candidates += [name for name in known if name not in candidates]
 
         if llm is not None and len(candidates) > 1:
-            groups = _llm_groups(llm, label, candidates)
+            groups = _llm_groups(
+                llm,
+                label,
+                candidates,
+                document_text=document_text,
+                audit=audit,
+            )
             method = "llm"
         else:
             groups = [[name] for name in candidates]
