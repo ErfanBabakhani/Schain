@@ -18,6 +18,18 @@ from .pipeline import process_document
 logger = logging.getLogger(__name__)
 
 
+_DOCUMENT_METRIC_FIELDS = (
+    "elapsed_seconds", "llm_calls", "extraction_chunks", "extraction_calls",
+    "extraction_cache_hits", "extraction_retries", "candidate_facts",
+    "accepted_facts", "rejected_facts",
+)
+
+
+def _accumulate_document_metrics(summary: dict[str, Any], document_summary: dict[str, Any]) -> None:
+    for field in _DOCUMENT_METRIC_FIELDS:
+        summary[field] += document_summary.get(field, 0) or 0
+
+
 def run_ingest(
     config: dict[str, Any],
     connection,
@@ -72,6 +84,9 @@ def run_ingest(
         except Exception as error:  # noqa: BLE001 - already recorded as FAILED in state
             logger.error("document %s failed: %s", path.name, error)
             summary["documents_failed"] += 1
+            failed_summary = getattr(error, "_schain_document_summary", None)
+            if isinstance(failed_summary, dict):
+                _accumulate_document_metrics(summary, failed_summary)
             continue
 
         if document_summary["skipped"]:
@@ -81,10 +96,18 @@ def run_ingest(
         summary["facts"] += document_summary["facts"]
         summary["nodes_merged"] += document_summary["nodes_merged"]
         summary["relationships_merged"] += document_summary["relationships_merged"]
-        for field in ("elapsed_seconds", "llm_calls", "extraction_chunks", "extraction_calls",
-                      "extraction_cache_hits", "extraction_retries", "candidate_facts",
-                      "accepted_facts", "rejected_facts"):
-            summary[field] += document_summary.get(field, 0)
+        _accumulate_document_metrics(summary, document_summary)
 
     summary["documents"] = state.document_counts(connection)
+    summary["completion"] = {
+        "complete": summary["documents_failed"] == 0,
+        "export_success": False,
+        "pipeline_processing_complete": summary["documents_failed"] == 0,
+        "documents_failed": summary["documents_failed"],
+        "documents_skipped": summary["documents_skipped"],
+        "graph_has_accepted_facts": summary["accepted_facts"] > 0,
+        "stop_reason": (
+            "document_failures" if summary["documents_failed"] else "ingest_finished"
+        ),
+    }
     return summary

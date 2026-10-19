@@ -51,6 +51,10 @@ validation:
       - locatedIn
       - produces
     batch_size: 10
+    # A structurally incomplete model response retries only unresolved IDs, one at
+    # a time by default. Exhausted IDs are rejected as semantic_validation_incomplete.
+    incomplete_batch_max_attempts: 2
+    incomplete_retry_batch_size: 1
     # Relation-specific lexical + directional policy (assists LLM; not a lone filter).
     policy_file: config/relation_evidence.yaml
 

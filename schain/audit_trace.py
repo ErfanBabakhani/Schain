@@ -348,13 +348,18 @@ class RunAuditTrace:
             if kind in {
                 "structural_integrity_checked", "relationship_integrity_result",
                 "entity_resolution_integrity_checked",
-            }:
+            } or kind.startswith("endpoint_"):
                 categories["integrity_checks"].append(event)
-            if kind.startswith("entity_resolution"):
+            if kind.startswith("entity_resolution") or kind == "alias_merge_evaluated":
                 categories["entity_resolution"].append(event)
             if kind == "candidate_fact_created":
                 categories["candidate_facts"].append(event)
-            if kind in {"validation_check", "validation_completed"}:
+            if kind in {
+                "validation_check", "validation_completed",
+                "semantic_validation_batch_response",
+                "semantic_validation_targeted_retry",
+                "semantic_validation_unresolved",
+            }:
                 categories["validation_decisions"].append(event)
             if "repair" in kind:
                 categories["repair_attempts"].append(event)
@@ -362,7 +367,8 @@ class RunAuditTrace:
                 categories["accepted_facts"].append(event)
             if kind == "candidate_rejected":
                 categories["rejected_facts"].append(event)
-            if kind.startswith("relationship_") or kind == "structural_integrity_checked":
+            if (kind.startswith("relationship_") or kind.startswith("endpoint_")
+                    or kind == "structural_integrity_checked"):
                 categories["relationship_outcomes"].append(event)
             if kind.endswith("failed") or payload.get("status") == "error":
                 categories["errors"].append(event)
