@@ -378,7 +378,9 @@ def _usage_metrics(connection, config=None) -> dict[str, Any]:
 
 def run_expand(
     config: dict[str, Any], connection, llm, ontology: dict[str, Any], driver=None,
-    checkpoint_manager=None,
+    checkpoint_manager=None, *, allowed_entity_keys: Optional[set[str]] = None,
+    initialize_seeds: bool = True, retrieval_checkpoint=None,
+    document_checkpoint_sink=None,
 ) -> dict[str, Any]:
     """Expand under persisted budgets; all accepted facts survive scheduling stops.
 
@@ -413,7 +415,8 @@ def run_expand(
     requeued = state.requeue_stale_processing(connection)
     if requeued:
         logger.info("returned %d interrupted frontier entries to pending", requeued)
-    seed_frontier(connection, config, ontology)
+    if initialize_seeds:
+        seed_frontier(connection, config, ontology)
     # Legacy permanent beam-exclusion markers must not block resume.
     connection.execute(
         "UPDATE frontier SET stop_reason=NULL WHERE status=? AND stop_reason='frontier_beam_cap'",
@@ -484,11 +487,16 @@ def run_expand(
                 if not allowed:
                     summary["stop_reason"] = "document_budget"
                     break
+            effective_allowed = allowed_entity_keys
+            if allowed is not None:
+                effective_allowed = (
+                    allowed if allowed_entity_keys is None else allowed & allowed_entity_keys
+                )
             row = state.next_frontier_entity(
                 connection, max_tier,
                 max_expandable_entities_by_tier=scheduling_batch_sizes(expansion),
-                allowed_entity_keys=allowed,
                 run_new_claims_by_tier=run_new_claims_by_tier,
+                allowed_entity_keys=effective_allowed,
             )
             if row is None:
                 summary["stop_reason"] = "frontier_empty"
@@ -511,10 +519,17 @@ def run_expand(
                     continue
             try:
                 stages = _escalation_stages_for(connection, entity_key)
-                results = retrieve_for_entity(
-                    config, entity_name, entity_key, tier, connection, manifest,
-                    llm=llm, escalation_stages=stages,
+                results = (
+                    retrieval_checkpoint.load(entity_key, tier)
+                    if retrieval_checkpoint is not None else None
                 )
+                if results is None:
+                    results = retrieve_for_entity(
+                        config, entity_name, entity_key, tier, connection, manifest,
+                        llm=llm, escalation_stages=stages,
+                    )
+                    if retrieval_checkpoint is not None:
+                        retrieval_checkpoint.save(entity_key, tier, results)
             except Exception as error:
                 checkpoint_time()
                 retriable = int(row["attempts"]) + 1 < int(runtime.get("max_retrieval_attempts", 2))
@@ -622,7 +637,8 @@ def run_expand(
                 try:
                     document_summary = process_document(document, config, connection, llm, ontology, driver,
                         origin_entity=entity_key, tier=tier,
-                        document_index=state.document_usage_count(connection), document_budget=max_documents or None)
+                        document_index=state.document_usage_count(connection), document_budget=max_documents or None,
+                        checkpoint_sink=document_checkpoint_sink)
                 except Exception as error:
                     doc_elapsed = time.monotonic() - doc_started
                     state.finish_document_usage(connection, doc_id, entity_key, completed=False, elapsed_seconds=doc_elapsed)

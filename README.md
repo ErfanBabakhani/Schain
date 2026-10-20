@@ -387,3 +387,11 @@ For restart-safe Colab expansion, use
 It keeps live SQLite on local Colab storage and publishes verified backup generations
 to Google Drive. Configuration, security, resume, and crash-recovery details are in
 [`docs/SAVE_AND_COLAB_RESUME.md`](docs/SAVE_AND_COLAB_RESUME.md).
+
+## Distributed Colab EXPAND
+
+Multiple independent Colabs can join one PostgreSQL-authoritative experiment, claim
+fenced company leases, share durable extraction/entity checkpoints, and deliver accepted
+facts through a transactional Neo4j outbox. SQLite remains the default local backend.
+See [`docs/DISTRIBUTED_NEON_EXPAND.md`](docs/DISTRIBUTED_NEON_EXPAND.md) and
+[`notebooks/SChain_Expand_Neon_Distributed.ipynb`](notebooks/SChain_Expand_Neon_Distributed.ipynb).

@@ -80,6 +80,14 @@ def build_parser() -> argparse.ArgumentParser:
     expand.add_argument(
         "--max-documents", type=int, default=None, help="stop after this many documents"
     )
+    expand.add_argument(
+        "--tasks-this-session", type=int, default=0,
+        help="distributed mode: stop after this many company tasks (0 = until idle)",
+    )
+    expand.add_argument(
+        "--worker-id", default=None,
+        help="distributed mode: optional observable worker id (normally generated)",
+    )
     seed_override = expand.add_mutually_exclusive_group()
     seed_override.add_argument(
         "--seeds",
@@ -227,9 +235,19 @@ def main(argv: Optional[list[str]] = None) -> int:
         config.setdefault("save", {})["enabled"] = False
     elif args.save_override is not None:
         config.setdefault("save", {})["enabled"] = bool(args.save_override)
+    postgres_expand = bool(
+        args.mode == "expand"
+        and (
+            str((config.get("state") or {}).get("backend", "sqlite")).casefold() == "postgres"
+            or bool((config.get("distributed") or {}).get("enabled", False))
+        )
+    )
     if args.experiment_id is not None:
-        config.setdefault("checkpoint_store", {})["experiment_id"] = args.experiment_id
-        config["checkpoint_store"]["enabled"] = True
+        if postgres_expand:
+            config.setdefault("state", {})["experiment_id"] = args.experiment_id
+        else:
+            config.setdefault("checkpoint_store", {})["experiment_id"] = args.experiment_id
+            config["checkpoint_store"]["enabled"] = True
     if args.checkpoint_store is not None:
         config.setdefault("checkpoint_store", {})["directory"] = str(args.checkpoint_store)
         config["checkpoint_store"]["enabled"] = True
@@ -250,6 +268,25 @@ def main(argv: Optional[list[str]] = None) -> int:
                 )
         log_effective_expansion_config(config)
         validate_expansion_config(config)
+
+    if postgres_expand:
+        if args.restart:
+            logger.error("--restart is not permitted for a shared PostgreSQL experiment; use a new experiment id")
+            return 2
+        if args.checkpoint_store is not None or args.force_checkpoint_unlock:
+            logger.error("distributed PostgreSQL mode does not use Drive checkpoints or session locks")
+            return 2
+        try:
+            from .distributed.runner import run_distributed_expand
+            summary = run_distributed_expand(
+                config, tasks_this_session=args.tasks_this_session,
+                worker_id=args.worker_id,
+            )
+        except Exception as error:  # noqa: BLE001 - CLI lifecycle boundary
+            logger.error("distributed expand failed: %s: %s", type(error).__name__, error)
+            return 1
+        print(json.dumps(summary, indent=2, default=str))
+        return 0
 
     save = save_settings(config)
     checkpoint_manager = DurableCheckpointManager.from_config(config, mode=args.mode)
