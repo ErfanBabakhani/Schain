@@ -20,7 +20,7 @@ import logging
 import shutil
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import neo4j
 from neo4j_graphrag.components.types import Neo4jGraph
@@ -354,6 +354,7 @@ def process_document(
     tier: Optional[int] = None,
     document_index: Optional[int] = None,
     document_budget: Optional[int] = None,
+    checkpoint_sink: Optional[Callable[[str, dict[str, Any], dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
     """Run one document through the pipeline, resuming from wherever it stopped."""
     started = time.monotonic()
@@ -496,6 +497,8 @@ def process_document(
 
     try:
         document = _persist_document(document, config, is_new=is_new, status=status)
+        if checkpoint_sink is not None and status in (state.PENDING, state.PROCESSING, state.FAILED):
+            checkpoint_sink("retrieved", document, {})
         # --- Prompt 1 ---
         if status in (state.PENDING, state.PROCESSING, state.FAILED):
             advance_stage("extraction")
@@ -529,6 +532,12 @@ def process_document(
             _persist_integrity_failures(config, integrity_failures)
             state.set_document_status(connection, doc_id, state.EXTRACTED)
             status = state.EXTRACTED
+            if checkpoint_sink is not None:
+                checkpoint_sink(
+                    "extracted",
+                    document,
+                    json.loads(_extraction_file(config, doc_id).read_text(encoding="utf-8")),
+                )
 
         # --- Prompt 2 and the facts layer ---
         if status == state.EXTRACTED:
@@ -823,6 +832,16 @@ def process_document(
             summary["facts"] = len(accepted)
             summary["accepted_facts"] = len(accepted)
             summary["rejected_facts"] = len(rejected)
+            if checkpoint_sink is not None:
+                checkpoint_sink(
+                    "resolved",
+                    document,
+                    {
+                        "resolution": resolution,
+                        "accepted_facts": accepted.to_dict(orient="records"),
+                        "rejected_facts": rejected.to_dict(orient="records"),
+                    },
+                )
             audit.emit(
                 "validation_completed",
                 stage="validation",
