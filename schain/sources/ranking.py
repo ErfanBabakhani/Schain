@@ -48,6 +48,12 @@ NEGATIVE_PHRASES = (
     "privacy policy", "cookie policy", "terms of use",
 )
 
+LOW_VALUE_RESULT_PHRASES = (
+    "faq", "frequently asked questions", "store locator", "dealer locator",
+    "buy online", "for sale", "shopping", "coupon", "product directory",
+    "business directory", "company directory", "yellow pages",
+)
+
 # Direction dominates ALL secondary scores; the remaining score is in [-55, 57].
 DIRECTION_PRIORITY = {
     UPSTREAM_EXPLICIT: 300.0,
@@ -97,6 +103,11 @@ def _has_negative_portal_language(text: str) -> bool:
     return any(phrase in lowered for phrase in NEGATIVE_PHRASES)
 
 
+def _looks_low_value_result(result: SearchResult) -> bool:
+    blob = f"{result.title or ''}\n{result.snippet or ''}\n{result.url or ''}".casefold()
+    return any(phrase in blob for phrase in LOW_VALUE_RESULT_PHRASES)
+
+
 def _query_is_relationship_specific(query: str) -> bool:
     lowered = (query or "").casefold()
     return any(re.search(rf"\b{re.escape(marker)}\b", lowered) for marker in RELATION_KEYWORDS)
@@ -128,6 +139,8 @@ def discovery_candidate_is_meaningful(
     if not text:
         return False
     direction = classify_supply_direction(entity_name, text, aliases=aliases, policy=policy)
+    if direction != UPSTREAM_EXPLICIT and _looks_low_value_result(result):
+        return False
     if direction != UPSTREAM_EXPLICIT and _has_negative_portal_language(result.title or ""):
         return False
     # Broad EV vocabulary is useful for discovery, but a company update does not
@@ -249,6 +262,8 @@ def rank_discovery_candidate(
         score -= 40.0
     if _has_negative_portal_language(title):
         score -= 15.0
+    if _looks_low_value_result(result):
+        score -= 60.0
 
     result._discovery_direction = direction  # type: ignore[attr-defined]
     result._discovery_rank = score  # type: ignore[attr-defined]

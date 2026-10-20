@@ -92,9 +92,16 @@ class RetrievalCheckpoint:
         self.repository = repository
         self.lease = lease
 
-    def load(self, entity_key: str, tier: int) -> list[SearchResult] | None:
+    def _key(self, entity_key: str, stages: list[str] | None) -> str:
+        generation = str(self.lease.payload.get("generation") or "original")
+        stage_key = "+".join(stages or ["primary"])
+        return f"{entity_key}::generation:{generation}::stages:{stage_key}"
+
+    def load(
+        self, entity_key: str, tier: int, *, stages: list[str] | None = None,
+    ) -> list[SearchResult] | None:
         rows = self.repository.load_retrieval_checkpoint(
-            self.lease.experiment_id, entity_key, tier,
+            self.lease.experiment_id, self._key(entity_key, stages), tier,
         )
         if rows is None:
             return None
@@ -107,7 +114,10 @@ class RetrievalCheckpoint:
             results.append(result)
         return results
 
-    def save(self, entity_key: str, tier: int, results: list[SearchResult]) -> None:
+    def save(
+        self, entity_key: str, tier: int, results: list[SearchResult],
+        *, stages: list[str] | None = None,
+    ) -> None:
         rows = []
         runtime_fields = (
             "_source_known", "_source_class", "_source_base_score",
@@ -120,7 +130,9 @@ class RetrievalCheckpoint:
                 key: getattr(result, key) for key in runtime_fields if hasattr(result, key)
             }
             rows.append(_json_value(row))
-        self.repository.save_retrieval_checkpoint(self.lease, rows)
+        self.repository.save_retrieval_checkpoint(
+            self.lease, rows, checkpoint_entity_key=self._key(entity_key, stages),
+        )
 
 
 class DocumentCheckpointSink:
@@ -155,14 +167,19 @@ class DistributedExpandProcessor:
 
     def __call__(self, lease: TaskLease) -> TaskResult:
         config, workspace = worker_config(self.config, lease, worker_id=self.worker_id)
+        config["_distributed_entity_aliases"] = [
+            str(alias["mention"])
+            for alias in self.repository.shared_aliases(lease.experiment_id)
+            if str(alias.get("canonical_id")) == lease.entity_key
+        ]
         connection = state.connect(Path(config["storage"]["state_db"]))
         try:
             state.enqueue_entity(
                 connection, lease.entity_name, lease.tier,
                 entity_id=lease.entity_key, entity_type="Company", expandable=True,
             )
-            self._materialize_aliases(connection, lease)
-            self._materialize_documents(config, connection, lease)
+            existing_aliases = self._materialize_aliases(connection, lease)
+            completed_before = self._materialize_documents(config, connection, lease)
             summary = run_expand(
                 config, connection, self.llm, self.ontology, None,
                 allowed_entity_keys={lease.entity_key}, initialize_seeds=False,
@@ -178,13 +195,18 @@ class DistributedExpandProcessor:
                     "company task paused before completion: "
                     + str(local["stop_reason"] if local else summary.get("stop_reason"))
                 )
-            return self._collect_result(config, connection, lease, summary)
+            return self._collect_result(
+                config, connection, lease, summary,
+                completed_before=completed_before, existing_aliases=existing_aliases,
+            )
         finally:
             connection.close()
 
-    def _materialize_aliases(self, connection: Any, lease: TaskLease) -> None:
+    def _materialize_aliases(self, connection: Any, lease: TaskLease) -> set[str]:
         entries = []
+        keys: set[str] = set()
         for alias in self.repository.shared_aliases(lease.experiment_id):
+            keys.add(str(alias["mention_key"]))
             entries.append({
                 "label": alias["entity_type"], "mention": alias["mention"],
                 "canonical_id": alias["canonical_id"],
@@ -193,10 +215,12 @@ class DistributedExpandProcessor:
             })
         if entries:
             state.save_resolution(connection, entries)
+        return keys
 
     def _materialize_documents(
         self, config: dict[str, Any], connection: Any, lease: TaskLease,
-    ) -> None:
+    ) -> set[str]:
+        completed: set[str] = set()
         for stored in self.repository.task_documents(lease):
             document = dict(stored["document"])
             doc_id, _ = state.register_document(
@@ -236,20 +260,31 @@ class DistributedExpandProcessor:
                 state.finish_document_usage(
                     connection, doc_id, lease.entity_key, completed=True, elapsed_seconds=0,
                 )
+            if stored.get("stage") == "completed":
+                completed.add(str(doc_id))
+        return completed
 
     def _collect_result(
         self, config: dict[str, Any], connection: Any, lease: TaskLease,
         summary: dict[str, Any],
+        *, completed_before: set[str] | None = None,
+        existing_aliases: set[str] | None = None,
     ) -> TaskResult:
+        completed_before = completed_before or set()
+        existing_aliases = existing_aliases or set()
         facts_path = Path(config["storage"]["extracted_facts"])
         rejected_path = Path(config["storage"]["rejected_facts"])
         accepted = pd.read_parquet(facts_path).to_dict("records") if facts_path.exists() else []
         rejected = pd.read_parquet(rejected_path).to_dict("records") if rejected_path.exists() else []
+        accepted = [row for row in accepted if str(row.get("doc_id") or row.get("document_id")) not in completed_before]
+        rejected = [row for row in rejected if str(row.get("doc_id") or row.get("document_id")) not in completed_before]
         normalized_path = Path(config["storage"]["normalized_documents"])
         documents: list[dict[str, Any]] = []
         if normalized_path.exists():
             for document in pd.read_parquet(normalized_path).to_dict("records"):
                 doc_id = document["doc_id"]
+                if str(doc_id) in completed_before:
+                    continue
                 extraction_path = Path(config["storage"]["extractions"]) / f"{doc_id}.json"
                 documents.append({
                     "document": _json_value(document),
@@ -261,6 +296,8 @@ class DistributedExpandProcessor:
                 })
         aliases = []
         for row in state.load_resolution_cache(connection).values():
+            if str(row["mention_key"]) in existing_aliases:
+                continue
             aliases.append({
                 "mention_key": row["mention_key"], "entity_type": row["label"],
                 "mention": row["mention"], "canonical_id": row["canonical_id"],
@@ -268,10 +305,17 @@ class DistributedExpandProcessor:
                 "evidence": [],
             })
         discoveries = []
+        newly_supported_suppliers = {
+            str(fact.get("subject_id"))
+            for fact in accepted
+            if fact.get("relation") == "suppliesTo" and fact.get("subject_id")
+        }
         for row in connection.execute(
             "SELECT * FROM frontier WHERE entity_key<>? ORDER BY tier,entity_key",
             (lease.entity_key,),
         ).fetchall():
+            if row["entity_key"] not in newly_supported_suppliers:
+                continue
             discoveries.append({
                 "entity_key": row["entity_key"], "entity_name": row["entity_name"],
                 "entity_type": row["entity_type"], "tier": int(row["tier"]),

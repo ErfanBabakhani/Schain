@@ -4,7 +4,7 @@ Migrations are additive and run under a transaction-scoped advisory lock.  No SQ
 data is implicitly copied or transformed.
 """
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 MIGRATIONS: dict[int, str] = {
     1: r"""
@@ -189,5 +189,45 @@ CREATE TABLE IF NOT EXISTS schain_events (
 );
 CREATE INDEX IF NOT EXISTS schain_events_experiment_time_idx
     ON schain_events(experiment_id, created_at DESC);
+""",
+    2: r"""
+ALTER TABLE schain_experiments
+    ADD COLUMN IF NOT EXISTS discovery_profile_version text,
+    ADD COLUMN IF NOT EXISTS discovery_profile jsonb NOT NULL DEFAULT '{}'::jsonb,
+    ADD COLUMN IF NOT EXISTS document_limit integer,
+    ADD COLUMN IF NOT EXISTS manifest_history jsonb NOT NULL DEFAULT '[]'::jsonb;
+
+CREATE TABLE IF NOT EXISTS schain_discovery_paths (
+    experiment_id text NOT NULL REFERENCES schain_experiments(experiment_id) ON DELETE CASCADE,
+    path_id text NOT NULL,
+    task_id text REFERENCES schain_tasks(task_id),
+    fact_id text,
+    supplier_id text NOT NULL,
+    supplier_name text,
+    customer_id text NOT NULL,
+    customer_name text,
+    origin_entity text NOT NULL,
+    path_depth integer NOT NULL CHECK (path_depth >= 0),
+    frontier_action text NOT NULL,
+    details jsonb NOT NULL DEFAULT '{}'::jsonb,
+    created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (experiment_id, path_id)
+);
+CREATE INDEX IF NOT EXISTS schain_discovery_paths_supplier_idx
+    ON schain_discovery_paths(experiment_id, supplier_id, path_depth);
+CREATE INDEX IF NOT EXISTS schain_discovery_paths_customer_idx
+    ON schain_discovery_paths(experiment_id, customer_id, path_depth);
+
+CREATE TABLE IF NOT EXISTS schain_maintenance_runs (
+    experiment_id text NOT NULL REFERENCES schain_experiments(experiment_id) ON DELETE CASCADE,
+    operation_key text NOT NULL,
+    operation text NOT NULL,
+    parameters jsonb NOT NULL,
+    result jsonb NOT NULL,
+    applied_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (experiment_id, operation_key)
+);
+
+UPDATE schain_experiments SET schema_version=2 WHERE schema_version<2;
 """,
 }
