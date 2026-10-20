@@ -3,14 +3,12 @@
 from __future__ import annotations
 
 import os
-import hashlib
 import socket
 import subprocess
 from typing import Any
 import uuid
 
-from ..config import REPO_ROOT, save_settings, seed_groups
-from ..durable import critical_configuration
+from ..config import save_settings, seed_groups
 from ..names import canonical_id
 from ..ontology import load_ontology
 from ..pipeline import open_driver
@@ -21,6 +19,8 @@ from .outbox import Neo4jOutboxDispatcher
 from ..state_backend import configured_state_backend
 from .schema import SCHEMA_VERSION
 from .worker import WorkerSession
+from .manifest import build_distributed_manifest
+from .profile import profile_snapshot, validate_deep_discovery
 
 
 def _git_commit() -> str | None:
@@ -37,12 +37,8 @@ def automatic_worker_id() -> str:
     return f"{socket.gethostname()}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
 
 
-def _source_hash(relative: str) -> str:
-    return hashlib.sha256((REPO_ROOT / relative).read_bytes()).hexdigest()
-
-
 def run_distributed_expand(
-    config: dict[str, Any], *, tasks_this_session: int = 0,
+    config: dict[str, Any], *, tasks_this_session: int | None = None,
     worker_id: str | None = None,
 ) -> dict[str, Any]:
     settings = distributed_settings(config, require_credentials=True)
@@ -56,26 +52,30 @@ def run_distributed_expand(
     registered = False
     try:
         repository.migrate()
+        if settings.resume_existing_only and not repository.experiment_exists(
+            settings.experiment_id
+        ):
+            raise RuntimeError(
+                f"experiment {settings.experiment_id!r} does not exist; "
+                "resume_existing_only forbids creating a replacement"
+            )
         seeds = []
         for group, names in seed_groups(config).items():
             seeds.extend({
                 "group": group, "entity_name": name,
                 "entity_key": canonical_id("Company", name), "entity_type": "Company",
             } for name in names)
-        manifest = critical_configuration(config)
-        manifest["state_schema_version"] = SCHEMA_VERSION
-        manifest["distributed_source_sha256"] = {
-            relative: _source_hash(relative)
-            for relative in (
-                "schain/names.py", "schain/kg/extract.py", "schain/kg/integrity.py",
-                "schain/expansion/frontier.py",
-            )
-        }
+        manifest = build_distributed_manifest(config)
+        profile = profile_snapshot(config)
+        if profile["version"] != "unversioned":
+            profile = validate_deep_discovery(config)
         join_status = repository.initialize_or_join_experiment(
             settings.experiment_id, manifest,
             max_tier=int((config.get("expansion") or {}).get("max_tier", 3)),
             save_enabled=save["enabled"], seeds=seeds,
             max_task_attempts=settings.max_task_attempts,
+            discovery_profile=profile,
+            document_limit=int(profile.get("document_limit") or 0) or None,
         )
         commit = _git_commit()
         repository.register_worker(
@@ -104,7 +104,8 @@ def run_distributed_expand(
             poll_seconds=settings.poll_seconds,
             save_enabled=save["enabled"], graph_dispatcher=dispatcher,
         )
-        result = session.run(max_tasks=max(0, int(tasks_this_session)))
+        task_limit = settings.tasks_per_session if tasks_this_session is None else int(tasks_this_session)
+        result = session.run(max_tasks=max(0, task_limit))
         result.update({
             "experiment_join_status": join_status,
             "experiment_id": settings.experiment_id,

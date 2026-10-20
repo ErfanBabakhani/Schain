@@ -14,6 +14,9 @@ import uuid
 
 import pytest
 
+from schain.config import load_config
+from schain.distributed.maintenance import apply_extension, extension_plan
+from schain.distributed.manifest import build_distributed_manifest
 from schain.distributed.models import (
     IdentityConflictError,
     StaleLeaseError,
@@ -332,3 +335,151 @@ def test_crash_after_neo4j_write_replays_idempotent_merge(repository):
     assert repository.progress(experiment_id)["pending_outbox_items"] == 0
     assert len(driver.queries) == 4
     assert all("MERGE" in query for query in driver.queries)
+
+
+def test_safe_extension_preserves_history_and_schedules_ordered_idempotent_topups(repository):
+    config = load_config("config/distributed_neon_deep_discovery.yaml")
+    experiment_id = "pytest-" + uuid.uuid4().hex
+    current_manifest = build_distributed_manifest(config)
+    current_manifest["expansion"] = {**current_manifest["expansion"], "max_tier": 2}
+    repository.initialize_or_join_experiment(
+        experiment_id, current_manifest, max_tier=2, save_enabled=False,
+        seeds=[{"entity_key": "company:toyota", "entity_name": "Toyota", "group": "test"}],
+        max_task_attempts=3,
+    )
+    with repository._connection() as connection, connection.transaction():
+        # Model the completed Tier-0/Tier-1 history and four terminal Tier-2 nodes.
+        for index in range(11):
+            repository._schedule_locked(
+                connection, experiment_id, entity_key=f"company:tier1-{index}",
+                entity_name=f"Tier One {index}", entity_type="Company", tier=1,
+                discovered_from="company:toyota", provenance={"historical": True},
+                priority=1, max_task_attempts=3, max_tier=2,
+            )
+        for index in range(4):
+            repository._schedule_locked(
+                connection, experiment_id, entity_key=f"company:tier2-{index}",
+                entity_name=f"Tier Two {index}", entity_type="Company", tier=2,
+                discovered_from="company:tier1-0", provenance={"historical": True},
+                priority=1, max_task_attempts=3, max_tier=2,
+            )
+        connection.execute(
+            "UPDATE schain_tasks SET status='completed',completed_at=clock_timestamp() "
+            "WHERE experiment_id=%s", (experiment_id,),
+        )
+        connection.execute(
+            "UPDATE schain_frontier SET status=CASE WHEN tier=2 THEN 'terminal' ELSE 'completed' END "
+            "WHERE experiment_id=%s", (experiment_id,),
+        )
+        original_task_row = connection.execute(
+            "SELECT task_id,entity_key,entity_name FROM schain_tasks "
+            "WHERE experiment_id=%s AND tier=1 ORDER BY task_id LIMIT 1",
+            (experiment_id,),
+        ).fetchone()
+        original_task = original_task_row["task_id"]
+        connection.execute(
+            "INSERT INTO schain_documents "
+            "(experiment_id,document_id,content_hash,task_id,origin_entity,tier,stage,document) "
+            "VALUES (%s,'historical-doc','historical-hash',%s,%s,1,'completed',%s)",
+            (experiment_id, original_task, original_task_row["entity_key"],
+             repository._json(_document("historical-doc"))),
+        )
+        connection.execute(
+            "INSERT INTO schain_facts "
+            "(experiment_id,fact_id,document_id,task_id,tier,accepted,payload) "
+            "VALUES (%s,'historical-fact','historical-doc',%s,1,true,%s)",
+            (experiment_id, original_task, repository._json({
+                "fact_id": "historical-fact", "doc_id": "historical-doc",
+                "subject_id": "company:tier2-0", "subject_name": "Tier Two 0",
+                "subject_type": "Company", "relation": "suppliesTo",
+                "object_id": original_task_row["entity_key"],
+                "object_name": original_task_row["entity_name"],
+                "object_type": "Company", "evidence": "Tier Two 0 supplies Toyota",
+            })),
+        )
+    plan = extension_plan(
+        repository, experiment_id, new_max_tier=5, topup_tier=1, config=config,
+    )
+    assert not plan["blockers"]
+    assert plan["toyota_recovery"]["entity_key"] == "company:toyota"
+    assert len(plan["tier_topups"]) == 11
+    assert len(plan["terminal_nodes_to_reopen"]) == 4
+    result = apply_extension(
+        repository, experiment_id, new_max_tier=5, topup_tier=1, config=config,
+    )
+    assert result["scheduled"] == {"toyota": 1, "tier_topups": 11, "reopened": 4}
+    assert result["historical_path_audit_rows_added"] == 1
+    replay = apply_extension(
+        repository, experiment_id, new_max_tier=5, topup_tier=1, config=config,
+    )
+    assert replay["idempotent_replay"] is True
+    with repository._connection() as connection:
+        assert connection.execute(
+            "SELECT count(*) n FROM schain_documents WHERE experiment_id=%s AND document_id='historical-doc'",
+            (experiment_id,),
+        ).fetchone()["n"] == 1
+        assert connection.execute(
+            "SELECT count(*) n FROM schain_tasks WHERE experiment_id=%s AND status='completed'",
+            (experiment_id,),
+        ).fetchone()["n"] == 12
+        assert connection.execute(
+            "SELECT jsonb_array_length(manifest_history) n FROM schain_experiments WHERE experiment_id=%s",
+            (experiment_id,),
+        ).fetchone()["n"] == 1
+    _register(repository, experiment_id, "resume-worker")
+    assert repository.claim_task(experiment_id, "resume-worker", lease_seconds=30).tier == 0
+
+
+def test_multi_path_relationships_do_not_duplicate_or_raise_global_tier(repository):
+    experiment_id, _, _ = _experiment(repository, ("A", "B"), max_tier=3)
+    for worker in ("path-a", "path-b"):
+        _register(repository, experiment_id, worker)
+    leases = [
+        repository.claim_task(experiment_id, "path-a", lease_seconds=30),
+        repository.claim_task(experiment_id, "path-b", lease_seconds=30),
+    ]
+    for index, lease in enumerate(leases):
+        doc_id = f"path-{index}"
+        customer = lease.entity_key
+        fact = {
+            **_fact(doc_id, str(index)), "object_id": customer,
+            "object_name": lease.entity_name,
+        }
+        repository.complete_task(
+            lease,
+            TaskResult(
+                documents=[_document(doc_id)], accepted_facts=[fact],
+                discoveries=[{"entity_key": "company:supplier", "entity_name": "Supplier", "tier": 1}],
+            ),
+            save_enabled=False,
+        )
+    with repository._connection() as connection:
+        supplier = connection.execute(
+            "SELECT tier,count(*) OVER () total FROM schain_frontier "
+            "WHERE experiment_id=%s AND entity_key='company:supplier'",
+            (experiment_id,),
+        ).fetchone()
+        assert supplier["tier"] == 1 and supplier["total"] == 1
+    paths = repository.frontier_audit(experiment_id)
+    assert len(paths) == 2
+    assert {row["customer_id"] for row in paths} == {"company:a", "company:b"}
+    assert {row["path_depth"] for row in paths} == {1}
+
+
+def test_toyota_and_toyota_motor_are_not_merged_without_evidenced_alias(repository):
+    config = load_config("config/distributed_neon_deep_discovery.yaml")
+    experiment_id = "pytest-" + uuid.uuid4().hex
+    manifest = build_distributed_manifest(config)
+    manifest["expansion"] = {**manifest["expansion"], "max_tier": 2}
+    repository.initialize_or_join_experiment(
+        experiment_id, manifest, max_tier=2, save_enabled=False,
+        seeds=[{
+            "entity_key": "company:toyota-motor", "entity_name": "Toyota Motor",
+            "group": "test",
+        }], max_task_attempts=3,
+    )
+    plan = extension_plan(
+        repository, experiment_id, new_max_tier=5, topup_tier=1, config=config,
+    )
+    assert plan["toyota_recovery"] is None
+    assert "toyota_tier0_not_found_or_not_evidenced" in plan["blockers"]

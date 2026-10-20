@@ -22,6 +22,8 @@ class DistributedSettings:
     pool_min: int
     pool_max: int
     event_retention_days: int
+    resume_existing_only: bool
+    tasks_per_session: int
 
 
 def distributed_settings(
@@ -76,4 +78,6 @@ def distributed_settings(
         pool_min=pool_min,
         pool_max=pool_max,
         event_retention_days=max(1, int(distributed.get("event_retention_days", 30))),
+        resume_existing_only=bool(distributed.get("resume_existing_only", False)),
+        tasks_per_session=max(1, int(distributed.get("tasks_per_session", 40))),
     )

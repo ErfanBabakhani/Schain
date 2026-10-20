@@ -268,6 +268,10 @@ def _admit_above_target(
     connection,
     config: dict[str, Any],
     max_documents: int,
+    source_domains: int = 0,
+    query_families: int = 0,
+    min_source_domains: int = 0,
+    min_query_families: int = 0,
 ) -> tuple[bool, Optional[str], bool]:
     """Return (admit, stop_reason, rescue_active).
 
@@ -292,8 +296,11 @@ def _admit_above_target(
         return True, None, True
 
     # CASE D / A: productive entity with remaining high-quality upstream candidates.
+    source_coverage_met = (
+        source_domains >= min_source_domains and query_families >= min_query_families
+    )
     if existing_keys and direction == UPSTREAM_EXPLICIT and (not hard or used < hard):
-        if used >= max(target, min_docs) and zero_gain >= patience:
+        if used >= max(target, min_docs) and zero_gain >= patience and source_coverage_met:
             return False, "diminishing_returns", False
         return True, None, False
 
@@ -303,7 +310,7 @@ def _admit_above_target(
             return True, None, False
         return False, "target_met_no_strong_upstream_candidate", False
 
-    if used >= max(target, min_docs) and zero_gain >= patience:
+    if used >= max(target, min_docs) and zero_gain >= patience and source_coverage_met:
         return False, "diminishing_returns", False
     return True, None, False
 
@@ -327,12 +334,16 @@ def _escalation_stages_for(connection, entity_key: str) -> list[str]:
     return list(_ESCALATION_LADDER[0][1])
 
 
-def _advance_escalation(connection, entity_key: str) -> Optional[str]:
+def _advance_escalation(
+    connection, entity_key: str, *, max_rounds: int | None = None,
+) -> Optional[str]:
     row = connection.execute(
         "SELECT escalation_stage FROM frontier WHERE entity_key=?", (entity_key,),
     ).fetchone()
     current = (row["escalation_stage"] if row and "escalation_stage" in row.keys() else None) or "primary"
     labels = [name for name, _ in _ESCALATION_LADDER]
+    if max_rounds is not None:
+        labels = labels[:max(1, min(len(labels), int(max_rounds)))]
     if current not in labels:
         current = "primary"
     idx = labels.index(current)
@@ -400,6 +411,8 @@ def run_expand(
         ((config.get("validation") or {}).get("evidence") or {}).get("policy_file"))
     patience = int(retrieval_cfg.get("zero_gain_patience", 3))
     min_docs = int(retrieval_cfg.get("min_documents_before_diminishing_returns", 3))
+    min_source_domains = int(retrieval_cfg.get("min_source_domains_before_stop", 0))
+    min_query_families = int(retrieval_cfg.get("min_query_families_before_stop", 0))
     rescue_enabled = bool(retrieval_cfg.get("zero_yield_rescue", True))
     prompt1_drops = empty_prompt1_drop_counts()
     entity_stop_reasons: dict[str, int] = {}
@@ -520,7 +533,7 @@ def run_expand(
             try:
                 stages = _escalation_stages_for(connection, entity_key)
                 results = (
-                    retrieval_checkpoint.load(entity_key, tier)
+                    retrieval_checkpoint.load(entity_key, tier, stages=stages)
                     if retrieval_checkpoint is not None else None
                 )
                 if results is None:
@@ -529,7 +542,7 @@ def run_expand(
                         llm=llm, escalation_stages=stages,
                     )
                     if retrieval_checkpoint is not None:
-                        retrieval_checkpoint.save(entity_key, tier, results)
+                        retrieval_checkpoint.save(entity_key, tier, results, stages=stages)
             except Exception as error:
                 checkpoint_time()
                 retriable = int(row["attempts"]) + 1 < int(runtime.get("max_retrieval_attempts", 2))
@@ -565,6 +578,15 @@ def run_expand(
                 unfinished = usage is not None and not usage["completed"] and state.document_attempt_count(connection, doc_id) < max_attempts
                 prepared.append((not unfinished, result, direction, document, known, usage, doc_id))
             prepared.sort(key=lambda item: item[0])
+            source_domains = len({
+                str(getattr(result, "source_domain", "") or "").casefold()
+                for _, result, *_ in prepared
+                if getattr(result, "source_domain", None)
+            })
+            query_families = len({
+                str(getattr(result, "escalation_stage", "") or "primary")
+                for _, result, *_ in prepared
+            })
             rescue_active = bool(int(row["rescue_mode"] or 0)) if "rescue_mode" in row.keys() else False
             for _, result, direction, document, known, usage, doc_id in prepared:
                 # Another result in this same batch may just have persisted identical
@@ -609,6 +631,9 @@ def run_expand(
                         patience=patience, min_docs=min_docs,
                         rescue_enabled=rescue_enabled, connection=connection,
                         config=config, max_documents=run_remaining if max_documents else 0,
+                        source_domains=source_domains, query_families=query_families,
+                        min_source_domains=min_source_domains,
+                        min_query_families=min_query_families,
                     )
                     if entered_rescue and not rescue_active:
                         rescue_active = True
@@ -694,7 +719,10 @@ def run_expand(
                 # Productive entities continue under _admit_above_target / diminishing returns.
                 # Zero-yield entities continue via rescue/escalation up to hard max.
             if not existing_keys and reason == "candidate_pool_exhausted" and rescue_enabled:
-                advanced = _advance_escalation(connection, entity_key)
+                advanced = _advance_escalation(
+                    connection, entity_key,
+                    max_rounds=int(retrieval_cfg.get("recovery_rounds", len(_ESCALATION_LADDER))),
+                )
                 if advanced and (not hard or used < hard):
                     reason = f"escalation_{advanced}"
                     pending_escalation = True

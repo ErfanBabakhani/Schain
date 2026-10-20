@@ -186,6 +186,8 @@ re-issue searches or re-expand finished companies.
 | [config/ontology.yaml](config/ontology.yaml) | entity types, relation types, allowed patterns, which relations advance a tier, known aliases |
 | [config/ingest.yaml](config/ingest.yaml) | input location, chunking |
 | [config/expansion.yaml](config/expansion.yaml) | seeds, `max_tier`, sources, relevance filter, per-tier query templates |
+| [config/deep_discovery.yaml](config/deep_discovery.yaml) | versioned high-recall upstream retrieval budgets for the approved Tier-5 resume |
+| [docs/DEEP_DISCOVERY_SAFE_RESUME.md](docs/DEEP_DISCOVERY_SAFE_RESUME.md) | safe `bmw-supply-chain-v2` plan/apply/resume procedure and audit semantics |
 
 Search limits resolve by **closest value wins**, field by field:
 

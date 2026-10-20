@@ -81,8 +81,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-documents", type=int, default=None, help="stop after this many documents"
     )
     expand.add_argument(
-        "--tasks-this-session", type=int, default=0,
-        help="distributed mode: stop after this many company tasks (0 = until idle)",
+        "--tasks-this-session", type=int, default=None,
+        help=("distributed mode: stop after this many company tasks "
+              "(default = distributed.tasks_per_session; 0 = until idle)"),
     )
     expand.add_argument(
         "--worker-id", default=None,

@@ -53,6 +53,7 @@ def build_escalation_queries(
     stages: Optional[list[str]] = None,
     used_queries: Optional[list[str]] = None,
     entity_type: str = "Company",
+    aliases: Optional[list[str]] = None,
 ) -> list[dict[str, Any]]:
     """Return query specs tagged with ``escalation_stage`` and ``selection_family``."""
     wanted = set(stages or STAGES)
@@ -92,6 +93,21 @@ def build_escalation_queries(
                 continue
             seen.add(norm)
             out.append(entry)
+        retrieval = (config.get("expansion") or {}).get("retrieval") or {}
+        alias_limit = max(0, int(retrieval.get("alias_query_max", 0)))
+        initial_limit = max(0, int(retrieval.get("max_initial_query_variants", 0)))
+        alias_queries = []
+        for alias in aliases or []:
+            if alias.casefold() == entity_name.casefold():
+                continue
+            alias_queries.extend((
+                f'"supplier to" "{alias}"',
+                f'"{alias}" procurement suppliers',
+            ))
+        for query in alias_queries[:alias_limit]:
+            if initial_limit and len(out) >= initial_limit:
+                break
+            _add(query, STAGE_A)
 
     if STAGE_C in wanted or STAGE_D in wanted:
         plan = plan_upstream_queries(

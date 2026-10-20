@@ -70,6 +70,27 @@ def diversify_by_title(
     return out
 
 
+def diversify_by_domain(
+    results: list[SearchResult], *, max_per_domain: int,
+) -> list[SearchResult]:
+    """Bound syndicated/single-site saturation while preserving rank order."""
+    if max_per_domain <= 0:
+        return list(results)
+    counts: dict[str, int] = {}
+    kept: list[SearchResult] = []
+    for result in results:
+        domain = (
+            result.source_domain
+            or (urlsplit(result.canonical_source_url or result.url or "").hostname or "")
+        ).casefold()
+        key = domain or f"provider:{result.provider}"
+        if counts.get(key, 0) >= max_per_domain:
+            continue
+        counts[key] = counts.get(key, 0) + 1
+        kept.append(result)
+    return kept
+
+
 # --- provenance enrichment ---------------------------------------------------------
 
 
@@ -537,7 +558,17 @@ async def retrieve_async(
     concurrency = config.get("concurrency", {})
     semaphore = asyncio.Semaphore(max(1, concurrency.get("retrieval", 8)))
     aliases = _company_aliases(config)
+    for alias in config.get("_distributed_entity_aliases") or []:
+        aliases.setdefault(str(alias), entity_name)
     variants = origin_name_variants(entity_name, aliases)
+    for alias in config.get("_distributed_entity_aliases") or []:
+        if str(alias).casefold() not in {name.casefold() for name in variants}:
+            variants.append(str(alias))
+    query_variants = list(dict.fromkeys([
+        *variants,
+        *(str(alias) for alias, canonical in aliases.items()
+          if normalization_key(canonical) == normalization_key(entity_name)),
+    ]))
     evidence_cfg = (config.get("validation") or {}).get("evidence") or {}
     policy = load_relation_evidence(evidence_cfg.get("policy_file"))
 
@@ -549,7 +580,7 @@ async def retrieve_async(
     seen_sids: set[str] = set()
     stages = escalation_stages or [STAGE_A, STAGE_B]
     query_specs = build_escalation_queries(
-        config, entity_name, tier, llm=llm, stages=stages,
+        config, entity_name, tier, llm=llm, stages=stages, aliases=query_variants,
     )
     stage_by_query = {
         " ".join((spec.get("query") or "").split()).casefold(): spec.get("escalation_stage")
@@ -631,7 +662,11 @@ async def retrieve_async(
         prior_lookups = sum(bool(r.title_lookup_attempted) for r in unique.values())
         remaining_lookups = max(0, max_lookups - prior_lookups)
         # Count already-attempted bodies toward the same per-entity network ceiling.
-        fetchable = [r for r in preliminary if not r.text and
+        preliminary_fetch = diversify_by_domain(
+            diversify_by_title(preliminary),
+            max_per_domain=int(retrieval_cfg.get("max_full_text_fetches_per_domain") or 0),
+        )
+        fetchable = [r for r in preliminary_fetch if not r.text and
                      sources.get(r.provider, {}).get("fetch_full_text", False)]
         attempted = sum(bool(r.full_text_attempted) for r in unique.values())
         remaining_fetches = max(0, max_fetches - attempted)
@@ -639,7 +674,7 @@ async def retrieve_async(
         # Ensure top unresolved Google News wrappers get title recovery even when
         # they sit just outside the body-fetch shortlist (snippet evidence still valid).
         fetchable_ids = {id(r) for r in fetchable}
-        for wrapper in preliminary:
+        for wrapper in preliminary_fetch:
             if remaining_lookups <= 0:
                 break
             if id(wrapper) in fetchable_ids:
@@ -731,6 +766,10 @@ async def retrieve_async(
         )]
         ranked = sort_discovery_results(usable, entity_name, aliases=variants, policy=policy)
         selected = diversify_by_title(ranked)
+        selected = diversify_by_domain(
+            selected,
+            max_per_domain=int(retrieval_cfg.get("max_candidates_per_domain") or 0),
+        )
         max_candidates = int(retrieval_cfg.get("max_candidates_per_entity") or 0)
         if max_candidates > 0:
             selected = selected[:max_candidates]

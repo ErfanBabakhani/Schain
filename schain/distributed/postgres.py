@@ -105,6 +105,13 @@ class PostgresRepository:
                 )
         return SCHEMA_VERSION
 
+    def experiment_exists(self, experiment_id: str) -> bool:
+        with self._connection() as connection:
+            return connection.execute(
+                "SELECT 1 FROM schain_experiments WHERE experiment_id=%s",
+                (experiment_id,),
+            ).fetchone() is not None
+
     def initialize_or_join_experiment(
         self,
         experiment_id: str,
@@ -114,6 +121,8 @@ class PostgresRepository:
         save_enabled: bool,
         seeds: Sequence[dict[str, Any]],
         max_task_attempts: int,
+        discovery_profile: dict[str, Any] | None = None,
+        document_limit: int | None = None,
     ) -> str:
         """Create once, otherwise verify the immutable compatibility manifest."""
         manifest_hash = _json_hash(manifest)
@@ -124,11 +133,14 @@ class PostgresRepository:
             )
             created = bool(connection.execute(
                 "INSERT INTO schain_experiments "
-                "(experiment_id,schema_version,manifest,manifest_hash,max_tier,save_enabled) "
-                "VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                "(experiment_id,schema_version,manifest,manifest_hash,max_tier,save_enabled,"
+                "discovery_profile_version,discovery_profile,document_limit) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
                 (
                     experiment_id, SCHEMA_VERSION, self._json(manifest), manifest_hash,
                     max_tier, save_enabled,
+                    (discovery_profile or {}).get("version"),
+                    self._json(discovery_profile or {}), document_limit,
                 ),
             ).rowcount)
             row = connection.execute(
@@ -146,6 +158,10 @@ class PostgresRepository:
                 )
             if int(row["max_tier"]) != int(max_tier) or bool(row["save_enabled"]) != bool(save_enabled):
                 raise ValueError("experiment max_tier/save policy does not match stored settings")
+            stored_profile = row.get("discovery_profile_version")
+            requested_profile = (discovery_profile or {}).get("version")
+            if stored_profile and stored_profile != requested_profile:
+                raise ValueError("experiment discovery profile does not match stored settings")
             for seed in seeds:
                 self._schedule_locked(
                     connection,
@@ -257,6 +273,12 @@ class PostgresRepository:
                 "                 WHERE failed_outbox.experiment_id=t.experiment_id "
                 "                 AND failed_outbox.status='failed') "
                 " AND t.available_at<=clock_timestamp() AND t.attempts<t.max_attempts "
+                " AND ((SELECT e.document_limit FROM schain_experiments e "
+                "       WHERE e.experiment_id=t.experiment_id) IS NULL "
+                "      OR (SELECT count(*) FROM schain_documents d "
+                "          WHERE d.experiment_id=t.experiment_id) < "
+                "         (SELECT e.document_limit FROM schain_experiments e "
+                "          WHERE e.experiment_id=t.experiment_id)) "
                 " AND t.tier=(SELECT min(tier) FROM schain_tasks "
                 "             WHERE experiment_id=%s AND status IN ('pending','retry','leased')) "
                 " AND NOT EXISTS (SELECT 1 FROM schain_graph_outbox o "
@@ -327,7 +349,8 @@ class PostgresRepository:
             )
 
     def save_retrieval_checkpoint(
-        self, lease: TaskLease, results: list[dict[str, Any]],
+        self, lease: TaskLease, results: list[dict[str, Any]], *,
+        checkpoint_entity_key: str | None = None,
     ) -> None:
         content_hash = _json_hash(results)
         with self._connection() as connection, connection.transaction():
@@ -339,7 +362,7 @@ class PostgresRepository:
                 "results=excluded.results,content_hash=excluded.content_hash,"
                 "updated_at=clock_timestamp()",
                 (
-                    lease.experiment_id, lease.entity_key, lease.tier,
+                    lease.experiment_id, checkpoint_entity_key or lease.entity_key, lease.tier,
                     self._json(results), content_hash,
                 ),
             )
@@ -488,6 +511,14 @@ class PostgresRepository:
                 "SELECT max_tier FROM schain_experiments WHERE experiment_id=%s",
                 (lease.experiment_id,),
             ).fetchone()
+            preexisting = {
+                str(discovery["entity_key"]): connection.execute(
+                    "SELECT tier,status FROM schain_frontier "
+                    "WHERE experiment_id=%s AND entity_key=%s",
+                    (lease.experiment_id, str(discovery["entity_key"])),
+                ).fetchone()
+                for discovery in result.discoveries
+            }
             for discovery in result.discoveries:
                 self._schedule_locked(
                     connection, lease.experiment_id,
@@ -501,6 +532,9 @@ class PostgresRepository:
                     max_task_attempts=int(discovery.get("max_attempts", 3)),
                     max_tier=int(experiment["max_tier"]),
                 )
+            self._record_discovery_paths_locked(
+                connection, lease, result.accepted_facts, result.discoveries, preexisting,
+            )
             updated = connection.execute(
                 "UPDATE schain_tasks SET status='completed',result=%s,worker_id=NULL,"
                 "lease_expires_at=NULL,completed_at=clock_timestamp(),updated_at=clock_timestamp() "
@@ -694,6 +728,11 @@ class PostgresRepository:
                 "SELECT count(*) n,min(tier) FILTER (WHERE status IN ('pending','leased')) current_tier "
                 "FROM schain_frontier WHERE experiment_id=%s", (experiment_id,),
             ).fetchone()
+            documents = connection.execute(
+                "SELECT count(*) n,count(*) FILTER "
+                "(WHERE document->>'content_source'='full_text') full_text "
+                "FROM schain_documents WHERE experiment_id=%s", (experiment_id,),
+            ).fetchone()
             return {
                 "experiment_id": experiment_id,
                 "status": experiment["status"],
@@ -711,6 +750,10 @@ class PostgresRepository:
                 "total_llm_calls": int(task_metrics["llm_calls"] or 0),
                 "task_attempts": int(task_metrics["attempts"] or 0),
                 "retry_count": int(task_metrics["retries"] or 0),
+                "documents": int(documents["n"] or 0),
+                "full_text_documents": int(documents["full_text"] or 0),
+                "document_limit": experiment.get("document_limit"),
+                "discovery_profile_version": experiment.get("discovery_profile_version"),
                 "progress_by_worker": {
                     item["worker_id"]: dict(item["statistics"] or {}) for item in worker_rows
                 },
@@ -749,7 +792,8 @@ class PostgresRepository:
     def experiment_manifest(self, experiment_id: str) -> dict[str, Any]:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT schema_version,manifest,status,max_tier,save_enabled,created_at,"
+                "SELECT schema_version,manifest,status,max_tier,save_enabled,"
+                "discovery_profile_version,discovery_profile,document_limit,manifest_history,created_at,"
                 "updated_at,completed_at FROM schain_experiments WHERE experiment_id=%s",
                 (experiment_id,),
             ).fetchone()
@@ -769,6 +813,83 @@ class PostgresRepository:
                 (timedelta(days=max(1, retention_days)),),
             )
             return cursor.rowcount
+
+    def frontier_audit(self, experiment_id: str) -> list[dict[str, Any]]:
+        """Explain each accepted upstream path independently of global entity tier."""
+        with self._connection() as connection:
+            return [dict(row) for row in connection.execute(
+                "SELECT path_id,task_id,fact_id,supplier_id,supplier_name,customer_id,"
+                "customer_name,origin_entity,path_depth,frontier_action,details,created_at "
+                "FROM schain_discovery_paths WHERE experiment_id=%s "
+                "ORDER BY created_at,path_id",
+                (experiment_id,),
+            ).fetchall()]
+
+    def _record_discovery_paths_locked(
+        self,
+        connection: Any,
+        lease: TaskLease,
+        facts: list[dict[str, Any]],
+        discoveries: list[dict[str, Any]],
+        preexisting: dict[str, Any],
+    ) -> None:
+        discovery_keys = {str(item["entity_key"]) for item in discoveries}
+        proposed_depth = lease.tier + 1
+        origin_ids = {lease.entity_key}
+        origin_ids.update(str(row["canonical_id"]) for row in connection.execute(
+            "SELECT canonical_id FROM schain_entity_aliases WHERE experiment_id=%s "
+            "AND (mention_key=%s OR canonical_id=%s)",
+            (lease.experiment_id, lease.entity_key, lease.entity_key),
+        ).fetchall())
+        for fact in facts:
+            if fact.get("relation") != "suppliesTo":
+                continue
+            supplier_id = str(fact.get("subject_id") or "")
+            customer_id = str(fact.get("object_id") or "")
+            if not supplier_id or not customer_id:
+                continue
+            fact_id = str(fact.get("fact_id") or fact.get("candidate_fact_id") or _json_hash(fact))
+            old = preexisting.get(supplier_id)
+            if old is None:
+                old = connection.execute(
+                    "SELECT tier,status FROM schain_frontier "
+                    "WHERE experiment_id=%s AND entity_key=%s",
+                    (lease.experiment_id, supplier_id),
+                ).fetchone()
+            if supplier_id == customer_id:
+                action = "self_edge_not_frontier"
+            elif customer_id not in origin_ids:
+                action = "accepted_relationship_other_customer"
+            elif supplier_id in discovery_keys and preexisting.get(supplier_id) is None:
+                action = "new_unique_supplier"
+            elif old is not None and int(old["tier"]) < proposed_depth:
+                action = "existing_entity_new_deeper_path"
+            elif old is not None and int(old["tier"]) == proposed_depth:
+                action = "existing_entity_new_peer_path"
+            elif old is not None:
+                action = "existing_entity_shorter_path"
+            else:
+                action = "valid_fact_omitted_from_frontier"
+            path_id = _stable_id(
+                "path", lease.experiment_id, lease.task_id, fact_id,
+                supplier_id, customer_id, str(proposed_depth),
+            )
+            connection.execute(
+                "INSERT INTO schain_discovery_paths "
+                "(experiment_id,path_id,task_id,fact_id,supplier_id,supplier_name,"
+                "customer_id,customer_name,origin_entity,path_depth,frontier_action,details) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) ON CONFLICT DO NOTHING",
+                (
+                    lease.experiment_id, path_id, lease.task_id, fact_id,
+                    supplier_id, fact.get("subject_name"), customer_id,
+                    fact.get("object_name"), lease.entity_key, proposed_depth, action,
+                    self._json({
+                        "global_tier": int(old["tier"]) if old is not None else None,
+                        "scheduled_by_task": supplier_id in discovery_keys,
+                        "evidence": fact.get("evidence"),
+                    }),
+                ),
+            )
 
     def database_size_bytes(self) -> int:
         with self._connection() as connection:
