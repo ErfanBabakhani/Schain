@@ -20,8 +20,7 @@ Two modes, and only two:
 | `INGEST` | documents you already have | normalize → deduplicate → Prompt 1 → Prompt 2 → facts → Neo4j `MERGE`. No search. |
 | `EXPAND` | seed companies | persistent frontier → tier-aware queries → retrieval → source reputation (metadata) → Prompt 1 → Prompt 2 → ontology/evidence validation → facts → edge support → frontier from valid suppliesTo → Neo4j `MERGE` (optional) → next tier, up to `max_tier`. |
 
-Project documents: [CLAUDE.md](CLAUDE.md) (development rules),
-[docs/SupplyChain_KG_V1_Architecture_Brief_Final.pdf](docs/SupplyChain_KG_V1_Architecture_Brief_Final.pdf)
+Project documents: [docs/SupplyChain_KG_V1_Architecture_Brief_Final.pdf](docs/SupplyChain_KG_V1_Architecture_Brief_Final.pdf)
 (architecture), [PROJECT_DECISIONS.md](PROJECT_DECISIONS.md) (frozen V1 scope),
 [PROJECT_STRUCTURE.md](PROJECT_STRUCTURE.md) (layout),
 [docs/EXTERNAL_DATASETS.md](docs/EXTERNAL_DATASETS.md) (validation data),

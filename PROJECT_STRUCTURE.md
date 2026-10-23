@@ -4,9 +4,7 @@ Keep the repository small. Do not create files until they are actually needed.
 
 ```text
 SChain/
-├── CLAUDE.md
 ├── README.md
-├── GIT_SETUP.md
 ├── PROJECT_DECISIONS.md
 ├── PROJECT_STRUCTURE.md
 ├── pyproject.toml
