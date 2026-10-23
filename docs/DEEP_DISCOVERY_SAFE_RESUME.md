@@ -49,7 +49,7 @@ tasks, documents, facts, aliases, and evidence are not updated or deleted. Repea
 same apply returns the stored maintenance result.
 
 Use
-[`SChain_Neon_v2_SAFE_RESUME_TIER5_AFTER_CODEX.ipynb`](../notebooks/SChain_Neon_v2_SAFE_RESUME_TIER5_AFTER_CODEX.ipynb)
+[`SChain_Expand.ipynb`](../notebooks/SChain_Expand.ipynb)
 for Colab. It uses `resume_existing_only=True`, 40-task sessions with optional safe
 auto-continue, streaming logging, the approved config, and Save disabled.
 

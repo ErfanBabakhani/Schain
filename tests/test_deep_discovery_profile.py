@@ -117,7 +117,7 @@ def test_benchmark_reports_observed_metrics_and_leaves_unlabelled_precision_unkn
 
 def test_safe_resume_notebook_uses_profile_and_streaming_auto_continue():
     notebook = json.loads((
-        ROOT / "notebooks" / "SChain_Neon_v2_SAFE_RESUME_TIER5_AFTER_CODEX.ipynb"
+        ROOT / "notebooks" / "SChain_Expand.ipynb"
     ).read_text(encoding="utf-8"))
     source = "\n".join("".join(cell.get("source") or []) for cell in notebook["cells"])
     for required in (

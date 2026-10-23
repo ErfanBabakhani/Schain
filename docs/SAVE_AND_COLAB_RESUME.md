@@ -80,7 +80,7 @@ are excluded from snapshots. Never add them to YAML.
 
 ## Colab procedure
 
-Open [SChain_Expand_Persistent_Save.ipynb](../notebooks/SChain_Expand_Persistent_Save.ipynb)
+Open [SChain_Expand_Persistent_Save.ipynb](../notebooks/SChain_Expand.ipynb)
 in a GPU Colab runtime.
 
 1. Add the three Neo4j values to Colab Secrets and grant notebook access.
