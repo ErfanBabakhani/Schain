@@ -73,7 +73,7 @@ The heartbeat must be less than half the lease.
 
 ## Colab and command-line workflow
 
-Open `notebooks/SChain_Expand_Neon_Distributed.ipynb` and create the named Colab
+Open `notebooks/SChain_Expand.ipynb` and create the named Colab
 Secrets. It is entirely in English, does not mount Drive, and never uses
 `session.lock.json`.
 

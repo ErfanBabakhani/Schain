@@ -11,8 +11,13 @@ from schain.distributed.export import export_distributed_artifacts
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def test_notebook_directory_has_one_workflow_per_mode():
+    names = {path.name for path in (ROOT / "notebooks").iterdir()}
+    assert names == {"SChain_Expand.ipynb", "SChain_Ingest.ipynb"}
+
+
 def test_distributed_notebook_is_valid_and_has_no_drive_or_session_lock():
-    path = ROOT / "notebooks" / "SChain_Expand_Neon_Distributed.ipynb"
+    path = ROOT / "notebooks" / "SChain_Expand.ipynb"
     notebook = json.loads(path.read_text(encoding="utf-8"))
     assert notebook["nbformat"] == 4
     source = "\n".join(
@@ -23,7 +28,7 @@ def test_distributed_notebook_is_valid_and_has_no_drive_or_session_lock():
     assert "NEON_DATABASE_URL" in source
     assert "run_distributed_expand" in source
     assert "TASKS_THIS_SESSION" in source
-    assert "SChain_Expand_Neon_Distributed" in path.name
+    assert path.name == "SChain_Expand.ipynb"
 
 
 def test_distributed_export_contains_graph_and_audit(tmp_path):
