@@ -11,7 +11,7 @@
 # script after any interruption continues from the SQLite checkpoint.
 #
 # Services already running before this script started are reused and never stopped.
-# Services this script starts are stopped when the workload finishes, so a 27B model
+# Services this script starts are stopped when the workload finishes, so the model
 # does not sit on the GPU afterwards.
 
 set -uo pipefail
@@ -28,7 +28,7 @@ Modes:
 
 Options:
   --smoke-test           tiny run against the real LLM and Neo4j, then stop.
-                         EXPAND: --max-tier 0 --max-documents 3.
+                         EXPAND: --max-tier 1 --max-documents 3.
                          INGEST: one small document.
                          Runs in the foreground so you see the result immediately.
   --restart              clear checkpoint state and generated data first (destructive
@@ -50,6 +50,8 @@ USAGE
 # --- arguments ---------------------------------------------------------------------
 
 MODE="expand"
+# Parsing shifts positional arguments; preserve exact argv for tmux / SLURM children.
+ORIGINAL_ARGS=("$@")
 INPUT=""
 CONFIG_FILE=""
 SMOKE=0
@@ -149,7 +151,7 @@ if [ "$FOREGROUND" -eq 0 ] && [ -z "${TMUX:-}" ] && [ -z "${SCHAIN_NO_TMUX:-}" ]
         fi
         log "starting in tmux session '$TMUX_SESSION' (survives SSH disconnect)"
         tmux new-session -d -s "$TMUX_SESSION" \
-            "cd $(printf '%q' "$REPO_ROOT") && SCHAIN_NO_TMUX=1 $(printf '%q' "$0") $(printf '%q ' "$@")"
+            "cd $(printf '%q' "$REPO_ROOT") && SCHAIN_NO_TMUX=1 $(printf '%q' "$0") $(printf '%q ' "${ORIGINAL_ARGS[@]}")"
         echo
         echo "  attach:  tmux attach -t $TMUX_SESSION"
         echo "  status:  ./scripts/server_status.sh"
@@ -185,17 +187,15 @@ ensure_venv() {
 ensure_venv
 
 # Configuration comes from the project's own loader, so it cannot drift from the app.
-if [ "$DRY_RUN" -eq 1 ] && [ ! -x "$VENV_PY" ]; then
-    CFG_LLM_BASE_URL="http://localhost:8000/v1"; CFG_NEO4J_URI="bolt://localhost:7687"
-    CFG_LLM_MODEL="(unknown until .venv exists)"; CFG_NEO4J_DATABASE="neo4j"
-else
-    # Capture first: eval of an empty string would succeed and leave variables unset.
-    if ! CONFIG_OUTPUT="$(config_values "$CONFIG_FILE" 2>&1)"; then
-        die "could not read $CONFIG_FILE:
+# Capture first: eval of an empty string would succeed and leave variables unset.
+# A dry run must use the actual config too; guessed localhost defaults can report the
+# wrong services and an unintended model, especially on the first run without .venv.
+if ! CONFIG_OUTPUT="$(config_values "$CONFIG_FILE" 2>&1)"; then
+    die "could not read $CONFIG_FILE with the available Python interpreter.
+Install the project dependencies before running this configuration:
 $CONFIG_OUTPUT"
-    fi
-    eval "$CONFIG_OUTPUT"
 fi
+eval "$CONFIG_OUTPUT"
 
 LOG_DIR="$REPO_ROOT/logs"
 mkdir -p "$LOG_DIR"
@@ -238,12 +238,12 @@ HINT
         SLURM_ARGS+=(--time="${SCHAIN_SLURM_SMOKE_TIME:-02:00:00}")
         log "requesting an interactive GPU allocation: srun ${SLURM_ARGS[*]}"
         if [ "$DRY_RUN" -eq 1 ]; then
-            echo "  would exec: srun ${SLURM_ARGS[*]} $0 $* (allocation is released when this script exits)"
+            echo "  would exec: srun ${SLURM_ARGS[*]} $0 ${ORIGINAL_ARGS[*]} (allocation is released when this script exits)"
         else
             trap - EXIT INT TERM
             exec srun "${SLURM_ARGS[@]}" \
                 env SCHAIN_NO_TMUX=1 SCHAIN_IN_ALLOCATION=1 SCHAIN_RUN_STAMP="$RUN_STAMP" \
-                "$0" "$@"
+                "$0" "${ORIGINAL_ARGS[@]}"
         fi
     else
         # Production must not use an interactive allocation: those are capped at two
@@ -263,7 +263,7 @@ HINT
             # must not tee into the same file as well.
             echo "export SCHAIN_NO_TMUX=1 SCHAIN_IN_ALLOCATION=1 SCHAIN_LOG_TO_STDOUT=1"
             echo "export SCHAIN_RUN_STAMP=$(printf '%q' "$RUN_STAMP")"
-            echo "exec $(printf '%q' "$0") $(printf '%q ' "$@") --foreground"
+            echo "exec $(printf '%q' "$0") $(printf '%q ' "${ORIGINAL_ARGS[@]}") --foreground"
         } > "$BATCH_FILE"
         chmod +x "$BATCH_FILE"
 
@@ -367,6 +367,15 @@ ensure_neo4j() {
         log "Neo4j already reachable at $CFG_NEO4J_URI - reusing it (it will not be stopped)"
         return 0
     fi
+    if tcp_open "$(neo4j_host "$CFG_NEO4J_URI")" "$(neo4j_port "$CFG_NEO4J_URI")"; then
+        die "the port at $CFG_NEO4J_URI is occupied but Neo4j could not be verified.
+Check the service, Bolt connectivity and credentials before starting another instance."
+    fi
+    case "$(neo4j_host "$CFG_NEO4J_URI")" in
+        localhost|127.0.0.1|0.0.0.0) : ;;
+        *) die "NEO4J_URI points at a remote host that is not reachable: $CFG_NEO4J_URI.
+Start Neo4j there, or configure a reachable instance before running this script." ;;
+    esac
     if [ "$DRY_RUN" -eq 1 ]; then
         if have docker; then
             echo "  would start Neo4j container '$NEO4J_CONTAINER' from $NEO4J_IMAGE, data in $NEO4J_DATA_DIR"
@@ -450,7 +459,9 @@ Automatic installation is skipped here (no GPU visible, or SCHAIN_VLLM_AUTO_INST
     local vllm_log="$LOG_DIR/vllm_${RUN_STAMP}.log"
 
     # shellcheck disable=SC2206
-    local cmd=("$vllm_bin" serve "$model" --served-model-name "$model"
+    # The Python config selects the API model name. An explicit weight override must
+    # still expose that name, otherwise /health succeeds but every generation is 404.
+    local cmd=("$vllm_bin" serve "$model" --served-model-name "$CFG_LLM_MODEL"
                --port "$port" --max-model-len "$VLLM_MAX_MODEL_LEN"
                --gpu-memory-utilization "$VLLM_GPU_UTIL" --tensor-parallel-size "$tp"
                $VLLM_EXTRA_ARGS)
@@ -474,7 +485,7 @@ Automatic installation is skipped here (no GPU visible, or SCHAIN_VLLM_AUTO_INST
     nohup "${cmd[@]}" > "$vllm_log" 2>&1 &
     OWNED_VLLM_PID=$!
 
-    log "waiting for the model to load (up to ${VLLM_STARTUP_TIMEOUT}s; a 27B model takes minutes)"
+    log "waiting for the model to load (up to ${VLLM_STARTUP_TIMEOUT}s; model loading can take minutes)"
     for _ in $(seq 1 "$VLLM_STARTUP_TIMEOUT"); do
         if ! kill -0 "$OWNED_VLLM_PID" 2>/dev/null; then
             tail -20 "$vllm_log" >&2
@@ -497,7 +508,7 @@ if [ "$MODE" = "ingest" ]; then
     [ -n "$INPUT" ] && SCHAIN_CMD+=(--input "$INPUT")
 elif [ "$SMOKE" -eq 1 ]; then
     # Smallest useful real run: one tier, a few documents, normal pipeline code.
-    SCHAIN_CMD+=(--max-tier "${SCHAIN_SMOKE_MAX_TIER:-0}"
+    SCHAIN_CMD+=(--max-tier "${SCHAIN_SMOKE_MAX_TIER:-1}"
                  --max-documents "${SCHAIN_SMOKE_MAX_DOCUMENTS:-3}")
 fi
 

@@ -1,4 +1,4 @@
-"""Tier-aware query generation, depth and per-provider retrieval limits."""
+"""Tier-aware upstream query generation, depth and per-provider retrieval limits."""
 
 from __future__ import annotations
 
@@ -9,61 +9,55 @@ from schain.expansion.queries import generate_queries
 
 NEWS_PROVIDERS = ("google_news", "gdelt")
 
-# The production template set, tier by tier.
+# Upstream-focused production templates plus high-yield list/report queries.
 EXPECTED_TEMPLATES = {
-    0: ['"{entity}" suppliers', '"{entity}" sourcing', '"{entity}" "supply agreement"',
-        '"{entity}" battery suppliers', '"{entity}" semiconductor suppliers',
-        '"{entity}" raw material supply'],
-    1: ['"{entity}" suppliers', '"{entity}" sourcing', '"{entity}" "supply agreement"',
-        '"{entity}" component suppliers', '"{entity}" battery material suppliers',
-        '"{entity}" raw material suppliers'],
-    2: ['"{entity}" suppliers', '"{entity}" sourcing', '"{entity}" "supply agreement"',
-        '"{entity}" material suppliers', '"{entity}" precursor suppliers',
-        '"{entity}" feedstock suppliers'],
-    3: ['"{entity}" suppliers', '"{entity}" raw material suppliers', '"{entity}" feedstock',
-        '"{entity}" precursor', '"{entity}" refining', '"{entity}" "offtake agreement"'],
-    4: ['"{entity}" suppliers', '"{entity}" feedstock suppliers',
-        '"{entity}" refinery suppliers', '"{entity}" concentrate suppliers',
-        '"{entity}" ore suppliers', '"{entity}" "offtake agreement"'],
-    5: ['"{entity}" suppliers', '"{entity}" raw material sourcing',
-        '"{entity}" mining suppliers', '"{entity}" mines', '"{entity}" extraction',
-        '"{entity}" "offtake agreement"'],
+    tier: [
+        'supplies "{entity}"',
+        '"supplier to" "{entity}"',
+        '"{entity}" sources from supplier',
+        '"{entity}" purchases from supplier',
+        '"{entity}" procurement supplier',
+        '"{entity}" suppliers',
+        '"{entity}" key suppliers',
+        '"{entity}" major suppliers',
+        '"{entity}" component suppliers',
+        '"{entity}" supply chain',
+        '"{entity}" supplier list',
+        '"{entity}" key suppliers list',
+        '"{entity}" supplier award',
+        '"{entity}" procurement report',
+        '"{entity}" sourcing report',
+        '"{entity}" sustainability report suppliers',
+        '"{entity}" annual report suppliers',
+        '"{entity}" supply chain report',
+        '"{entity}" filetype:pdf suppliers',
+    ]
+    for tier in range(5)
 }
 
-# Per-provider candidate ceilings, per query.
 EXPECTED_LIMITS = {
-    0: {"google_news": 50, "gdelt": 50, "general_web": 30, "wikipedia": 10},
-    1: {"google_news": 50, "gdelt": 50, "general_web": 30, "wikipedia": 10},
-    2: {"google_news": 50, "gdelt": 50, "general_web": 30, "wikipedia": 10},
-    3: {"google_news": 40, "gdelt": 40, "general_web": 25, "wikipedia": 10},
-    4: {"google_news": 30, "gdelt": 30, "general_web": 20, "wikipedia": 10},
-    5: {"google_news": 30, "gdelt": 30, "general_web": 20, "wikipedia": 10},
+    tier: {"google_news": 10, "gdelt": 16, "general_web": 18, "wikipedia": 4}
+    for tier in range(5)
 }
 
 
-# --- depth ---------------------------------------------------------------------------
-
-
-def test_production_depth_is_six_tiers(expand_config):
-    assert expand_config["expansion"]["max_tier"] == 6
+def test_production_depth_is_five_tiers(expand_config):
+    assert expand_config["expansion"]["max_tier"] == 5
 
 
 @pytest.mark.parametrize("tier", sorted(EXPECTED_TEMPLATES))
-def test_tiers_zero_to_five_are_searched(tier, expand_config):
+def test_tiers_below_terminal_are_searched(tier, expand_config):
     assert generate_queries(expand_config, "BMW", tier), f"tier {tier} produced no queries"
 
 
-def test_tier_six_is_terminal_and_produces_no_queries(expand_config):
-    """Tier-6 entities are stored, but nothing is ever searched for them."""
-    assert resolve_tier_queries(expand_config, 6) == []
-    assert generate_queries(expand_config, "Some Deep Mine", 6) == []
+def test_tier_five_and_beyond_are_terminal(expand_config):
+    for tier in (5, 6):
+        assert resolve_tier_queries(expand_config, tier) == []
+        assert generate_queries(expand_config, "Some Deep Mine", tier) == []
 
 
 def test_beyond_the_configured_depth_nothing_is_generated(expand_config):
     assert generate_queries(expand_config, "BMW", 7) == []
-
-
-# --- templates -----------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("tier,templates", sorted(EXPECTED_TEMPLATES.items()))
@@ -73,14 +67,32 @@ def test_tier_templates_match_the_configured_set(tier, templates, expand_config)
 
 def test_entity_is_substituted_into_every_template(expand_config):
     queries = [spec["query"] for spec in generate_queries(expand_config, "BMW", 0)]
-    assert queries[:3] == ['"BMW" suppliers', '"BMW" sourcing', '"BMW" "supply agreement"']
+    assert queries[:3] == [
+        'supplies "BMW"',
+        '"supplier to" "BMW"',
+        '"BMW" sources from supplier',
+    ]
     assert all("{entity}" not in query for query in queries)
 
 
-def test_upper_tiers_move_upstream_in_vocabulary(expand_config):
-    tier5 = [spec["query"] for spec in generate_queries(expand_config, "Ganfeng Lithium", 5)]
-    assert '"Ganfeng Lithium" mines' in tier5
-    assert '"Ganfeng Lithium" "offtake agreement"' in tier5
+def test_upstream_templates_avoid_ambiguous_sourcing_primary(expand_config):
+    templates = [spec["template"] for spec in generate_queries(expand_config, "X", 0)]
+    assert '"{entity}" sourcing' not in templates
+    assert '"{entity}" "supply agreement"' not in templates
+    assert any("supplies" in t for t in templates)
+    assert any("sources from" in t for t in templates)
+    assert '"{entity}" suppliers' in templates
+    assert '"{entity}" key suppliers' in templates
+    assert '"{entity}" component suppliers' in templates
+
+
+def test_deep_queries_do_not_assume_an_industrial_role(expand_config):
+    shallow = [spec["template"] for spec in generate_queries(expand_config, "Acme", 0)]
+    deep = [spec["template"] for spec in generate_queries(expand_config, "Acme", 4)]
+    assert shallow == deep
+    assert all("mines" not in template and "refining" not in template for template in deep)
+    # The buyer phrase is unquoted, allowing inserted product/material words.
+    assert '"{entity}" sources from supplier' in deep
 
 
 def test_template_without_placeholder_is_used_literally(caplog):
@@ -91,20 +103,17 @@ def test_template_without_placeholder_is_used_literally(caplog):
     assert "placeholder" in caplog.text
 
 
-# --- limits --------------------------------------------------------------------------
-
-
 @pytest.mark.parametrize("tier,limits", sorted(EXPECTED_LIMITS.items()))
 def test_limits_are_per_provider_per_query(tier, limits, expand_config):
     for spec in generate_queries(expand_config, "BMW", tier):
         assert {provider: query_limit(spec, provider) for provider in spec["providers"]} == limits
 
 
-def test_news_providers_get_the_largest_share(expand_config):
+def test_news_providers_are_competitive_with_general_web(expand_config):
     spec = generate_queries(expand_config, "BMW", 0)[0]
-    for provider in NEWS_PROVIDERS:
-        assert query_limit(spec, provider) > query_limit(spec, "general_web")
-        assert query_limit(spec, provider) > query_limit(spec, "wikipedia")
+    assert query_limit(spec, "general_web") >= query_limit(spec, "google_news")
+    assert query_limit(spec, "gdelt") >= query_limit(spec, "google_news")
+    assert query_limit(spec, "google_news") > query_limit(spec, "wikipedia")
 
 
 def test_all_four_source_families_are_queried(expand_config):
@@ -115,10 +124,7 @@ def test_all_four_source_families_are_queried(expand_config):
 def test_wikipedia_stays_small_at_every_tier(expand_config):
     for tier in EXPECTED_LIMITS:
         for spec in generate_queries(expand_config, "BMW", tier):
-            assert query_limit(spec, "wikipedia") == 10
-
-
-# --- precedence ----------------------------------------------------------------------
+            assert query_limit(spec, "wikipedia") == 4
 
 
 def test_per_query_override_beats_the_tier_default():
@@ -128,8 +134,8 @@ def test_per_query_override_beats_the_tier_default():
                       "queries": [{"query": "a"}, {"query": "b", "max_results": 15}]}},
     }}}
     specs = {spec["query"]: spec for spec in resolve_tier_queries(config, 0)}
-    assert specs["a"]["max_results"] == 50    # tier default
-    assert specs["b"]["max_results"] == 15    # query override
+    assert specs["a"]["max_results"] == 50
+    assert specs["b"]["max_results"] == 15
 
 
 def test_tier_without_defaults_falls_back_to_the_global_value():
@@ -141,38 +147,30 @@ def test_tier_without_defaults_falls_back_to_the_global_value():
 
 
 def test_per_provider_limits_inherit_independently():
-    """A tier overriding only max_results keeps the global per-provider entries."""
     config = {"expansion": {"search": {
         "defaults": {"max_results": 20, "providers": ["gdelt", "wikipedia"],
                      "max_results_by_provider": {"wikipedia": 10}},
         "tiers": {1: {"defaults": {"max_results": 50}, "queries": [{"query": "a"}]}},
     }}}
     spec = resolve_tier_queries(config, 1)[0]
-    assert query_limit(spec, "gdelt") == 50       # from the tier default
-    assert query_limit(spec, "wikipedia") == 10   # inherited global per-provider entry
+    assert query_limit(spec, "gdelt") == 50
+    assert query_limit(spec, "wikipedia") == 10
 
 
 def test_no_cumulative_target_mechanism_exists(expand_config):
-    """Limits are ceilings per query, never a total number of documents to collect."""
     for spec in generate_queries(expand_config, "BMW", 0):
         assert "target_relevant_documents" not in spec
     assert "target_relevant_documents" not in expand_config["expansion"]
 
 
-# --- cost shape ----------------------------------------------------------------------
-
-
 def test_search_volume_is_node_centric_not_pairwise(expand_config):
-    """Cost is entities x templates; no query is ever built from a pair of entities."""
     entities = ["BMW", "Toyota", "Tesla Inc.", "BYD Co., Ltd.", "CATL", "Panasonic"]
     per_entity = len(generate_queries(expand_config, "BMW", 0))
     total = sum(len(generate_queries(expand_config, name, 0)) for name in entities)
 
     assert total == len(entities) * per_entity
-    # what an all-pairs scheme would cost, for contrast
     pairwise = len(entities) * (len(entities) - 1) * per_entity
     assert total < pairwise
-    # no generated query mentions two entities at once
     for name in entities:
         for spec in generate_queries(expand_config, name, 0):
             assert sum(other in spec["query"] for other in entities) == 1

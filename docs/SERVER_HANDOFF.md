@@ -1,7 +1,9 @@
+> Current experiment policy and readiness: [AUDIT_V0.3.0.md](AUDIT_V0.3.0.md). Colab uses the dedicated runtime profile and can omit Neo4j.
+
 # Server handoff
 
 For moving V1 to the GPU server. **None of this has been executed yet** — the development
-laptop cannot serve Qwen3.8-27B (4 GB VRAM) and has no Neo4j, so the real model, the real
+laptop cannot serve the configured 4B model (4 GB VRAM) and has no Neo4j, so the real model, the real
 database and any end-to-end run belong to the server phase.
 
 ## First run
@@ -83,7 +85,7 @@ same graph. Nothing else ever deletes state.
 
 The script tracks what it started:
 
-- **Started by the run** → stopped when the workload finishes: vLLM (so a 27B model does
+- **Started by the run** → stopped when the workload finishes: vLLM (so an idle model does
   not sit on the GPU), and the Neo4j container if the script created or started it. Under
   SLURM, the script exits, `srun` returns, and the allocation is released — no idle job is
   left behind.
@@ -123,24 +125,25 @@ If `NEO4J_PASSWORD` is unset on the first local install, one is generated and wr
 
 vLLM is not preinstalled here. On the first run with a GPU present, the runner installs it
 once into the existing `.venv`, then reuses it. The first model load also downloads
-Qwen3.8-27B from Hugging Face — the log says so explicitly, so a long first start is not
+the configured 4B model from Hugging Face — the log says so explicitly, so a long first start is not
 mistaken for a hang. Set `HF_HOME` to cache on shared storage.
 
 ## Notes
 
 - **APOC is not required** by the current implementation; every write is plain Cypher
   `MERGE`. The container the script starts does not install it.
-- **vLLM is not installed automatically.** It is large and GPU-specific. On the server:
-  `.venv/bin/python -m pip install vllm`. The script says so if it is missing.
+- The runner can install vLLM when a GPU is present and `SCHAIN_VLLM_AUTO_INSTALL=1`
+  (default). Set it to0 for a preconfigured runtime; GPU/package compatibility still
+  needs runtime verification.
 - Logs land in `logs/`, timestamped, e.g. `logs/expand_2026-08-29_210000.log`. vLLM gets
   its own `logs/vllm_*.log`. The path is printed when the run starts.
 - Each EXPAND run also writes `logs/retrieval_manifest_<run_id>.csv`: one row per retrieved
   candidate, with fetch, dedup, relevance and Prompt-1 status. Use it to see why a document
   did or did not become graph facts. A summary is printed at the end of the run.
-- Production depth is `max_tier: 6`, so a full run is large. The smoke test deliberately
-  uses `--max-tier 0 --max-documents 3`; raise the depth only after it passes.
-- **Start small.** The smoke test exists for this. Only scale up — full `max_tier`, no
-  `--max-documents` — once it has passed once.
+- Production depth is `max_tier: 5`, so a full run is large. The smoke test deliberately
+  uses `--max-tier 1 --max-documents 3`; raise the depth only after it passes.
+- **Start small.** The smoke test exists for this. Only scale up — configured `max_tier` and the configured
+  cumulative document/runtime safety ceilings — once it has passed once.
 - Some documents will be title + snippet rather than full articles, because Google News
   RSS links are redirect wrappers. Each document records which it was in
   `content_source`.

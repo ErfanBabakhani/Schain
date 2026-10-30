@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pandas as pd
 
 from schain import state
@@ -75,8 +77,23 @@ def test_missing_input_directory_is_reported(ingest_config, connection, ontology
 
 
 def test_facts_accumulate_across_documents(tmp_path, ingest_config, connection, ontology):
+    class SourceAwareLLM(StubLLM):
+        def _answer(self, prompt):
+            # An extraction stub must return evidence from the document it receives.
+            if "Input text:" in prompt and SECOND_DOCUMENT.strip() in prompt:
+                self.prompts.append(prompt)
+                return json.dumps({
+                    "nodes": [
+                        {"id": "0", "label": "Company", "properties": {"name": "Ganfeng Lithium Co Ltd"}},
+                        {"id": "1", "label": "Company", "properties": {"name": "CATL"}},
+                    ],
+                    "relationships": [{"type": "suppliesTo", "start_node_id": "0", "end_node_id": "1",
+                        "properties": {"evidence": SECOND_DOCUMENT.splitlines()[0]}}],
+                })
+            return super()._answer(prompt)
+
     directory = corpus(tmp_path, DOCUMENT_TEXT, SECOND_DOCUMENT)
-    run_ingest(ingest_config, connection, StubLLM(), ontology, None, directory)
+    run_ingest(ingest_config, connection, SourceAwareLLM(), ontology, None, directory)
     facts = pd.read_parquet(ingest_config["storage"]["extracted_facts"])
     assert facts.doc_id.nunique() == 2
     # fact ids are deterministic, so nothing is duplicated

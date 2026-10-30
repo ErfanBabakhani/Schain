@@ -14,4 +14,4 @@ ingest:
   file_patterns: ["*.txt", "*.md", "*.pdf"]
   chunk_size: 2000
   chunk_overlap: 200
-  on_error: IGNORE             # IGNORE = log and skip a failed chunk | RAISE = stop
+  on_error: RAISE             # RAISE preserves failed chunks for resume; IGNORE allows partial documents

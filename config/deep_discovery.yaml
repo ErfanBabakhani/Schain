@@ -1,0 +1,87 @@
+include:
+  - config/expansion.yaml
+
+# Versioned policy persisted with a distributed experiment by the maintenance CLI.
+discovery_profile:
+  name: deep_discovery
+  version: deep_discovery_v1
+
+expansion:
+  max_tier: 5
+  # A distributed task expands one company. The experiment-wide ceiling is enforced
+  # separately in PostgreSQL, so this must not silently cap the approved tier maxima.
+  max_documents: 200
+  max_documents_per_run: 200
+  max_documents_per_experiment: 20000
+
+  retrieval:
+    target_documents_per_entity: 80
+    max_documents_per_entity: 200
+    target_documents_by_tier: {0: 80, 1: 80, 2: 60, 3: 50, 4: 40, 5: 0}
+    max_documents_by_tier: {0: 200, 1: 160, 2: 120, 3: 100, 4: 80, 5: 0}
+    max_full_text_fetches_per_entity: 250
+    max_title_lookups_per_entity: 100
+    max_candidates_per_entity: 600
+    max_full_text_fetches_per_domain: 30
+    max_candidates_per_domain: 20
+    query_planner_enabled: true
+    query_planner_max_categories: 12
+    query_planner_max_queries: 30
+    max_initial_query_variants: 30
+    alias_query_max: 2
+    zero_yield_rescue: true
+    # Adaptive stopping uses independent source/query-family coverage. A raw streak
+    # alone is never enough to declare an entity exhausted.
+    zero_gain_patience: 12
+    min_documents_before_diminishing_returns: 20
+    min_query_families_before_stop: 4
+    min_source_domains_before_stop: 6
+    recovery_rounds: 4
+
+  search:
+    defaults:
+      max_results: 20
+      # General web and disclosures lead; news remains one source, not the budget.
+      providers: [general_web, gdelt, google_news, wikipedia]
+      max_results_by_provider:
+        general_web: 30
+        gdelt: 24
+        google_news: 12
+        wikipedia: 5
+    tiers:
+      0: &deep_queries
+        queries:
+          - {query: 'supplies "{entity}"'}
+          - {query: '"supplier to" "{entity}"'}
+          - {query: '"supplier of" "{entity}"'}
+          - {query: '"{entity}" suppliers'}
+          - {query: '"{entity}" key suppliers'}
+          - {query: '"{entity}" major suppliers'}
+          - {query: '"{entity}" approved vendors'}
+          - {query: '"{entity}" vendor list'}
+          - {query: '"{entity}" procurement suppliers'}
+          - {query: '"{entity}" procurement contract'}
+          - {query: '"{entity}" purchases from'}
+          - {query: '"{entity}" sources from'}
+          - {query: '"{entity}" manufacturing partners components'}
+          - {query: '"{entity}" component suppliers'}
+          - {query: '"{entity}" raw material suppliers'}
+          - {query: '"{entity}" semiconductor suppliers'}
+          - {query: '"{entity}" battery suppliers'}
+          - {query: '"{entity}" steel supplier'}
+          - {query: '"{entity}" chemical supplier'}
+          - {query: '"{entity}" equipment supplier'}
+          - {query: '"{entity}" supplier award'}
+          - {query: '"{entity}" official supplier portal'}
+          - {query: '"{entity}" annual report suppliers'}
+          - {query: '"{entity}" sustainability report suppliers'}
+          - {query: '"{entity}" sourcing report'}
+          - {query: '"{entity}" supply chain report'}
+          - {query: '"{entity}" procurement report filetype:pdf'}
+          - {query: '"{entity}" suppliers filetype:pdf'}
+      1: *deep_queries
+      2: *deep_queries
+      3: *deep_queries
+      4: *deep_queries
+      5:
+        expand: false

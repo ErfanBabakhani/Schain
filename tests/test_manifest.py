@@ -151,7 +151,7 @@ def test_summary_counts_agree_with_the_rows(tmp_path):
     assert summary["snippet_only_documents"] == 1
     assert summary["relevant_documents"] == 2
     assert summary["irrelevant_documents"] == 1
-    assert summary["sent_to_prompt1"] == 2      # PROCESSED + FAILED
+    assert summary["sent_to_prompt1"] == 1      # one unique URL, two audit rows
     assert summary["prompt1_failures"] == 1
     assert summary["by_provider"] == {"gdelt": 1, "google_news": 1, "general_web": 1}
     assert summary["by_tier"] == {"0": 2, "1": 1}
@@ -215,7 +215,7 @@ def test_retrieval_records_fetch_dedup_and_relevance(one_provider_config, connec
     assert ("https://a.test/1", mf.DUPLICATE_URL) in rows
     irrelevant = rows[("https://b.test/2", mf.UNIQUE)]
     assert irrelevant["relevance_status"] == mf.IRRELEVANT
-    assert irrelevant["error"] == "HTTP_404"
+    assert irrelevant["error"] == "http_404"
 
 
 # --- through a whole EXPAND run -------------------------------------------------------
@@ -226,9 +226,11 @@ def test_expand_writes_a_manifest_and_a_summary(expand_config, connection, ontol
     import logging
 
     expand_config["seeds"] = {"oem": ["BMW"]}
-    expand_config["expansion"]["max_tier"] = 0
+    expand_config["expansion"]["max_tier"] = 1
 
-    def fake_retrieval(config, entity_name, entity_key, tier, connection, manifest=None):
+    def fake_retrieval(config, entity_name, entity_key, tier, connection, manifest=None, **_kwargs):
+        if tier > 0:
+            return []
         candidates = [
             result(url="https://news.test/used", text=DOCUMENT_TEXT),
             result(url="https://news.test/dup", text=DOCUMENT_TEXT),   # same content
@@ -269,11 +271,13 @@ def test_prompt1_failure_is_distinguished_from_a_later_failure(
     from .conftest import FailingLLM
 
     expand_config["seeds"] = {"oem": ["BMW"]}
-    expand_config["expansion"]["max_tier"] = 0
+    expand_config["expansion"]["max_tier"] = 1
     expand_config["runtime"]["max_consecutive_failures"] = 10
 
-    def fake_retrieval(config, entity_name, entity_key, tier, connection, manifest=None):
-        candidate = result(url="https://news.test/x", text=DOCUMENT_TEXT)
+    def fake_retrieval(config, entity_name, entity_key, tier, connection, manifest=None, **_kwargs):
+        if tier > 0:
+            return []
+        candidate = result(url="https://news.test/x", text=DOCUMENT_TEXT, query="q")
         manifest.record_candidate(entity_name, tier, "gdelt", "NEWS", "q", 1, candidate)
         return [candidate]
 
@@ -289,10 +293,12 @@ def test_prompt1_failure_is_distinguished_from_a_later_failure(
 def test_resume_does_not_duplicate_manifest_rows(expand_config, connection, ontology,
                                                  tmp_path, monkeypatch):
     expand_config["seeds"] = {"oem": ["BMW"]}
-    expand_config["expansion"]["max_tier"] = 0
+    expand_config["expansion"]["max_tier"] = 1
 
-    def fake_retrieval(config, entity_name, entity_key, tier, connection, manifest=None):
-        candidate = result(url="https://news.test/x", text=DOCUMENT_TEXT)
+    def fake_retrieval(config, entity_name, entity_key, tier, connection, manifest=None, **_kwargs):
+        if tier > 0:
+            return []
+        candidate = result(url="https://news.test/x", text=DOCUMENT_TEXT, query="q")
         manifest.record_candidate(entity_name, tier, "gdelt", "NEWS", "q", 1, candidate)
         return [candidate]
 

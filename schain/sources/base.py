@@ -7,6 +7,7 @@ no extraction, no deduplication and no filtering - that happens once, in retriev
 from __future__ import annotations
 
 import logging
+from contextvars import ContextVar
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -20,6 +21,7 @@ USER_AGENT = "schain-kg/0.1 (supply-chain knowledge graph research pipeline)"
 # Values of SearchResult.content_source, recorded as document provenance.
 FULL_TEXT = "full_text"
 TITLE_SNIPPET = "title_snippet"
+request_error: ContextVar[Optional[str]] = ContextVar("retrieval_request_error", default=None)
 
 
 @dataclass
@@ -40,6 +42,25 @@ class SearchResult:
     retrieved_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat(timespec="seconds")
     )
+    # Provenance enrichment (optional; filled after retrieval).
+    retrieval_url: Optional[str] = None
+    canonical_source_url: Optional[str] = None
+    source_domain: Optional[str] = None
+    publisher_name: Optional[str] = None
+    publisher_url: Optional[str] = None
+    raw_title: Optional[str] = None
+    canonical_resolution_attempted: bool = False
+    title_lookup_attempted: bool = False
+    full_text_attempted: bool = False
+    fetch_status_code: Optional[int] = None
+    fetch_error: Optional[str] = None
+    fetched_text: Optional[str] = None  # retained when a body is unusable and fallback is selected
+    content_selection_reason: Optional[str] = None
+    discovery_direction: Optional[str] = None
+    discovery_rank: Optional[float] = None
+    selection_reason: Optional[str] = None
+    document_type: Optional[str] = None
+    escalation_stage: Optional[str] = None
 
     @property
     def content_source(self) -> str:
@@ -51,7 +72,10 @@ class SearchResult:
         return FULL_TEXT if self.text else TITLE_SNIPPET
 
     def as_row(self) -> dict[str, Any]:
-        return {**asdict(self), "content_source": self.content_source}
+        row = {**asdict(self), "content_source": self.content_source}
+        if not row.get("retrieval_url"):
+            row["retrieval_url"] = self.url
+        return row
 
     def document_text(self) -> str:
         """Best available text: the fetched body, otherwise title and snippet.
@@ -62,7 +86,7 @@ class SearchResult:
         """
         if self.text:
             return self.text
-        parts = [self.title, self.snippet]
+        parts = list(dict.fromkeys([self.title, self.snippet]))
         return "\n".join(part for part in parts if part).strip()
 
 
@@ -91,6 +115,7 @@ async def get_json(
         response.raise_for_status()
         return response.json()
     except (httpx.HTTPError, ValueError) as error:
+        request_error.set(type(error).__name__)
         logger.warning("request to %s failed: %s", url, error)
         return None
 
@@ -102,6 +127,7 @@ async def get_text(client: httpx.AsyncClient, url: str) -> Optional[str]:
         response.raise_for_status()
         return response.text
     except httpx.HTTPError as error:
+        request_error.set(type(error).__name__)
         logger.warning("request to %s failed: %s", url, error)
         return None
 
@@ -109,20 +135,22 @@ async def get_text(client: httpx.AsyncClient, url: str) -> Optional[str]:
 async def fetch_article_text(
     client: httpx.AsyncClient, url: str
 ) -> tuple[Optional[str], Optional[int], Optional[str]]:
-    """Fetch a page and extract its article body.
+    """Fetch a page and extract its article body (HTML or text PDF).
 
     Returns ``(text, http_status, error)``. The error is a short code the retrieval
     manifest records - HTTP_403, TIMEOUT, PARSE_FAILED, EMPTY_CONTENT - rather than an
     exception type, because it is written to a CSV a human reads later.
 
-    Boilerplate removal is done by trafilatura, the established tool for this; writing an
-    HTML-to-text extractor by hand would be reimplementing a solved problem.
+    Boilerplate removal is done by trafilatura for HTML. Text PDFs use pypdf when
+    available; OCR is not required for normal digital PDFs.
     """
     status: Optional[int] = None
     try:
         response = await client.get(url)
         status = response.status_code
         response.raise_for_status()
+        content_type = (response.headers.get("content-type") or "").casefold()
+        raw = response.content
         html = response.text
     except httpx.TimeoutException:
         logger.debug("timeout fetching %s", url)
@@ -135,11 +163,20 @@ async def fetch_article_text(
         logger.debug("request to %s failed: %s", url, error)
         return None, status, "FETCH_FAILED"
 
+    looks_pdf = (
+        "application/pdf" in content_type
+        or url.casefold().endswith(".pdf")
+        or raw[:5] == b"%PDF-"
+    )
+    if looks_pdf:
+        text, error = _extract_pdf_text(raw)
+        if text:
+            return text, status, None
+        return None, status, error or "PARSE_FAILED"
+
     try:
         import trafilatura
     except ImportError as error:
-        # A broken install would otherwise disable full-text extraction everywhere and
-        # look like every page simply failing to parse, so say so once and loudly.
         logger.warning(
             "trafilatura is unavailable (%s); all retrieved documents will fall back to "
             "title and snippet. Reinstall the project dependencies.", error,
@@ -155,3 +192,28 @@ async def fetch_article_text(
     if not text:
         return None, status, "EMPTY_CONTENT"
     return text, status, None
+
+
+def _extract_pdf_text(raw: bytes) -> tuple[Optional[str], Optional[str]]:
+    """Extract text from a digital PDF. No OCR."""
+    try:
+        from io import BytesIO
+        from pypdf import PdfReader
+    except ImportError:
+        try:
+            from io import BytesIO
+            from PyPDF2 import PdfReader  # type: ignore
+        except ImportError:
+            return None, "PDF_SUPPORT_MISSING"
+    try:
+        reader = PdfReader(BytesIO(raw))
+        pages = []
+        for page in reader.pages:
+            pages.append(page.extract_text() or "")
+        text = "\n".join(pages).strip()
+        if not text:
+            return None, "EMPTY_CONTENT"
+        return text, None
+    except Exception as error:  # noqa: BLE001
+        logger.debug("pdf extraction failed: %s", error)
+        return None, "PARSE_FAILED"

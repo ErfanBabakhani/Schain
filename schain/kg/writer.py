@@ -13,10 +13,12 @@ endpoints without knowing their type.
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Any, Iterable, Optional
 
 import neo4j
+import pandas as pd
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +65,10 @@ def merge_nodes(
     for node in nodes:
         by_label.setdefault(node["label"], []).append(node)
 
-    for label, rows in by_label.items():
+    entity_types = tuple(entity_types)
+    for label in by_label:
         _validate(label, entity_types, "entity label")
+    for label, rows in by_label.items():
         query = (
             "UNWIND $rows AS row "
             f"MERGE (e:{label}:Entity {{canonical_id: row.canonical_id}}) "
@@ -90,31 +94,69 @@ def merge_relationships(
 ) -> int:
     """MERGE relationships, one statement per relation type.
 
-    ``source_doc_ids`` accumulates the documents a relationship was seen in, so the same
-    fact arriving from a second document is recorded without creating a second edge.
+    Each semantic edge retains all source documents and quote-to-document records.
+    Neo4j properties cannot hold a list of maps, so ``evidence_records`` is a list of
+    JSON strings. Stable serialization makes repeated writes idempotent. The original
+    scalar ``evidence`` property remains available to older Cypher queries.
     """
     written = 0
     by_type: dict[str, list[dict[str, Any]]] = {}
     for relationship in relationships:
-        by_type.setdefault(relationship["type"], []).append(relationship)
+        row = dict(relationship)
+        record = {
+            key: _property_value(row.get(key))
+            for key in (
+                "fact_id", "doc_id", "chunk_index", "evidence", "source_url",
+                "canonical_source_url", "retrieval_url", "model",
+                "validation_status", "ontology_valid", "evidence_validated",
+                "evidence_quote_grounded", "direction_explicit",
+            )
+        }
+        row["evidence_record"] = json.dumps(
+            record, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+            allow_nan=False,
+        )
+        row["fact_ids"] = [record["fact_id"]] if record["fact_id"] else []
+        row["source_urls"] = sorted({
+            record[key] for key in ("source_url", "canonical_source_url", "retrieval_url")
+            if record[key]
+        })
+        by_type.setdefault(row["type"], []).append(row)
 
-    for relation_type, rows in by_type.items():
+    relation_types = tuple(relation_types)
+    for relation_type in by_type:
         _validate(relation_type, relation_types, "relation type")
+    for relation_type, rows in by_type.items():
         query = (
             "UNWIND $rows AS row "
             "MATCH (a:Entity {canonical_id: row.start_id}) "
             "MATCH (b:Entity {canonical_id: row.end_id}) "
             f"MERGE (a)-[r:{relation_type}]->(b) "
             "ON CREATE SET r.first_seen_doc_id = row.doc_id "
-            "SET r.evidence = row.evidence, "
+            "SET r.evidence = coalesce(r.evidence, row.evidence), "
             "    r.source_doc_ids = [d IN coalesce(r.source_doc_ids, []) "
-            "                        WHERE d <> row.doc_id] + [row.doc_id]"
+            "                        WHERE d <> row.doc_id] + [row.doc_id], "
+            "    r.fact_ids = [f IN coalesce(r.fact_ids, []) "
+            "                  WHERE NOT f IN row.fact_ids] + row.fact_ids, "
+            "    r.source_urls = [u IN coalesce(r.source_urls, []) "
+            "                     WHERE NOT u IN row.source_urls] + row.source_urls, "
+            "    r.evidence_records = [v IN coalesce(r.evidence_records, []) "
+            "                          WHERE v <> row.evidence_record] + [row.evidence_record]"
         )
         for batch in _batched(rows, batch_size):
             driver.execute_query(query, rows=batch, database_=database)
         written += len(rows)
         logger.info("merged %d %s relationship(s)", len(rows), relation_type)
     return written
+
+
+def _property_value(value: Any) -> Any:
+    """Convert nullable pandas scalars to JSON/Neo4j-compatible property values."""
+    if value is None or pd.isna(value):
+        return None
+    if hasattr(value, "item"):
+        return value.item()
+    return value
 
 
 def facts_to_graph_rows(
@@ -149,6 +191,14 @@ def facts_to_graph_rows(
                 "end_id": row["object_id"],
                 "evidence": row["evidence"],
                 "doc_id": row["doc_id"],
+                **{
+                    field: _property_value(row.get(field))
+                    for field in (
+                        "fact_id", "chunk_index", "source_url", "canonical_source_url",
+                        "retrieval_url", "model", "validation_status", "ontology_valid",
+                        "evidence_validated", "evidence_quote_grounded", "direction_explicit",
+                    )
+                },
             }
         )
     return list(nodes.values()), relationships
