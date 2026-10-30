@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="color-scheme" content="dark" />
+  <title>SChain Graph Explorer</title>
+  <meta name="description" content="Interactive evidence-first supply-chain graph explorer." />
+  <link rel="stylesheet" href="assets/css/styles.css" />
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <button class="brand" id="brandBtn" aria-label="Reset explorer">
+        <span class="brand-mark">S</span>
+        <span class="brand-copy"><strong>SChain</strong><small>Graph Explorer</small></span>
+      </button>
+
+      <div class="top-context">
+        <span id="datasetTitle" class="dataset-title">Supply chain graph</span>
+        <span id="datasetMeta" class="dataset-meta"></span>
+      </div>
+
+      <div class="top-actions">
+        <details class="dataset-menu" id="datasetMenu">
+          <summary class="dataset-trigger"><span class="dataset-dot"></span><span>Dataset</span><span class="chevron">⌄</span></summary>
+          <div class="menu-popover dataset-popover">
+            <select id="datasetSelect" class="field" aria-label="Dataset"></select>
+            <div class="menu-separator"></div>
+            <button id="openJsonBtn" class="menu-item">Open JSON</button>
+            <button id="downloadJsonBtn" class="menu-item">Export JSON</button>
+            <input id="jsonInput" type="file" accept=".json,application/json" multiple hidden />
+          </div>
+        </details>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <section class="graph-panel">
+        <header class="graph-toolbar">
+          <div class="toolbar-cluster view-cluster">
+            <div class="segmented view-mode" id="viewMode" aria-label="Graph mode">
+              <button class="active" data-view="tiered">Tiered</button>
+              <button data-view="network">Network</button>
+              <button data-view="supply">Upstream</button>
+              <button data-view="global">All</button>
+            </div>
+            <select id="focalCompany" class="compact-select focal-select" aria-label="Upstream focal company"></select>
+          </div>
+
+          <div class="toolbar-spacer"></div>
+
+          <div class="toolbar-cluster">
+            <div class="segmented entity-scope-mode" id="entityScopeMode" aria-label="Entity scope">
+              <button class="active" data-entity-scope="all">All entities</button>
+              <button data-entity-scope="companies">Companies</button>
+            </div>
+            <div class="segmented dimension-mode" id="dimensionMode" aria-label="Dimension">
+              <button class="active" data-dimension="3d">3D</button>
+              <button data-dimension="2d">2D</button>
+            </div>
+            <div class="search-box">
+              <span class="search-icon">⌕</span>
+              <input id="entitySearch" type="search" placeholder="Search" autocomplete="off" />
+              <div id="searchResults" class="search-results"></div>
+            </div>
+            <div class="popover-wrap">
+              <button id="filterBtn" class="tool-btn">Filters</button>
+              <div id="filterPopover" class="filter-popover" hidden>
+                <div class="filter-group">
+                  <div class="filter-head"><span>Relation</span><button id="relationAll" class="mini-action">All</button></div>
+                  <div id="relationFilters" class="filter-list"></div>
+                </div>
+                <div class="filter-group">
+                  <div class="filter-head"><span>Tier</span><button id="tierAll" class="mini-action">All</button></div>
+                  <div id="tierFilters" class="filter-list compact"></div>
+                </div>
+              </div>
+            </div>
+            <label class="toggle-btn"><input id="labelsToggle" type="checkbox"><span>Labels</span></label>
+            <button id="fitBtn" class="tool-btn icon-only" title="Fit graph">⌗</button>
+          </div>
+        </header>
+
+        <div id="focusBar" class="focus-bar" hidden>
+          <button id="exitFocusBtn" class="back-btn" type="button" title="Return to the full graph">← Defocus</button>
+          <div class="focus-copy">
+            <strong id="focusTitle">Focused graph</strong>
+            <span id="focusMeta"></span>
+          </div>
+          <div class="focus-spacer"></div>
+          <label class="context-toggle"><input id="contextToggle" type="checkbox"><span>Context</span></label>
+        </div>
+
+        <div id="selectionBar" class="selection-bar" hidden>
+          <div id="selectionChips" class="selection-chips"></div>
+          <div class="selection-spacer"></div>
+          <button id="clearSelectionBtn" class="selection-clear">Clear</button>
+          <button id="openDetailsBtn" class="primary-btn">Details</button>
+        </div>
+
+        <div id="graphStage" class="graph-stage">
+          <canvas id="graphCanvas"></canvas>
+          <div id="graphLegend" class="graph-legend"></div>
+          <div class="graph-counts"><strong id="visibleNodeCount">0</strong><span>entities</span><i></i><strong id="visibleEdgeCount">0</strong><span>facts</span></div>
+          <div id="graphEmptyState" class="empty-state" hidden><strong>No results</strong></div>
+          <div id="dropOverlay" class="drop-overlay"><strong>Drop JSON</strong></div>
+        </div>
+      </section>
+
+      <aside class="side-panel">
+        <header class="side-head">
+          <div class="side-title-wrap">
+            <h2 id="sideTitle">Explorer</h2>
+            <span id="sideMeta"></span>
+          </div>
+          <div id="panelScopeToggle" class="segmented tiny" hidden>
+            <button class="active" data-panel-scope="visible">Visible</button>
+            <button data-panel-scope="selected">Selected</button>
+          </div>
+        </header>
+
+        <nav class="side-tabs" id="sideTabs">
+          <button class="active" data-side-tab="info">Info</button>
+          <button data-side-tab="evidence">Evidence</button>
+          <button data-side-tab="sources">Sources</button>
+        </nav>
+
+        <div id="sideTools" class="side-tools" hidden>
+          <div class="panel-search">
+            <span>⌕</span>
+            <input id="panelSearch" type="search" placeholder="Filter" autocomplete="off" />
+          </div>
+          <div class="panel-filter-wrap">
+            <button id="panelFilterBtn" class="panel-filter-btn">Filter</button>
+            <div id="panelFilterPopover" class="panel-filter-popover" hidden>
+              <label><span>Relation</span><select id="panelRelationFilter"></select></label>
+              <label><span>Source</span><select id="panelContentFilter"><option value="all">All</option><option value="full_text">Full text</option><option value="title_snippet">Title / snippet</option></select></label>
+              <label><span>Score</span><select id="panelScoreFilter"><option value="0">All</option><option value="60">60+</option><option value="75">75+</option></select></label>
+            </div>
+          </div>
+        </div>
+
+        <div id="sideContent" class="side-content"></div>
+      </aside>
+    </main>
+  </div>
+
+  <div id="evidenceModal" class="source-modal" hidden>
+    <div class="source-modal-backdrop" data-modal-close></div>
+    <section class="source-modal-dialog" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <header class="source-modal-head">
+        <div class="source-modal-title-wrap">
+          <span id="modalDomain" class="source-domain"></span>
+          <h3 id="modalTitle">Evidence source</h3>
+        </div>
+        <div class="source-modal-actions">
+          <button id="modalCloseBtn" class="modal-close" aria-label="Close">×</button>
+        </div>
+      </header>
+      <div class="source-modal-quote" id="modalQuote"></div>
+      <div class="source-content-wrap">
+        <div id="evidenceContent" class="evidence-content-view">
+          <div class="content-loading">Loading source context…</div>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <script src="assets/js/demo-data.js"></script>
+  <script src="assets/js/app.js"></script>
+</body>
+</html>
