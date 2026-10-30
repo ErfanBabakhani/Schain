@@ -37,12 +37,26 @@ secret_state() { [ -n "${!1:-}" ] && echo "set" || echo "not set"; }
 
 # --- project configuration ---------------------------------------------------------
 
+# Inspection must also work before server_run.sh has created .venv. Prefer the project
+# interpreter, then an available Python for read-only configuration and driver probes.
+# The workload still runs only in the managed project .venv.
+inspection_python() {
+    if [ -x "$VENV_PY" ]; then
+        printf '%s\n' "$VENV_PY"
+    else
+        command -v python3
+    fi
+}
+
 # Read the values the scripts need straight from the project's config loader, so the
 # shell and the application can never disagree about model, endpoint or paths.
 # Usage: eval "$(config_values config/expansion.yaml)"
-config_values() {
+config_values() (
     local config_file="$1"
-    "$VENV_PY" - "$config_file" <<'PY'
+    local inspect_py
+    inspect_py="$(inspection_python)" || return 1
+    cd "$REPO_ROOT" || return 1
+    "$inspect_py" - "$config_file" <<'PY'
 import shlex
 import sys
 
@@ -64,7 +78,7 @@ emit("CFG_NEO4J_URI", neo4j["uri"])
 emit("CFG_NEO4J_DATABASE", neo4j["database"])
 emit("CFG_STATE_DB", resolve_path(config["storage"]["state_db"]))
 PY
-}
+)
 
 # --- service health ----------------------------------------------------------------
 
@@ -78,20 +92,20 @@ neo4j_port() { local u="${1##*:}"; printf '%s' "${u%%/*}"; }
 # TCP reachability, using bash's own /dev/tcp so no extra tool is required.
 tcp_open() {
     local host="$1" port="$2" timeout="${3:-2}"
-    timeout "$timeout" bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null
+    timeout "$timeout" bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null
 }
 
 # A TCP connect only proves that something is listening on the port - any unrelated
 # process holding 7687 would look like Neo4j. The reuse-or-start decision depends on this
 # answer, so confirm with the project's own driver, exactly as the pipeline will.
 neo4j_reachable() {
-    local uri="$1"
+    local uri="$1" inspect_py
     tcp_open "$(neo4j_host "$uri")" "$(neo4j_port "$uri")" 2 || return 1
-    [ -x "$VENV_PY" ] || return 0     # cannot verify further; the port is open
     [ -n "${SCHAIN_NEO4J_SKIP_BOLT_CHECK:-}" ] && return 0
+    inspect_py="$(inspection_python)" || return 1
     # Hard timeout: the driver completes the TCP connect and then waits indefinitely for
     # a Bolt handshake that a non-Neo4j listener never sends.
-    timeout "${SCHAIN_NEO4J_PROBE_TIMEOUT:-8}" "$VENV_PY" - "$uri" <<'NEO4JCHECK' 2>/dev/null
+    timeout "${SCHAIN_NEO4J_PROBE_TIMEOUT:-8}" "$inspect_py" - "$uri" <<'NEO4JCHECK' 2>/dev/null
 import os
 import sys
 

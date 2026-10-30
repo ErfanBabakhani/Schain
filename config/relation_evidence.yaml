@@ -1,0 +1,161 @@
+# Executable relation policy; .* is a bounded phrase within one clause.
+# Cues guide checks and entailment. One explicit valid source is sufficient.
+version: 2
+suppliesTo:
+  description: 'Directional supplier → customer. Accept only when the evidence makes
+    the supplier and customer roles explicit. Never guess direction from a bilateral
+    deal.
+
+    '
+  positive:
+  - supply
+  - supplies
+  - supplied
+  - supplier to
+  - supplier for
+  - delivers
+  - deliver
+  - delivered
+  - selected .* supplier
+  - selects .* supplier
+  - chose .* supplier
+  - names .* supplier
+  - named .* supplier
+  - sources .* from
+  - source .* from
+  - sourced .* from
+  - sourcing .* from
+  - purchases .* from
+  - purchased .* from
+  - buys .* from
+  - bought .* from
+  - procured .* from
+  insufficient:
+  - partners with
+  - partnered with
+  - partnership with
+  - collaborates with
+  - collaborated with
+  - collaboration with
+  - strategic pact
+  - strategic partnership
+  - strategic alliance
+  - works with
+  - working with
+  - cooperation agreement
+  - cooperates with
+  - signed an agreement with
+  - signed a deal with
+  - memorandum of understanding
+  - mou with
+  ambiguous:
+  - supply agreement with
+  - supply deal with
+  - sourcing agreement with
+  - procurement agreement with
+  - offtake agreement with
+  direction_templates_supplier_first:
+  # Bounded same-clause gap permits a subject appositive, e.g.
+  # "Rimac Technology, a Croatian company, supplies ... to BMW".
+  - '{subject} .* supplies .* to {object}'
+  - '{subject} .* supplied .* to {object}'
+  - '{subject} .* will supply .* to {object}'
+  - '{subject} supplies {object}'
+  - '{subject} supplies .* to {object}'
+  - '{subject} supply {object}'
+  - '{subject} supply .* to {object}'
+  - '{subject} supplied {object}'
+  - '{subject} supplied .* to {object}'
+  - '{subject} will supply .* to {object}'
+  - '{subject} is a supplier to {object}'
+  - '{subject} is a supplier for {object}'
+  - '{subject} supplier to {object}'
+  - '{subject} supplier for {object}'
+  - '{subject} delivers .* to {object}'
+  - '{subject} deliver .* to {object}'
+  - '{subject} delivered .* to {object}'
+  - '{subject} will deliver .* to {object}'
+  - '{subject} provides .* to {object}'
+  - '{subject} provided .* to {object}'
+  - '{subject} will supply {object}'
+  - '{subject} to supply {object}'
+  - '{subject} to supply .* to {object}'
+  - '{subject} is supplier to {object}'
+  - '{subject} is supplier for {object}'
+  direction_templates_customer_first:
+  - '{object} selects {subject} as .* supplier'
+  - '{object} selected {subject} as .* supplier'
+  - '{object} chose {subject} as .* supplier'
+  - '{object} chooses {subject} as .* supplier'
+  - '{object} names {subject} .* supplier'
+  - '{object} named {subject} .* supplier'
+  - '{object} sources .* from {subject}'
+  - '{object} source .* from {subject}'
+  - '{object} sourced .* from {subject}'
+  - '{object} sourcing .* from {subject}'
+  - '{object} purchases .* from {subject}'
+  - '{object} purchased .* from {subject}'
+  - '{object} buys .* from {subject}'
+  - '{object} bought .* from {subject}'
+  - '{object} procures .* from {subject}'
+  - '{object} procured .* from {subject}'
+produces:
+  positive:
+  - produces
+  - manufactures
+  - makes
+  - builds
+  - fabricates
+  - manufactured in-house
+  - produces in-house
+  - manufacturing
+  insufficient:
+  - uses
+  - features
+  - contains
+  - equipped with
+  - powered by
+  - paired with
+  - rides on
+  - draws power from
+  - fitted with
+owns:
+  positive:
+  - owns
+  - owned by
+  - acquired
+  - acquisition of
+  - parent company of
+  - subsidiary of
+  - is a subsidiary of
+  - majority-owned
+  - wholly owned
+  - completed acquisition
+  - controlled by
+  insufficient:
+  - works for
+  - appointed as
+  - manages
+  - partners with
+  - collaborates with
+  - strategic relationship
+  - agreed to buy
+  - plans to acquire
+  - will acquire
+  - bid for
+  - intending to acquire
+  - proposed acquisition
+  - seeking to acquire
+locatedIn:
+  positive:
+  - located in
+  - headquartered in
+  - based in
+  - facility in
+  - plant in
+  - factory in
+  insufficient:
+  - near
+  - along
+  - disrupted
+  - weather in

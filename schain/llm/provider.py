@@ -10,13 +10,145 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from neo4j_graphrag.llm import LLMInterface, OpenAILLM
+from neo4j_graphrag.utils.rate_limit import RetryRateLimitHandler
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_VLLM_BASE_URL = "http://localhost:8000/v1"
+
+
+class RuntimeDeadlineExceeded(TimeoutError):
+    """No new model call may start after the experiment deadline."""
+
+
+def _public_endpoint(url: str | None) -> str | None:
+    if not url:
+        return url
+    try:
+        parts = urlsplit(url)
+        return urlunsplit((parts.scheme, parts.netloc.rsplit("@", 1)[-1], parts.path, "", ""))
+    except ValueError:
+        return "<configured endpoint>"
+
+
+class MeasuredLLM:
+    """Transparent per-document API-call meter, including failed calls.
+
+    Counts application invocations, not hidden HTTP attempts. The production client
+    explicitly disables layered SDK/rate-handler retries by default below.
+    """
+
+    def __init__(
+        self,
+        llm,
+        metrics: dict[str, Any],
+        deadline: float | None = None,
+        audit=None,
+    ) -> None:
+        self._schain_wrapped_llm = llm
+        self.metrics = metrics
+        self.stage = "extraction"
+        self.deadline = deadline
+        self.audit = audit
+
+    def __getattr__(self, name):
+        return getattr(self._schain_wrapped_llm, name)
+
+    def _begin(self) -> tuple[str, float]:
+        if self.deadline is not None and time.monotonic() >= self.deadline:
+            self.metrics["stop_reason"] = "runtime_deadline"
+            raise RuntimeDeadlineExceeded("runtime deadline reached before model call")
+        stage = self.stage
+        self.metrics["llm_calls"] = self.metrics.get("llm_calls", 0) + 1
+        counts = self.metrics.setdefault("llm_calls_by_stage", {})
+        counts[stage] = counts.get(stage, 0) + 1
+        return stage, time.monotonic()
+
+    def _finish(self, stage: str, started: float) -> None:
+        times = self.metrics.setdefault("llm_seconds_by_stage", {})
+        times[stage] = round(times.get(stage, 0.0) + time.monotonic() - started, 4)
+
+    @staticmethod
+    def _audit_request(args, kwargs) -> dict[str, Any]:
+        """Describe the real invocation boundary without reconstructing a prompt."""
+        return {
+            "input": args[0] if args else kwargs.get("input"),
+            "message_history": (
+                args[1] if len(args) > 1 else kwargs.get("message_history")
+            ),
+            "system_instruction": (
+                args[2] if len(args) > 2 else kwargs.get("system_instruction")
+            ),
+            "keyword_arguments": {
+                key: value for key, value in kwargs.items()
+                if key not in {"input", "message_history", "system_instruction"}
+            },
+        }
+
+    def invoke(self, *args, **kwargs):
+        stage, started = self._begin()
+        audit_started = None
+        if self.audit is not None and self.audit.enabled:
+            audit_started = self.audit.llm_started(
+                stage=stage,
+                request=self._audit_request(args, kwargs),
+                model=getattr(self, "model_name", None),
+                parameters=getattr(self, "model_params", None),
+            )
+        try:
+            response = self._schain_wrapped_llm.invoke(*args, **kwargs)
+            if audit_started is not None:
+                self.audit.llm_finished(
+                    stage=stage,
+                    started=audit_started,
+                    response=response,
+                )
+            return response
+        except Exception as error:
+            if audit_started is not None:
+                self.audit.llm_finished(
+                    stage=stage,
+                    started=audit_started,
+                    error=error,
+                )
+            raise
+        finally:
+            self._finish(stage, started)
+
+    async def ainvoke(self, *args, **kwargs):
+        stage, started = self._begin()
+        audit_started = None
+        if self.audit is not None and self.audit.enabled:
+            audit_started = self.audit.llm_started(
+                stage=stage,
+                request=self._audit_request(args, kwargs),
+                model=getattr(self, "model_name", None),
+                parameters=getattr(self, "model_params", None),
+            )
+        try:
+            response = await self._schain_wrapped_llm.ainvoke(*args, **kwargs)
+            if audit_started is not None:
+                self.audit.llm_finished(
+                    stage=stage,
+                    started=audit_started,
+                    response=response,
+                )
+            return response
+        except Exception as error:
+            if audit_started is not None:
+                self.audit.llm_finished(
+                    stage=stage,
+                    started=audit_started,
+                    error=error,
+                )
+            raise
+        finally:
+            self._finish(stage, started)
 
 
 def llm_is_configured(config: dict[str, Any]) -> bool:
@@ -36,6 +168,15 @@ def build_llm(config: dict[str, Any]) -> LLMInterface:
         raise ValueError("llm.model is not set in the config file")
 
     model_params: dict[str, Any] = {"temperature": llm_config.get("temperature", 0.0)}
+    if llm_config.get("max_tokens") is not None:
+        max_tokens = int(llm_config["max_tokens"])
+        if max_tokens <= 0:
+            raise ValueError("llm.max_tokens must be positive")
+        model_params["max_tokens"] = max_tokens
+    client_retries = int(llm_config.get("client_max_retries", 0))
+    rate_attempts = int(llm_config.get("rate_limit_max_attempts", 1))
+    if client_retries < 0 or rate_attempts < 1:
+        raise ValueError("LLM retry limits must be non-negative retries / positive attempts")
 
     # JSON mode makes the server guarantee parseable JSON. It is set independently of
     # structured_output: Prompt 1's schema-constrained path passes its own response_format
@@ -69,13 +210,18 @@ def build_llm(config: dict[str, Any]) -> LLMInterface:
 
     logger.info(
         "llm provider=%s model=%s base_url=%s json_mode=%s structured_output=%s",
-        provider, model, base_url,
+        provider, model, _public_endpoint(base_url),
         "response_format" in model_params, llm_config.get("structured_output", False),
     )
+    logger.info("llm request timeout=%ss max_tokens=%s SDK retries=%d rate attempts=%d",
+                llm_config.get("request_timeout_seconds", 120),
+                model_params.get("max_tokens", "server default"), client_retries, rate_attempts)
     return OpenAILLM(
         model_name=model,
         model_params=model_params,
         base_url=base_url,
         api_key=api_key,
         timeout=llm_config.get("request_timeout_seconds", 120),
+        max_retries=client_retries,
+        rate_limit_handler=RetryRateLimitHandler(max_attempts=rate_attempts),
     )

@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SChain · Evidence explorer</title><style>/*__STYLE__*/</style></head>
+<body>
+<header><div class="brand"><span class="mark">S</span><div><strong>SChain</strong><span class="subtitle">Evidence explorer</span></div></div><div id="dataset" class="dataset"></div><button id="openGraph" class="button primary">Open graph JSON</button><input id="upload" type="file" accept=".json,application/json" multiple hidden></header>
+<div id="banner" role="status"></div>
+<div class="workspace">
+<aside class="controls"><h1>Supply network</h1><p class="muted">Follow suppliers upstream. Inspect the source behind each relationship.</p>
+<label>Loaded graph<select id="files"></select></label>
+<label>Find an entity<input id="search" type="search" placeholder="Name or alias…" autocomplete="off"></label>
+<label>Seed network<select id="seed"><option value="">All configured seeds</option></select></label>
+<label>Relationship<select id="relation"><option value="suppliesTo">Supply relationships</option><option value="">All relationships</option></select></label>
+<label>Entity type<select id="type"><option value="">All types</option></select></label>
+<label>Maximum supply tier<select id="tier"><option value="">All available tiers</option></select></label>
+<label>Evidence<select id="quality"><option value="">All evidence states</option><option value="checked">Model-checked evidence</option><option value="unchecked">Unchecked / unknown</option><option value="contested">Contested</option></select></label>
+<label>Minimum source documents<select id="support"><option value="1">1 document</option><option value="2">2 documents</option><option value="3">3 documents</option></select></label>
+<label class="check"><input id="context" type="checkbox" checked>Include untiered context</label>
+<button id="reset">Reset filters</button>
+<div class="legend"><h2>Entity types</h2><div id="legend"></div></div>
+<p class="note">Arrows point from supplier to customer. Tier is the shortest observed supply path to a seed. Source counts are not independent confirmations or confidence scores.</p>
+</aside>
+<main><section class="stats" aria-label="Graph statistics"><div><strong id="nodeCount">0</strong><span>visible entities</span></div><div><strong id="edgeCount">0</strong><span>visible relationships</span></div><div><strong id="docCount">0</strong><span>source documents</span></div><div><strong id="checkedCount">0</strong><span>model-checked edges</span></div></section>
+<div class="toolbar"><div class="tabs"><button id="graphTab" aria-pressed="true">Graph</button><button id="tableTab" aria-pressed="false">Relationships</button></div><span id="focusLabel"></span><button id="clearFocus" hidden>Clear focus</button><div class="spacer"></div><button id="zoomIn" aria-label="Zoom in">+</button><button id="zoomOut" aria-label="Zoom out">−</button><button id="fit">Fit</button><button id="saveSvg">Save SVG</button></div>
+<div id="canvas"><svg id="graph" role="img" aria-label="Directed supply chain graph" xmlns="http://www.w3.org/2000/svg"></svg><div id="empty" hidden>No relationships match these filters.</div><div class="canvasHint">Scroll to zoom · Drag to pan · Select a node or relationship</div></div>
+<div id="tableWrap" hidden><table><thead><tr><th>Supplier / subject</th><th>Relationship</th><th>Customer / object</th><th>Documents</th><th>Evidence</th></tr></thead><tbody id="rows"></tbody></table><div class="pager"><button id="prev">Previous</button><span id="page"></span><button id="next">Next</button></div></div>
+<footer><span id="viewInfo"></span><button id="saveJson">Save filtered JSON</button></footer>
+</main>
+<aside class="inspector"><div class="eyebrow">SOURCE INSPECTION</div><div id="details"><h2>Select a relationship</h2><p class="muted">Its exact quote, source, and validation status appear here.</p></div></aside>
+</div>
+<script type="application/json" id="graphData">__GRAPH_DATA__</script><script>/*__SCRIPT__*/</script></body></html>

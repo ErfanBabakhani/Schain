@@ -67,7 +67,7 @@ else
 fi
 
 section "configuration ($CONFIG_FILE)"
-if [ -x "$VENV_PY" ] && values="$(config_values "$CONFIG_FILE" 2>/dev/null)"; then
+if values="$(config_values "$CONFIG_FILE" 2>/dev/null)"; then
     eval "$values"
     item "llm provider"  "$CFG_LLM_PROVIDER"
     item "llm model"     "$CFG_LLM_MODEL"
@@ -76,7 +76,7 @@ if [ -x "$VENV_PY" ] && values="$(config_values "$CONFIG_FILE" 2>/dev/null)"; th
     item "neo4j database" "$CFG_NEO4J_DATABASE"
     item "state db"      "$CFG_STATE_DB $([ -f "$CFG_STATE_DB" ] && echo '(exists: a run can resume)' || echo '(absent: first run)')"
 else
-    item "config"        "not readable yet (.venv missing or config error)"
+    item "config"        "not readable (Python dependencies missing or config error)"
 fi
 
 section "secrets (.env)"

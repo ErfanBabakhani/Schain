@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections import defaultdict
 from typing import Any, Optional
 
@@ -30,7 +31,9 @@ from json_repair import repair_json
 from neo4j_graphrag.components.types import Neo4jGraph
 from neo4j_graphrag.llm import LLMInterface
 
+from ..audit import llm_call_context, prompt_hash
 from ..names import canonical_id, mention_key, normalization_key, pick_canonical_name
+from .entity_types import company_type_hint
 
 logger = logging.getLogger(__name__)
 
@@ -45,9 +48,25 @@ Below is a list of {entity_type} names. Group the names that refer to the same
 real-world {entity_type}, for example an abbreviation and its full legal name.
 
 Rules:
-- Group only names you are confident denote the same real-world entity.
+- WHEN UNCERTAIN, DO NOT MERGE. False split is better than false merge.
+- Group only names you are HIGHLY CONFIDENT denote the identical real-world entity.
+- Valid merges: legal-suffix variation, capitalization, clear acronym/abbreviation,
+  configured aliases, formally equivalent trade/legal names.
+- Do NOT merge merely because entities appear in the same article, operate in the
+  same industry, supply similar products, supply one another, are competitors,
+  share a parent/customer, or have vaguely similar names.
+- Do NOT merge different products or materials that are merely in the same category
+  (example: Blade Batteries is not Ultium battery pack; ventilated rotors are not
+  carbon-sleeved rotors).
+- Do NOT merge a plant/factory/facility with its owning company
+  (example: BMW Group Plant Landshut is not BMW).
+- Do NOT merge distinct companies such as BYD and CATL.
+- Example of incorrect merge: Volkswagen is not Stellantis.
 - Keep genuinely different entities in separate groups, including parent companies and
   their subsidiaries, and different plants or divisions.
+- Do NOT merge a parent company with a named subsidiary, division, brand, business
+  unit, or affiliate unless the evidence explicitly says they are the same legal
+  entity (example: Thyssenkrupp is not Thyssenkrupp Steel / nucera / Aerospace).
 - Every input name must appear in exactly one group.
 - Do not invent names that are not in the list.
 - Return JSON only, in this form, with no commentary:
@@ -56,6 +75,187 @@ Rules:
 Names:
 {names}
 """
+
+_FACILITY_TOKENS = frozenset({
+    "plant", "factory", "facility", "works", "campus", "mill", "smelter",
+    "refinery", "mine site", "warehouse",
+})
+
+
+def looks_like_facility(name: str) -> bool:
+    """True for plant/factory/facility mentions that must not alias to the company."""
+    tokens = set(normalization_key(name).split())
+    return bool(tokens & _FACILITY_TOKENS) or "plant" in normalization_key(name)
+
+
+def _is_acronym_of(short: str, long_key: str, long_name: str = "") -> bool:
+    """Require whole-name initials; legal Limited may supply the final L in CATL."""
+    if not short or " " in short or " " not in long_key or len(short) < 2:
+        return False
+    initials = "".join(word[0] for word in long_key.split())
+    if short == initials or short == long_key.replace(" ", ""):
+        return True
+    legal_limited = long_name.casefold().rstrip(". ").endswith((" limited", " ltd"))
+    return bool(legal_limited and short == initials + "l")
+
+
+def _document_supports_shorthand(
+    left: str,
+    right: str,
+    document_text: Optional[str],
+    candidate_names: Optional[list[str]],
+) -> bool:
+    """Return true only for explicit or collision-free in-document shorthand."""
+    if not document_text:
+        return False
+    ka, kb = normalization_key(left), normalization_key(right)
+    short, long_name = (left, right) if len(ka.split()) < len(kb.split()) else (right, left)
+    short_key, long_key = normalization_key(short), normalization_key(long_name)
+    if not short_key or not long_key.startswith(short_key + " "):
+        return False
+
+    text = document_text.casefold()
+    # A shared leading token is not an alias when the document describes a
+    # corporate relationship.  This check deliberately precedes the generic
+    # shorthand rules: subsidiaries and divisions remain distinct entities.
+    corporate_separation_patterns = (
+        rf"{re.escape(long_name.casefold())}\s+is\s+(?:a|an|the)\s+"
+        rf"(?:subsidiary|division|affiliate|business unit|brand)\s+of\s+"
+        rf"{re.escape(short.casefold())}",
+        rf"{re.escape(short.casefold())}(?:'s|\s+owned)\s+"
+        rf"(?:subsidiary|division|affiliate|business unit|brand)\s+"
+        rf"{re.escape(long_name.casefold())}",
+        rf"{re.escape(short.casefold())}\s+and\s+{re.escape(long_name.casefold())}"
+        rf"\s+are\s+(?:different|distinct|separate)",
+    )
+    if any(re.search(pattern, text) for pattern in corporate_separation_patterns):
+        return False
+
+    explicit_patterns = (
+        rf"{re.escape(long_name.casefold())}\s+is\s+also\s+abbreviated\s+as\s+{re.escape(short.casefold())}",
+        rf"{re.escape(short.casefold())}\s+and\s+{re.escape(long_name.casefold())}\s+refer\s+to\s+the\s+same",
+        rf"{re.escape(long_name.casefold())}\s+and\s+{re.escape(short.casefold())}\s+refer\s+to\s+the\s+same",
+    )
+    if any(re.search(pattern, text) for pattern in explicit_patterns):
+        return True
+
+    collisions = {
+        normalization_key(name)
+        for name in (candidate_names or [])
+        if normalization_key(name).startswith(short_key + " ")
+    }
+    if len(collisions) != 1:
+        return False
+    remainder = long_key[len(short_key):].strip()
+    # The short form must occur independently, not only as the prefix of the full name.
+    independent = re.search(
+        rf"(?<!\w){re.escape(short.casefold())}(?!\s+{re.escape(remainder)})(?!\w)",
+        text,
+    )
+    return bool(independent and long_name.casefold() in text)
+
+
+def identity_plausible(
+    left: str,
+    right: str,
+    *,
+    document_text: Optional[str] = None,
+    candidate_names: Optional[list[str]] = None,
+) -> bool:
+    """Conservative check: refuse merges that are almost certainly false.
+
+    Used to sanitize LLM groups. WHEN UNCERTAIN for this heuristic, returns False
+    only for clearly unsafe pairs; acronym/alias pairs remain allowed.
+    """
+    if left == right:
+        return True
+    ka, kb = normalization_key(left), normalization_key(right)
+    if not ka or not kb:
+        return False
+    if ka == kb:
+        return True
+
+    fa, fb = looks_like_facility(left), looks_like_facility(right)
+    if fa or fb:
+        # Facilities only collapse under identical normalization keys.
+        return False
+
+    wa, wb = set(ka.split()), set(kb.split())
+    if _is_acronym_of(ka, kb, right) or _is_acronym_of(kb, ka, left):
+        return True
+
+    if wa.isdisjoint(wb):
+        return False
+
+    if len(wa) == 1 and len(wb) == 1 and ka != kb:
+        return False
+
+    # Parent / subsidiary / business-unit style nesting: shared stem but extra
+    # distinctive tokens (Steel, Aerospace, Nucera, Rothe Erde, …) → do not merge.
+    if wa != wb and (wa.issubset(wb) or wb.issubset(wa)):
+        smaller, larger = (wa, wb) if len(wa) < len(wb) else (wb, wa)
+        extras = larger - smaller
+        # Shared corporate stem plus unit/product qualifier is not identity.
+        if extras and len(smaller) >= 1:
+            return _document_supports_shorthand(
+                left, right, document_text, candidate_names,
+            )
+
+    if len(wa) >= 2 and len(wb) >= 2:
+        jaccard = len(wa & wb) / len(wa | wb)
+        if jaccard < 0.5:
+            return False
+        # High overlap but different longer forms with distinct trailing tokens.
+        if wa != wb and jaccard < 0.85:
+            return False
+    return True
+
+
+def sanitize_llm_groups(
+    groups: list[list[str]],
+    *,
+    document_text: Optional[str] = None,
+    candidate_names: Optional[list[str]] = None,
+    audit=None,
+    label: Optional[str] = None,
+) -> list[list[str]]:
+    """Complete-link groups: every pair must be safe, with no acronym bridge."""
+    sanitized: list[list[str]] = []
+    seen: set[str] = set()
+    for group in groups:
+        buckets: list[list[str]] = []
+        for name in sorted({str(n) for n in group if n} - seen):
+            seen.add(name)
+            for bucket in buckets:
+                if all(identity_plausible(
+                    name,
+                    other,
+                    document_text=document_text,
+                    candidate_names=candidate_names,
+                ) for other in bucket):
+                    bucket.append(name)
+                    break
+            else:
+                buckets.append([name])
+        sanitized.extend(buckets)
+        if audit is not None and len(group) > 1:
+            accepted = len(buckets) == 1
+            audit.emit(
+                "alias_merge_evaluated",
+                stage="resolution",
+                entity_type=label,
+                proposed_names=sorted({str(name) for name in group if name}),
+                accepted_groups=buckets,
+                accepted=accepted,
+                reason=(
+                    "complete_link_identity_supported"
+                    if accepted else "unsafe_or_ambiguous_identity_pair"
+                ),
+                related_llm_call_ids=audit.contextual_llm_call_ids(
+                    "resolution", "entity_type", label or "",
+                ),
+            )
+    return sanitized
 
 
 def _mentions_by_label(graph: Neo4jGraph) -> dict[str, dict[str, str]]:
@@ -66,16 +266,34 @@ def _mentions_by_label(graph: Neo4jGraph) -> dict[str, dict[str, str]]:
         if not name:
             logger.warning("node %s has no name property, skipping", node.id)
             continue
-        grouped[node.label][node.id] = str(name).strip()
+        label = node.label
+        if label == "Company":
+            repaired_type, reason = company_type_hint(str(name))
+            if repaired_type:
+                label = repaired_type
+                logger.info("entity type repair %s: Company -> %s (%s)", name, label, reason)
+        grouped[label][node.id] = str(name).strip()
     return grouped
 
 
-def _llm_groups(llm: LLMInterface, label: str, names: list[str]) -> list[list[str]]:
+def _llm_groups(
+    llm: LLMInterface,
+    label: str,
+    names: list[str],
+    *,
+    document_text: Optional[str] = None,
+    audit=None,
+) -> list[list[str]]:
     """Ask Prompt 2 to group aliases for one entity type."""
     prompt = DISAMBIGUATION_PROMPT.format(
         entity_type=label, names="\n".join(f"- {name}" for name in names)
     )
-    raw = llm.invoke(prompt).content
+    with llm_call_context(
+        prompt_template_id="DISAMBIGUATION_PROMPT",
+        prompt_template_hash=prompt_hash(DISAMBIGUATION_PROMPT),
+        entity_type=label,
+    ):
+        raw = llm.invoke(prompt).content
     try:
         payload = json.loads(repair_json(raw))
         groups = [
@@ -91,7 +309,15 @@ def _llm_groups(llm: LLMInterface, label: str, names: list[str]) -> list[list[st
     # Any name the model dropped stays in a group of its own, so nothing is lost.
     covered = {name for group in groups for name in group}
     groups.extend([name] for name in names if name not in covered)
-    return [group for group in groups if group]
+    groups = [group for group in groups if group]
+    # Conservative post-filter: refuse clearly false merges even if the model emitted them.
+    return sanitize_llm_groups(
+        groups,
+        document_text=document_text,
+        candidate_names=names,
+        audit=audit,
+        label=label,
+    )
 
 
 def alias_lookup(aliases: Optional[dict[str, Any]], label: str) -> dict[str, str]:
@@ -114,6 +340,8 @@ def resolve_entities(
     llm: Optional[LLMInterface] = None,
     cache: Optional[dict[str, dict[str, Any]]] = None,
     aliases: Optional[dict[str, Any]] = None,
+    document_text: Optional[str] = None,
+    audit=None,
 ) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
     """Resolve every extracted node to a canonical entity.
 
@@ -128,12 +356,20 @@ def resolve_entities(
     new_entries: list[dict[str, Any]] = []
 
     for label, nodes in _mentions_by_label(graph).items():
+        known_aliases = alias_lookup(aliases, label)
         cached_nodes: dict[str, str] = {}
         fresh_nodes: dict[str, str] = {}
         for node_id, name in nodes.items():
-            if mention_key(label, name) in cache:
+            cached = cache.get(mention_key(label, name))
+            configured = known_aliases.get(normalization_key(name))
+            safe_alias = bool(configured and cached and
+                normalization_key(configured) == normalization_key(cached["canonical_name"]) and
+                not (looks_like_facility(name) and not looks_like_facility(configured)))
+            if cached and (safe_alias or identity_plausible(name, cached["canonical_name"])):
                 cached_nodes[node_id] = name
             else:
+                if cached:
+                    logger.warning("ignoring unsafe cached identity %s -> %s", name, cached["canonical_name"])
                 fresh_nodes[node_id] = name
 
         # Stage 1: mentions already resolved in an earlier run.
@@ -154,11 +390,14 @@ def resolve_entities(
 
         # Stages 2 and 3: deterministic grouping, with configured aliases folded in by
         # grouping an alias under its canonical name's key.
+        # Never apply aliases that would collapse a facility mention into a company.
         known_aliases = alias_lookup(aliases, label)
         by_key: dict[str, list[str]] = defaultdict(list)
         configured_name: dict[str, str] = {}
         for name in fresh_nodes.values():
             alias_target = known_aliases.get(normalization_key(name))
+            if alias_target and looks_like_facility(name) and not looks_like_facility(alias_target):
+                alias_target = None
             key = normalization_key(alias_target or name)
             by_key[key].append(name)
             if alias_target:
@@ -178,7 +417,13 @@ def resolve_entities(
             candidates += [name for name in known if name not in candidates]
 
         if llm is not None and len(candidates) > 1:
-            groups = _llm_groups(llm, label, candidates)
+            groups = _llm_groups(
+                llm,
+                label,
+                candidates,
+                document_text=document_text,
+                audit=audit,
+            )
             method = "llm"
         else:
             groups = [[name] for name in candidates]
@@ -222,4 +467,13 @@ def resolve_entities(
             label, len(cached_nodes), len(fresh_nodes), len(members), method,
         )
 
+    original_labels = {node.id: node.label for node in graph.nodes}
+    repaired_mentions = set()
+    for node_id, entry in resolution.items():
+        if original_labels.get(node_id) != entry["label"]:
+            entry["method"] = "type_repair:branded_model_structure/" + entry["method"]
+            repaired_mentions.add((entry["label"], entry["mention"]))
+    for entry in new_entries:
+        if (entry["label"], entry["mention"]) in repaired_mentions:
+            entry["method"] = "type_repair:branded_model_structure/" + entry["method"]
     return resolution, new_entries

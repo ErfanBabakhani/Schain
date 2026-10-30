@@ -31,19 +31,52 @@ seeds:
 expansion:
   # Tier is graph distance along supplier --suppliesTo--> customer, never industrial
   # role: a mining company selling directly to an OEM is Tier 1, not a "deep" tier.
-  # Tier 0 = seeds, Tiers 1-6 = successive upstream suppliers. Tier 6 is terminal:
-  # its entities and relations are stored, but it is never searched.
-  max_tier: 6
-  # Safety stop for a run; 0 means no limit.
-  max_documents: 0
+  # Tier 5 is stored but never searched. Only suppliesTo advances tiers.
+  max_tier: 5
+  # Per-run discovery-document ceiling (pauses the run; does NOT prune PENDING
+  # frontier entities). Lifetime progress is tracked in SQLite usage tables.
+  # max_documents_per_run is authoritative; max_documents kept as alias.
+  # Tier-0 has higher leverage (each Tier-1 opens a new branch).
+  max_documents: 320
+  max_documents_per_run: 320
+
+  # Per-frontier-entity processing. TARGET is a checkpoint, not a hard stop.
+  # MAX is the useful spend ceiling including zero-yield escalation.
+  # max_documents_per_entity must be >= max(tier maxima) or it silently caps tiers.
+  retrieval:
+    target_documents_per_entity: 24
+    max_documents_per_entity: 36
+    target_documents_by_tier: {0: 24, 1: 14, 2: 10, 3: 8, 4: 6, 5: 0}
+    max_documents_by_tier: {0: 36, 1: 24, 2: 18, 3: 14, 4: 10, 5: 0}
+    zero_gain_patience: 3
+    min_documents_before_diminishing_returns: 3
+    # Resolve/fetch a bounded ranked pool; selected snippets remain valid evidence.
+    max_full_text_fetches_per_entity: 48
+    # Title+publisher recovery attempts per entity after Google News wrapper failure.
+    max_title_lookups_per_entity: 12
+    # When primary pass yields zero expansion edges, escalate search stages up to max.
+    zero_yield_rescue: true
+    # Strong-LLM-first: semantic adjudication for genuinely ambiguous candidates.
+    semantic_direction_adjudication: true
+    evidence_second_pass: true
+    query_planner_enabled: true
+    query_planner_max_categories: 8
+    query_planner_max_queries: 12
+    max_candidates_per_entity: 96
+
+  # Soft per-run SCHEDULING batch sizes (ORDER fairness across tiers only).
+  # Every accepted valid supplier is enqueued and eventually processed.
+  # These numbers do NOT permanently exclude suppliers ranked below a cutoff.
+  # Alias retained: max_expandable_entities_by_tier == scheduling_batch_size_by_tier.
+  max_expandable_entities_by_tier: {1: 10, 2: 8, 3: 6, 4: 4}
+  scheduling_batch_size_by_tier: {1: 10, 2: 8, 3: 6, 4: 4}
 
   sources:
     # News: explicit new supply agreements.
     google_news:
       enabled: true
       language: en-US
-      # Google News RSS links are redirect wrappers, so a body often cannot be fetched;
-      # such documents fall back to title + snippet.
+      # Resolve publisher links before full-text fetch; retain explicit snippet fallback.
       fetch_full_text: true
     gdelt:
       enabled: true
@@ -67,6 +100,8 @@ expansion:
   relevance:
     require_entity_mention: true
     min_chars: 200
+    # Explicit title/snippet supplier headlines may be shorter than min_chars.
+    title_snippet_min_chars: 40
     # Add the EV vocabulary below to these keywords.
     include_vocabulary: true
     keywords:
@@ -105,86 +140,44 @@ expansion:
   # max_results_by_provider overrides max_results for the providers it names.
   search:
     defaults:
-      max_results: 30
+      # Candidate ceilings per provider per query — not LLM quotas.
+      # Prefer GDELT/web breadth over Google News dominance.
+      max_results: 14
       providers: [google_news, gdelt, general_web, wikipedia]
       max_results_by_provider:
-        general_web: 30
-        wikipedia: 10
+        google_news: 10
+        gdelt: 16
+        general_web: 18
+        wikipedia: 4
 
+    # Stage A (directional) + Stage B (broad). Stages C–E are generated at runtime
+    # by the escalation ladder / query planner when zero-yield rescue activates.
+    # Strict validation still decides which facts become expansion edges.
     tiers:
-      0:
-        defaults:
-          max_results: 50               # news providers
-          max_results_by_provider: {general_web: 30, wikipedia: 10}
+      0: &tier_queries
         queries:
+          - query: 'supplies "{entity}"'
+          - query: '"supplier to" "{entity}"'
+          - query: '"{entity}" sources from supplier'
+          - query: '"{entity}" purchases from supplier'
+          - query: '"{entity}" procurement supplier'
           - query: '"{entity}" suppliers'
-          - query: '"{entity}" sourcing'
-          - query: '"{entity}" "supply agreement"'
-          - query: '"{entity}" battery suppliers'
-          - query: '"{entity}" semiconductor suppliers'
-          - query: '"{entity}" raw material supply'
-
-      1:
-        defaults:
-          max_results: 50
-          max_results_by_provider: {general_web: 30, wikipedia: 10}
-        queries:
-          - query: '"{entity}" suppliers'
-          - query: '"{entity}" sourcing'
-          - query: '"{entity}" "supply agreement"'
+          - query: '"{entity}" key suppliers'
+          - query: '"{entity}" major suppliers'
           - query: '"{entity}" component suppliers'
-          - query: '"{entity}" battery material suppliers'
-          - query: '"{entity}" raw material suppliers'
-
-      2:
-        defaults:
-          max_results: 50
-          max_results_by_provider: {general_web: 30, wikipedia: 10}
-        queries:
-          - query: '"{entity}" suppliers'
-          - query: '"{entity}" sourcing'
-          - query: '"{entity}" "supply agreement"'
-          - query: '"{entity}" material suppliers'
-          - query: '"{entity}" precursor suppliers'
-          - query: '"{entity}" feedstock suppliers'
-
-      3:
-        defaults:
-          max_results: 40
-          max_results_by_provider: {general_web: 25, wikipedia: 10}
-        queries:
-          - query: '"{entity}" suppliers'
-          - query: '"{entity}" raw material suppliers'
-          - query: '"{entity}" feedstock'
-          - query: '"{entity}" precursor'
-          - query: '"{entity}" refining'
-          - query: '"{entity}" "offtake agreement"'
-
-      4:
-        defaults:
-          max_results: 30
-          max_results_by_provider: {general_web: 20, wikipedia: 10}
-        queries:
-          - query: '"{entity}" suppliers'
-          - query: '"{entity}" feedstock suppliers'
-          - query: '"{entity}" refinery suppliers'
-          - query: '"{entity}" concentrate suppliers'
-          - query: '"{entity}" ore suppliers'
-          - query: '"{entity}" "offtake agreement"'
-
+          - query: '"{entity}" supply chain'
+          - query: '"{entity}" supplier list'
+          - query: '"{entity}" key suppliers list'
+          - query: '"{entity}" supplier award'
+          - query: '"{entity}" procurement report'
+          - query: '"{entity}" sourcing report'
+          - query: '"{entity}" sustainability report suppliers'
+          - query: '"{entity}" annual report suppliers'
+          - query: '"{entity}" supply chain report'
+          - query: '"{entity}" filetype:pdf suppliers'
+      1: *tier_queries
+      2: *tier_queries
+      3: *tier_queries
+      4: *tier_queries
       5:
-        defaults:
-          max_results: 30
-          max_results_by_provider: {general_web: 20, wikipedia: 10}
-        queries:
-          - query: '"{entity}" suppliers'
-          - query: '"{entity}" raw material sourcing'
-          - query: '"{entity}" mining suppliers'
-          - query: '"{entity}" mines'
-          - query: '"{entity}" extraction'
-          - query: '"{entity}" "offtake agreement"'
-
-      6:
-        # Terminal tier: Tier-6 entities and their relations are stored, but no search
-        # is performed for them and nothing is promoted to Tier 7.
         expand: false

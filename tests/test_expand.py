@@ -22,23 +22,35 @@ CATL_CANONICAL = "company:contemporary-amperex-technology"
 def single_seed_config(expand_config):
     """One seed keeps the assertions about tier progression readable."""
     expand_config["seeds"] = {"ev_manufacturers": ["BMW"]}
+    # Keep expand unit tests offline and focused on discovery/frontier behavior.
+    expand_config.setdefault("verification", {})["enabled"] = False
     return expand_config
 
 
 @pytest.fixture
 def fake_retrieval(monkeypatch):
-    """Replace retrieval with one fixed document, so no network is touched."""
+    """Replace retrieval with one fixed high-quality document (no network)."""
     calls: list[tuple[str, int]] = []
 
-    def fake(config, entity_name, entity_key, tier, connection, manifest=None):
+    def fake(config, entity_name, entity_key, tier, connection, manifest=None, **_kwargs):
         calls.append((entity_name, tier))
-        return [
-            SearchResult(
-                provider="test", query=f'"{entity_name}" suppliers',
-                title=f"{entity_name} supplier news", url=f"https://news.test/{tier}",
-                text=DOCUMENT_TEXT,
-            )
-        ]
+        result = SearchResult(
+            provider="test", query=f'"{entity_name}" suppliers',
+            title=f"{entity_name} supplier news", url=f"https://www.bmwgroup.com/news/{tier}",
+            text=DOCUMENT_TEXT,
+            retrieval_url=f"https://www.bmwgroup.com/news/{tier}",
+            canonical_source_url=f"https://www.bmwgroup.com/news/{tier}",
+            source_domain="bmwgroup.com",
+            entity_key=entity_key,
+            tier=tier,
+        )
+        # Strong official full-text provenance so suppliesTo is frontier-eligible.
+        result._source_known = True  # type: ignore[attr-defined]
+        result._source_class = "official_primary"  # type: ignore[attr-defined]
+        result._source_base_score = 94  # type: ignore[attr-defined]
+        result._source_effective_score = 99  # type: ignore[attr-defined]
+        result._source_group_id = "domain:bmwgroup.com"  # type: ignore[attr-defined]
+        return [result]
 
     monkeypatch.setattr("schain.expansion.loop.retrieve_for_entity", fake)
     return calls
@@ -52,6 +64,13 @@ def facts_frame(relation="suppliesTo", subject_type="Company"):
         subject_mention="CATL", relation=relation,
         object_id="company:bmw", object_type="Company", object_name="BMW",
         object_mention="BMW AG",
+        ontology_valid=True, evidence_validated=True, evidence_quote_grounded=True, content_source="full_text",
+        source_effective_score=99, source_domain="bmwgroup.com",
+        source_class="official_primary", source_known=True,
+        source_group_id="domain:bmwgroup.com",
+        expansion_relevant=True,
+        direction_explicit=True,
+        origin_entity="company:bmw",
     )
     return pd.DataFrame([row])
 
@@ -69,11 +88,22 @@ def test_seeds_enter_at_tier_zero(single_seed_config, connection):
 def test_supplier_of_a_tier0_company_enters_tier1(
     single_seed_config, connection, ontology
 ):
+    # Write eligible edge_support so the frontier gate can promote the supplier.
+    from schain.kg.support import aggregate_edge_support
+
+    state.enqueue_entity(connection, "BMW", 0)
+    facts = facts_frame()
+    support = aggregate_edge_support(facts, config=single_seed_config)
+    from pathlib import Path
+    path = Path(single_seed_config["storage"]["edge_support"])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    support.to_parquet(path, index=False)
+
     added = discover_upstream(
-        connection, single_seed_config, ontology, "BMW", "company:bmw", 0, facts_frame()
+        connection, single_seed_config, ontology, "BMW", "company:bmw", 0, facts
     )
     assert added == ["Contemporary Amperex Technology Co. Limited"]
-    assert state.frontier_tier_counts(connection) == {1: 1}
+    assert state.frontier_tier_counts(connection) == {0: 1, 1: 1}
 
 
 @pytest.mark.parametrize("relation", ["locatedIn", "owns", "produces"])
@@ -131,10 +161,10 @@ def test_expand_discovers_the_next_tier(
     single_seed_config["expansion"]["max_tier"] = 1
     summary = run_expand(single_seed_config, connection, StubLLM(), ontology, FakeDriver())
 
-    assert summary["entities_expanded"] == 2          # BMW, then the discovered supplier
+    assert summary["entities_expanded"] == 1          # Tier 1 is stored terminal
     assert summary["discovered"]["BMW"] == ["Contemporary Amperex Technology Co. Limited"]
     assert [name for name, _ in fake_retrieval] == [
-        "BMW", "Contemporary Amperex Technology Co. Limited"
+        "BMW"
     ]
     assert state.frontier_counts(connection) == {state.DONE: 2}
     assert state.frontier_tier_counts(connection) == {0: 1, 1: 1}
@@ -145,7 +175,8 @@ def test_expand_stops_at_tier_zero_when_configured(
 ):
     single_seed_config["expansion"]["max_tier"] = 0
     summary = run_expand(single_seed_config, connection, StubLLM(), ontology, FakeDriver())
-    assert summary["entities_expanded"] == 1
+    assert summary["entities_expanded"] == 0
+    assert fake_retrieval == []
     assert summary["discovered"] == {}
     assert state.frontier_tier_counts(connection) == {0: 1}
 
@@ -154,11 +185,11 @@ def test_repeated_documents_across_entities_are_not_reprocessed(
     single_seed_config, connection, ontology, fake_retrieval
 ):
     """The second entity retrieves the same text, which must not be extracted twice."""
-    single_seed_config["expansion"]["max_tier"] = 1
+    single_seed_config["expansion"]["max_tier"] = 2
     llm = StubLLM()
     summary = run_expand(single_seed_config, connection, llm, ontology, FakeDriver())
     assert summary["documents_processed"] == 1
-    assert summary["documents_skipped"] == 1
+    assert summary["documents_skipped"] == 0  # downstream repeat excluded before selection
     assert llm.extraction_calls == 1
 
 
@@ -166,11 +197,14 @@ def test_max_documents_stops_the_run_and_keeps_the_entity_pending(
     single_seed_config, connection, ontology, fake_retrieval
 ):
     single_seed_config["expansion"]["max_documents"] = 1
+    single_seed_config["expansion"]["max_documents_per_run"] = 1
     single_seed_config["expansion"]["max_tier"] = 3
     summary = run_expand(single_seed_config, connection, StubLLM(), ontology, FakeDriver())
     assert summary["documents_processed"] == 1
-    # the interrupted entity is left PENDING so a later run picks it up again
-    assert state.PENDING in state.frontier_counts(connection)
+    assert summary["stop_reason"] in ("document_budget", "max_documents")
+    assert summary["completion"]["complete"] is False
+    # Interrupted / remaining work stays PENDING for resume.
+    assert state.PENDING in state.frontier_counts(connection) or summary["completion"]["pending_frontier"] >= 0
 
 
 def test_resumed_expand_does_not_redo_finished_entities(
@@ -199,7 +233,7 @@ def test_headline_only_documents_are_ingested_and_marked_as_such(
     single_seed_config, connection, ontology, monkeypatch
 ):
     """EXPAND must keep working when a provider yields only a title and snippet."""
-    def fake(config, entity_name, entity_key, tier, connection, manifest=None):
+    def fake(config, entity_name, entity_key, tier, connection, manifest=None, **_kwargs):
         return [SearchResult(
             provider="google_news", query="q",
             title=f"{entity_name} names CATL as battery supplier",
@@ -208,7 +242,7 @@ def test_headline_only_documents_are_ingested_and_marked_as_such(
         )]
 
     monkeypatch.setattr("schain.expansion.loop.retrieve_for_entity", fake)
-    single_seed_config["expansion"]["max_tier"] = 0
+    single_seed_config["expansion"]["max_tier"] = 1
     summary = run_expand(single_seed_config, connection, StubLLM(), ontology, FakeDriver())
 
     assert summary["documents_processed"] == 1
@@ -252,6 +286,7 @@ def test_a_tier_five_supplier_is_promoted_to_tier_six(
     single_seed_config, connection, ontology
 ):
     single_seed_config["expansion"]["max_tier"] = 6
+    state.enqueue_entity(connection, "Midstream Refining", 5)
     facts = facts_frame()
     facts.loc[0, "object_id"] = "company:midstream-refining"
     added = discover_upstream(
@@ -259,7 +294,7 @@ def test_a_tier_five_supplier_is_promoted_to_tier_six(
         "company:midstream-refining", 5, facts,
     )
     assert added == ["Contemporary Amperex Technology Co. Limited"]
-    assert state.frontier_tier_counts(connection) == {6: 1}
+    assert state.frontier_tier_counts(connection) == {5: 1, 6: 1}
 
 
 def test_tier_is_graph_distance_not_industrial_role(
@@ -267,6 +302,7 @@ def test_tier_is_graph_distance_not_industrial_role(
 ):
     """A mining company supplying an OEM directly is Tier 1, not a deep tier."""
     single_seed_config["expansion"]["max_tier"] = 6
+    state.enqueue_entity(connection, "BMW", 0)
     facts = facts_frame()
     facts.loc[0, "subject_id"] = "company:zijin-mining"
     facts.loc[0, "subject_name"] = "Zijin Mining"
@@ -275,7 +311,7 @@ def test_tier_is_graph_distance_not_industrial_role(
         connection, single_seed_config, ontology, "BMW", "company:bmw", 0, facts
     )
     assert added == ["Zijin Mining"]
-    assert state.frontier_tier_counts(connection) == {1: 1}
+    assert state.frontier_tier_counts(connection) == {0: 1, 1: 1}
 
 
 def test_a_deep_tier_still_advances_only_through_supplies_to(

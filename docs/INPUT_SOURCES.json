@@ -1,0 +1,71 @@
+{
+  "review_date": "2026-09-08",
+  "main_article_duplicate": "The separately attached main article (2) is byte-identical to source 01.",
+  "inputs": [
+    {
+      "filename": "Schain-mirza1(1).zip",
+      "sha256": "96711f49950776dbbeca4df2e3a0503da49230a1216799861967fc96738eb73d",
+      "bytes": 294616
+    },
+    {
+      "filename": "01-Enhancing-supply-chain-visibility-with-knowledge-graphs-and-large-language-models.pdf",
+      "sha256": "c36c8d45dff3f7d6023c7a8b40170fe9ac81e7c731220624aef47a5b0e4a2b36",
+      "bytes": 10084316
+    },
+    {
+      "filename": "02-2405.17743v5-1-1-.pdf",
+      "sha256": "94c696a64842cfd50382e8bc9836f2c40f5872f1602c95cf4062553ba24c4e42",
+      "bytes": 2566563
+    },
+    {
+      "filename": "03-Building-a-pathway-of-GenAI-enabled-capabilities-for-supply-chain-management.pdf",
+      "sha256": "1ddf30fabca150f63b70e9f8b18dae73c0ef36b44e6cff51cf2b779155807f1d",
+      "bytes": 4002801
+    },
+    {
+      "filename": "04-Large-language-models-in-supply-chain-management-a-systematic-literature-review-and-application-framework.pdf",
+      "sha256": "88a88624cecbd78847c06d8c9d034d39a8407906b2060610422372d0ef457a12",
+      "bytes": 8092060
+    },
+    {
+      "filename": "05-2024-SoSym-R-IO-AI.pdf",
+      "sha256": "9b9a9cdb7b162ea559394aca94615f16a0804bfe716166e91ccbb3d9056ff20f",
+      "bytes": 4642076
+    },
+    {
+      "filename": "06-2601.09680v1.pdf",
+      "sha256": "113d4c1d24ca97cbff295910f7ba1ceff8f91fef597c8687bd4d6be136085523",
+      "bytes": 5049710
+    },
+    {
+      "filename": "07-LLM4SCM-a-framework-for-intelligent-supply-chain-decisions.pdf",
+      "sha256": "8a3fab4d189e4786d297a65dba5dcc24db4e16a743068100911bfb19fbb9c8c0",
+      "bytes": 21213324
+    },
+    {
+      "filename": "08-2503.21115v1.pdf",
+      "sha256": "6b63fc68a356a9ea034a8ffbcaeb8eeddc547c04be5ecc30b974dd67edf43bc7",
+      "bytes": 7162946
+    },
+    {
+      "filename": "09-Leveraging-large-language-models-to-enhance-multi-agent-risk-assessment-in-supply-chain-networks.pdf",
+      "sha256": "cce560b614c604b41f52807f6e011ad5f6a77e199bf6d1fe25a85b4889cb0140",
+      "bytes": 6302000
+    },
+    {
+      "filename": "10-Drivers-and-constraints-of-agentic-AI-in-supply-chain-management-an-exploratory-study.pdf",
+      "sha256": "265cc4e3727a1bba15f59ef3e2ac11b6bcdccbcbf07d6675a222129eae9762d2",
+      "bytes": 4098383
+    },
+    {
+      "filename": "11-Generative-artificial-intelligence-and-mathematical-modelling-for-eco-friendly-humanitarian-supply-chains-1-.pdf",
+      "sha256": "2f8f86da7750d4062794ff4a6b2bdfa6710f94a7708af4b1c90a8b2794b4dafd",
+      "bytes": 23393509
+    },
+    {
+      "filename": "12-Agentic-LLMs-in-the-supply-chain-towards-autonomous-multi-agent-consensus-seeking.pdf",
+      "sha256": "c995137079935db167f239a883d08b2dcd3eff03931fa7bfccb1f459f4f8e647",
+      "bytes": 8365077
+    }
+  ]
+}

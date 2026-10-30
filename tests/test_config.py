@@ -16,7 +16,7 @@ from schain.config import (
 def test_include_brings_in_shared_settings():
     config = load_config(REPO_ROOT / "config/ingest.yaml")
     # llm/neo4j/storage live in config/base.yaml, not in ingest.yaml
-    assert config["llm"]["model"] == "Qwen/Qwen3.8-27B"
+    assert config["llm"]["model"] == "Qwen/Qwen3-4B-Instruct-2507"
     assert config["neo4j"]["database"] == "neo4j"
     assert config["storage"]["state_db"].endswith("state.db")
     # and the including file's own keys survive

@@ -162,7 +162,12 @@ def test_missing_resolution_and_state_do_not_break_export(ingest_config):
 
 
 def test_frontier_tier_enriches_company_nodes(expand_config):
-    _write_facts(expand_config, _base_rows())
+    rows = _base_rows()
+    for row in rows:
+        row.update(ontology_valid=True, evidence_validated=True,
+                   evidence_quote_grounded=True, direction_explicit=True,
+                   expansion_relevant=row["relation"] == "suppliesTo")
+    _write_facts(expand_config, rows)
     connection = state.connect(Path(expand_config["storage"]["state_db"]))
     try:
         state.enqueue_entity(connection, "BMW", 0)

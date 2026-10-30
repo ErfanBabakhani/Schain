@@ -73,7 +73,7 @@ def test_facts_carry_full_provenance(
     facts = pd.read_parquet(ingest_config["storage"]["extracted_facts"])
     row = facts.iloc[0]
     assert row.source_url == "https://news.test/catl-bmw"
-    assert row.model == "Qwen/Qwen3.8-27B"
+    assert row.model == ingest_config["llm"]["model"]
     assert row.chunk_index == 0
     assert row.evidence and row.doc_id and row.extracted_at
     assert facts.evidence.str.len().gt(0).all()

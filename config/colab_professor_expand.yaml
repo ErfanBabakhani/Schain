@@ -1,0 +1,45 @@
+# Colab runtime profile. Experiment seeds and depth are authoritative in expansion.yaml.
+include:
+  - config/expansion.yaml
+runtime_overlay: true
+mode: expand
+
+runtime:
+  resume: true
+  restart_from_scratch: false
+  max_minutes: 120
+
+llm:
+  provider: local
+  base_url: http://localhost:8000/v1
+  model: Qwen/Qwen3-4B-Instruct-2507
+  max_tokens: 2048
+  request_timeout_seconds: 120
+  client_max_retries: 0
+  rate_limit_max_attempts: 1
+
+concurrency:
+  llm_max_concurrency: 1
+
+ingest:
+  # Keep the full source; extract at most four origin-ranked original chunks.
+  # Checkpoints/metrics record omitted chunks and partial coverage explicitly.
+  max_chunks_per_document: 4
+
+save:
+  enabled: true
+  backend: neo4j
+  mode: incremental
+  max_attempts: 3
+  retry_backoff_seconds: 2.0
+
+# The runnable notebook supplies experiment_id, a Google Drive directory, and local
+# storage paths through an untracked runtime overlay.
+checkpoint_store:
+  enabled: false
+
+# Run without durable Colab snapshots:
+# python -m schain expand --config config/colab_professor_expand.yaml --save
+# Explicit experiment changes: --max-tier 5 --max-documents 320
+# Individual seed overrides safely preserve commas:
+# --seed Toyota --seed "Tesla Inc." --seed BMW --seed "BYD Co., Ltd."

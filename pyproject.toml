@@ -1,6 +1,6 @@
 [project]
 name = "schain"
-version = "0.1.0"
+version = "0.3.0"
 description = "Supply Chain Knowledge Graph V1 (INGEST / EXPAND)"
 requires-python = ">=3.10,<3.15"
 
@@ -25,6 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+postgres = ["psycopg[binary,pool]>=3.2,<4.0"]
 
 [project.scripts]
 schain = "schain.__main__:main"
@@ -41,4 +42,8 @@ testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
 markers = [
     "integration: needs Neo4j, a model endpoint or network access; skips when absent",
+    "postgres: needs a real PostgreSQL service (SCHAIN_TEST_POSTGRES_URL)",
 ]
+
+[tool.setuptools.package-data]
+schain = ["viewer_assets/*.html", "viewer_assets/*.css", "viewer_assets/*.js"]

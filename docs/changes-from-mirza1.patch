@@ -1,0 +1,2509 @@
+--- a/PROJECT_DECISIONS.md
++++ b/PROJECT_DECISIONS.md
+@@ -114,3 +114,21 @@
+ Intermediate source data, extracted facts, and checkpoint state are also retained outside Neo4j so the pipeline remains reproducible and resumable.
+ 
+ For visualization, use **Neo4j Browser** for basic graph inspection and demonstration. No custom visualization dashboard or frontend is required in V1.
++
++## 12. User-authorized evidence and visualization upgrade (2026-09-08)
++
++The user requested a paper/code review, efficiency improvements, a useful graph view,
++and a new code version. Release 0.2.0 adds a local offline HTML evidence explorer;
++this is an explicit exception to the earlier no-custom-visualization scope.
++INGEST/EXPAND, static ontology, configurable seeds and one-explicit-source acceptance
++remain the operating design. Source reputation is descriptive, not a confidence score.
++
++Newly processed evidence must occur in the source text after Unicode/whitespace
++normalization. Successful extraction chunks are checkpointed; default chunk errors
++raise for resumable recovery. Distinct quote/chunk witnesses are persisted separately
++and aggregate into one semantic edge. New validation/gold.py adds exact held-out
++relation scoring; it is separate from external-reference coverage. These changes
++are engineering improvements, not measured replication or accuracy claims.
++
++See START_HERE.md, docs/UPGRADE_REVIEW.md and docs/TEST_RESULTS.md. Completed legacy
++checkpoints are reused; re-extract into separate paths/database to compare quality.
+--- a/PROJECT_STRUCTURE.md
++++ b/PROJECT_STRUCTURE.md
+@@ -67,3 +67,13 @@
+ - `pipeline.py` / `ingest.py` / `expansion/loop.py`: orchestration.
+ 
+ Do not add architecture layers unless a concrete requirement needs them.
++
++## 0.2.0 additions
++
++- `schain/checkpoint.py`: atomic extraction JSON checkpoints.
++- `schain/viewer.py`, `schain/viewer_assets/`: offline graph explorer generator/assets.
++- `schain/validation/gold.py`: exact document-level directed triple evaluation.
++- `examples/`: explicitly fictional demo graph, standalone HTML and rebuild script.
++- `START_HERE.md`, `docs/UPGRADE_REVIEW.md`, `docs/literature/`: use and review notes.
++
++CLI now also includes `view` and `evaluate`; neither calls an LLM or Neo4j.
+--- a/README.md
++++ b/README.md
+@@ -1,3 +1,8 @@
++> **Updated code: 0.2.0 (8 September 2026).** Start with [START_HERE.md](START_HERE.md)
++> for the offline graph explorer, migration, and new commands. See
++> [docs/UPGRADE_REVIEW.md](docs/UPGRADE_REVIEW.md) for the paper comparison.
++> This dated addendum supersedes older statements below that exclude a local viewer.
++
+ # Supply Chain Knowledge Graph — V1
+ 
+ Builds a reproducible supply-chain knowledge graph from unstructured text: retrieval, LLM
+--- a/config/base.yaml
++++ b/config/base.yaml
+@@ -4,6 +4,10 @@
+ # Secrets never belong here. Neo4j credentials and API keys come from .env.
+ 
+ ontology_file: config/ontology.yaml
++
++# Applies to both INGEST and EXPAND; a failed chunk remains retryable.
++ingest:
++  on_error: RAISE
+ 
+ runtime:
+   # Resume is the default: work already completed in a previous run is not redone.
+@@ -27,6 +31,8 @@
+     max_repair_attempts: 1
+   evidence:
+     enabled: true
++    # Reject evidence that does not occur in the supplied source text.
++    require_source_quote: true
+     validate_tier_advancing_edges: true
+     validate_risky_relations:
+       - owns
+--- a/config/ingest.yaml
++++ b/config/ingest.yaml
+@@ -14,4 +14,4 @@
+   file_patterns: ["*.txt", "*.md", "*.pdf"]
+   chunk_size: 2000
+   chunk_overlap: 200
+-  on_error: IGNORE             # IGNORE = log and skip a failed chunk | RAISE = stop
++  on_error: RAISE             # RAISE preserves failed chunks for resume; IGNORE allows partial documents
+--- a/pyproject.toml
++++ b/pyproject.toml
+@@ -1,6 +1,6 @@
+ [project]
+ name = "schain"
+-version = "0.1.0"
++version = "0.2.0"
+ description = "Supply Chain Knowledge Graph V1 (INGEST / EXPAND)"
+ requires-python = ">=3.10,<3.15"
+ 
+@@ -42,3 +42,6 @@
+ markers = [
+     "integration: needs Neo4j, a model endpoint or network access; skips when absent",
+ ]
++
++[tool.setuptools.package-data]
++schain = ["viewer_assets/*.html", "viewer_assets/*.css", "viewer_assets/*.js"]
+--- a/schain/__init__.py
++++ b/schain/__init__.py
+@@ -1,3 +1,3 @@
+ """Supply-chain knowledge graph pipeline (V1)."""
+ 
+-__version__ = "0.1.0"
++__version__ = "0.2.0"
+--- a/schain/__main__.py
++++ b/schain/__main__.py
+@@ -85,6 +85,15 @@
+         "--output", type=Path, default=None,
+         help="output JSON path (default: storage.graph_export)",
+     )
++    view = subparsers.add_parser("view", help="build an offline HTML graph explorer")
++    view.add_argument("--config", type=Path, default=Path("config/ingest.yaml"))
++    view.add_argument("--input", required=True, type=Path, help="existing SChain graph JSON")
++    view.add_argument("--output", type=Path, default=Path("outputs/graph-explorer.html"))
++
++    evaluate = subparsers.add_parser("evaluate", help="score directed triples against a held-out gold set")
++    evaluate.add_argument("--config", type=Path, default=Path("config/ingest.yaml"))
++    evaluate.add_argument("--gold", required=True, type=Path)
++    evaluate.add_argument("--output", type=Path, default=None)
+     return parser
+ 
+ 
+@@ -135,7 +144,19 @@
+         format="%(levelname)-7s %(name)s: %(message)s",
+     )
+ 
++    if args.mode == "view":
++        from .viewer import main as viewer_main
++        return viewer_main(["--input", str(args.input), "--output", str(args.output)])
+     config = load_config(args.config)
++    if args.mode == "evaluate":
++        from .validation.gold import evaluate_file
++        report = evaluate_file(args.gold, storage_path(config, "extracted_facts"))
++        payload = json.dumps(report, indent=2, allow_nan=False)
++        if args.output:
++            from .checkpoint import atomic_write_json
++            atomic_write_json(args.output, report)
++        print(payload)
++        return 0
+     if args.mode == "validate":
+         return _run_validate(args, config)
+     if args.mode == "export":
+--- /dev/null
++++ b/schain/checkpoint.py
+@@ -0,0 +1,28 @@
++"""Small atomic writes for expensive intermediate results."""
++
++from __future__ import annotations
++
++import json
++import os
++import tempfile
++from pathlib import Path
++from typing import Any
++
++
++def atomic_write_json(path: Path, payload: Any) -> None:
++    """Replace a checkpoint only after the complete JSON is flushed to disk."""
++    path.parent.mkdir(parents=True, exist_ok=True)
++    temporary: Path | None = None
++    try:
++        with tempfile.NamedTemporaryFile(
++            mode="w", encoding="utf-8", dir=path.parent,
++            prefix=f".{path.name}.", suffix=".tmp", delete=False,
++        ) as handle:
++            temporary = Path(handle.name)
++            json.dump(payload, handle, ensure_ascii=False)
++            handle.flush()
++            os.fsync(handle.fileno())
++        os.replace(temporary, path)
++    finally:
++        if temporary is not None:
++            temporary.unlink(missing_ok=True)
+--- a/schain/graph_export.py
++++ b/schain/graph_export.py
+@@ -80,6 +80,23 @@
+     return str(cleaned)
+ 
+ 
++def _optional_bool(value: Any) -> Optional[bool]:
++    """Keep absent legacy validation flags unknown, including pandas nulls."""
++    value = json_safe(value)
++    if isinstance(value, bool):
++        return value
++    if value in (0, 1):
++        return bool(value)
++    return None
++
++
++def _any_flag(rows: list[dict[str, Any]], field: str) -> Optional[bool]:
++    flags = [_optional_bool(row.get(field)) for row in rows]
++    if True in flags:
++        return True
++    return False if False in flags else None
++
++
+ def _unique_sorted(values: list[Any]) -> list[str]:
+     seen: set[str] = set()
+     result: list[str] = []
+@@ -231,7 +248,50 @@
+     return tiers
+ 
+ 
++def _load_document_states(config: dict[str, Any]) -> Optional[dict[str, int]]:
++    """Count completed documents, including those that yielded zero accepted facts."""
++    path = storage_path(config, "state_db")
++    if not path.exists():
++        return None
++    connection = None
++    try:
++        connection = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro", uri=True)
++        rows = connection.execute(
++            "SELECT status, COUNT(*) FROM documents GROUP BY status"
++        ).fetchall()
++        return {str(status): int(count) for status, count in rows}
++    except sqlite3.Error as error:
++        logger.warning("could not read document states for export: %s", error)
++        return None
++    finally:
++        if connection is not None:
++            connection.close()
++
++
+ TIERABLE_TYPES = frozenset({"Company", "Mine"})
++
++
++def _supply_parents(edges: list[dict[str, Any]]) -> dict[str, set[str]]:
++    """Index eligible supply edges once; use legacy edges only if flags are absent."""
++    supply_edges = [edge for edge in edges if edge.get("relation") == "suppliesTo"]
++    flags = [
++        _optional_bool(edge.get("expansion_relevant"))
++        if _optional_bool(edge.get("expansion_relevant")) is not None
++        else _optional_bool((edge.get("quality") or {}).get("expansion_relevant"))
++        for edge in supply_edges
++    ]
++    has_flags = any(flag is not None for flag in flags)
++    parents: dict[str, set[str]] = {}
++    for edge, relevant in zip(supply_edges, flags):
++        quality = edge.get("quality") or {}
++        if has_flags and relevant is not True:
++            continue
++        if _optional_bool(quality.get("frontier_eligible")) is False:
++            continue
++        if quality.get("contested") is True or quality.get("status") == "contested":
++            continue
++        parents.setdefault(edge["source"], set()).add(edge["target"])
++    return parents
+ 
+ 
+ def _recompute_shortest_tiers(
+@@ -249,42 +309,18 @@
+     from collections import defaultdict, deque
+ 
+     by_id = {node["id"]: node for node in nodes}
+-    has_explicit_flag = any(
+-        edge.get("expansion_relevant") is not None
+-        or (edge.get("quality") or {}).get("expansion_relevant") is not None
+-        for edge in edges
+-        if edge.get("relation") == "suppliesTo"
+-    )
+-
+-    # Preserve frontier-assigned tiers as a fallback for nodes the BFS cannot reach
+-    # (e.g. missing expansion_relevant flags on partial fixtures).
+-    frontier_tiers = {
+-        node["id"]: node.get("discovery_tier")
+-        for node in nodes
+-        if node.get("discovery_tier") is not None and node.get("type") in TIERABLE_TYPES
+-    }
+-
+     upstream: dict[str, set[str]] = defaultdict(set)
+-    for edge in edges:
+-        if edge.get("relation") != "suppliesTo":
+-            continue
+-        relevant = edge.get("expansion_relevant")
+-        if relevant is None:
+-            relevant = (edge.get("quality") or {}).get("expansion_relevant")
+-        if has_explicit_flag and not relevant:
+-            continue
+-        if (edge.get("quality") or {}).get("frontier_eligible") is False:
+-            continue
+-        source = edge["source"]
+-        target = edge["target"]
++    for source, targets in _supply_parents(edges).items():
+         if by_id.get(source, {}).get("type") not in TIERABLE_TYPES:
+             continue
+-        upstream[target].add(source)
++        for target in targets:
++            if by_id.get(target, {}).get("type") in TIERABLE_TYPES:
++                upstream[target].add(source)
+ 
+     tiers: dict[str, int] = {}
+     parents: dict[str, set[str]] = defaultdict(set)
+     queue: deque[str] = deque()
+-    for seed_id in seed_ids:
++    for seed_id in sorted(seed_ids):
+         if seed_id in by_id:
+             tiers[seed_id] = 0
+             queue.append(seed_id)
+@@ -319,6 +355,7 @@
+             node["is_supply_chain_node"] = True
+             node["tier_parent_ids"] = []
+             node["tier_parent_id"] = None
++            node["discovered_from"] = None
+             continue
+         if node_id in tiers:
+             node["discovery_tier"] = tiers[node_id]
+@@ -328,41 +365,30 @@
+             if parent_list:
+                 node["discovered_from"] = parent_list[0]
+             node["is_supply_chain_node"] = True
+-        elif node_id in frontier_tiers:
+-            # Keep frontier assignment; invariant check may demote if parent path missing.
+-            node["discovery_tier"] = frontier_tiers[node_id]
+-            node["is_supply_chain_node"] = True
+         else:
+-            if node.get("is_seed"):
+-                node["discovery_tier"] = 0
+-                node["is_supply_chain_node"] = True
+-            else:
+-                node["discovery_tier"] = None
+-                node["tier_parent_id"] = None
+-                node["tier_parent_ids"] = []
+-                node["is_supply_chain_node"] = False
++            node["discovery_tier"] = None
++            node["tier_parent_id"] = None
++            node["tier_parent_ids"] = []
++            node["discovered_from"] = None
++            node["is_supply_chain_node"] = False
++            node["is_seed"] = False
+ 
+ 
+ def _apply_tier_semantics(
+     nodes: list[dict[str, Any]],
+     edges: list[dict[str, Any]],
++    max_tier: Optional[int] = None,
+ ) -> dict[str, Any]:
+     """Enforce supply-chain tier invariants; demote invalid tiers to context nodes."""
+     by_id = {node["id"]: node for node in nodes}
+-    supplies_parents: dict[str, set[str]] = {}
+-    for edge in edges:
+-        if edge.get("relation") != "suppliesTo":
+-            continue
+-        if not (
+-            edge.get("expansion_relevant")
+-            or (edge.get("quality") or {}).get("expansion_relevant")
+-        ):
+-            continue
+-        supplies_parents.setdefault(edge["source"], set()).add(edge["target"])
++    supplies_parents = _supply_parents(edges)
+ 
+     checked = 0
+     violations = 0
+-    for node in nodes:
++    # Validate shallow parents before their descendants, independent of node ID order.
++    for node in sorted(nodes, key=lambda n: (
++        n.get("discovery_tier") is None, n.get("discovery_tier") or 0, n["id"]
++    )):
+         ntype = node.get("type")
+         # Contextual types never carry supply-chain discovery tiers.
+         if ntype not in TIERABLE_TYPES:
+@@ -376,27 +402,21 @@
+             continue
+ 
+         tier = node.get("discovery_tier")
+-        node["is_expandable"] = ntype == "Company"
++        node["is_expandable"] = (
++            ntype == "Company" and tier is not None
++            and (max_tier is None or int(tier) < max_tier)
++        )
+         if tier is None:
+             node["is_supply_chain_node"] = bool(node.get("is_seed"))
+             continue
+ 
+         checked += 1
+-        if int(tier) == 0:
++        if int(tier) == 0 and node.get("is_seed"):
+             node["is_supply_chain_node"] = True
+             node.setdefault("tier_parent_ids", [])
+             continue
+ 
+         parents = supplies_parents.get(node["id"], set())
+-        # Legacy / frontier-only: also accept any suppliesTo parent when no
+-        # expansion-relevant edges were recorded on the graph.
+-        if not supplies_parents and not parents:
+-            for edge in edges:
+-                if (
+-                    edge.get("relation") == "suppliesTo"
+-                    and edge.get("source") == node["id"]
+-                ):
+-                    parents.add(edge["target"])
+         valid_parents = []
+         for parent_id in parents:
+             parent = by_id.get(parent_id)
+@@ -405,16 +425,7 @@
+             parent_tier = parent.get("discovery_tier")
+             if parent_tier is not None and int(parent_tier) == int(tier) - 1:
+                 valid_parents.append(parent_id)
+-        for parent_id in list(node.get("tier_parent_ids") or []):
+-            parent = by_id.get(parent_id)
+-            if parent is None:
+-                continue
+-            parent_tier = parent.get("discovery_tier")
+-            if parent_tier is not None and int(parent_tier) == int(tier) - 1:
+-                if parent_id not in valid_parents:
+-                    valid_parents.append(parent_id)
+-
+-        if not valid_parents:
++        if not valid_parents or (max_tier is not None and int(tier) > max_tier):
+             violations += 1
+             logger.warning(
+                 "tier invariant violation: %s tier=%s has no expansion-relevant "
+@@ -424,7 +435,9 @@
+             node["discovery_tier"] = None
+             node["tier_parent_id"] = None
+             node["tier_parent_ids"] = []
++            node["discovered_from"] = None
+             node["is_supply_chain_node"] = False
++            node["is_expandable"] = False
+         else:
+             node["tier_parent_ids"] = sorted(set(valid_parents))
+             node["tier_parent_id"] = node["tier_parent_ids"][0]
+@@ -450,9 +463,9 @@
+     relation_types = set(ontology.get("relation_types") or [])
+ 
+     # Seed matching uses canonical company ids for is_seed.
+-    from .names import canonical_id
+-
+-    seed_ids = {canonical_id("Company", name) for name in seed_names}
++    from .names import canonical_id, normalization_key
++
++    seed_ids: set[str] = set()
+     support_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+     if edge_support is not None and not edge_support.empty:
+         for row in edge_support.to_dict(orient="records"):
+@@ -516,9 +529,22 @@
+         if entity_id in node_meta:
+             node_meta[entity_id]["aliases"].update(extra)
+ 
++    # Resolve seed aliases against the already persisted canonical entities. An alias
++    # is used only when unambiguous; do not invent a second isolated CATL node when
++    # Prompt 2 stored its longer canonical company name.
++    alias_ids: dict[str, set[str]] = {}
++    for entity_id, meta in node_meta.items():
++        if meta["type"] == "Company":
++            for alias in meta["aliases"]:
++                alias_ids.setdefault(normalization_key(alias), set()).add(entity_id)
++
+     # Always emit configured seed companies, even with degree zero / no facts yet.
+     for seed_name in seed_names:
+         seed_id = canonical_id("Company", seed_name)
++        candidates = alias_ids.get(normalization_key(seed_name), set())
++        if seed_id not in node_meta and len(candidates) == 1:
++            seed_id = next(iter(candidates))
++        seed_ids.add(seed_id)
+         meta = node_meta.setdefault(
+             seed_id,
+             {
+@@ -551,7 +577,7 @@
+             discovery_tier = None
+             discovered_from = None
+             tier_parent_ids = []
+-        is_seed = entity_id in seed_ids or discovery_tier == 0
++        is_seed = entity_id in seed_ids
+         aliases = _unique_sorted(list(meta["aliases"]))
+         source_doc_ids = sorted(meta["source_doc_ids"])
+         nodes.append(
+@@ -591,7 +617,8 @@
+         for row in rows:
+             fact = _as_str(row.get("fact_id"))
+             doc_id = _as_str(row.get("doc_id"))
+-            url = _as_str(row.get("source_url"))
++            doc_meta = documents.get(doc_id, {})
++            url = _as_str(row.get("source_url")) or _as_str(doc_meta.get("source_url"))
+             if fact:
+                 fact_ids.append(fact)
+                 all_fact_ids.append(fact)
+@@ -599,7 +626,6 @@
+                 source_doc_ids.append(doc_id)
+             if url:
+                 source_urls.append(url)
+-            doc_meta = documents.get(doc_id, {})
+             provider = (
+                 _as_str(row.get("provider"))
+                 or _as_str(doc_meta.get("provider"))
+@@ -634,12 +660,12 @@
+                     ),
+                     "source_score": json_safe(
+                         row.get("source_effective_score")
+-                        if row.get("source_effective_score") is not None
++                        if not _is_missing(row.get("source_effective_score"))
+                         else doc_meta.get("source_effective_score")
+                     ),
+                     "source_known": json_safe(
+                         row.get("source_known")
+-                        if row.get("source_known") is not None
++                        if not _is_missing(row.get("source_known"))
+                         else doc_meta.get("source_known")
+                     ),
+                     "source_group_id": (
+@@ -656,6 +682,11 @@
+                     "provider": provider,
+                     "model": _as_str(row.get("model")) or None,
+                     "extracted_at": _as_str(row.get("extracted_at")) or None,
++                    "validation_status": _as_str(row.get("validation_status")) or None,
++                    "ontology_valid": _optional_bool(row.get("ontology_valid")),
++                    "evidence_validated": _optional_bool(row.get("evidence_validated")),
++                    "evidence_quote_grounded": _optional_bool(row.get("evidence_quote_grounded")),
++                    "direction_explicit": _optional_bool(row.get("direction_explicit")),
+                 }
+             )
+ 
+@@ -679,19 +710,38 @@
+             quality_status = "accepted"
+         elif quality_status in ("strong_candidate", "verified"):
+             quality_status = "accepted_high_reputation"
+-        contested = quality_status == "contested" or bool(
++        contested = quality_status == "contested" or _optional_bool(
+             support.get("has_supporting_conflict")
+-        )
++        ) is True
+         if contested:
+             quality_status = "contested"
+-        support_count = (
+-            int(support["document_count"])
+-            if support.get("document_count") is not None
+-            else len(unique_docs)
++        # Facts are the source of truth; a cached edge-support table can lag behind
++        # after an interrupted run. Missing flags must never turn into True via NaN.
++        support_count = len(unique_docs)
++        expansion_relevant = _any_flag(rows, "expansion_relevant")
++        ontology_valid = _any_flag(rows, "ontology_valid")
++        evidence_validated = _any_flag(rows, "evidence_validated")
++        evidence_quote_grounded = _any_flag(rows, "evidence_quote_grounded")
++        direction_explicit = _any_flag(rows, "direction_explicit")
++        gates = ("ontology_valid", "evidence_validated", "direction_explicit", "expansion_relevant")
++        has_valid_witness = any(
++            all(_optional_bool(row.get(field)) is True for field in gates)
++            and _optional_bool(row.get("evidence_quote_grounded")) is not False
++            for row in rows
+         )
+-        expansion_relevant = bool(support.get("expansion_relevant", False))
+-        if support.get("expansion_relevant") is None:
+-            expansion_relevant = any(bool(r.get("expansion_relevant")) for r in rows)
++        frontier_eligible: Optional[bool] = None
++        if any(value is not None for value in (
++            ontology_valid, evidence_validated, direction_explicit, expansion_relevant
++        )):
++            frontier_eligible = (
++                relation == "suppliesTo"
++                and rows[0].get("subject_type") in TIERABLE_TYPES
++                and has_valid_witness
++            )
++        if contested or _optional_bool(support.get("frontier_eligible")) is False:
++            frontier_eligible = False
++        scores = [item["source_score"] for item in evidence_items
++                  if isinstance(item["source_score"], (int, float))]
+         edge = {
+             "id": semantic_edge_id(source_id, relation, target_id),
+             "source": source_id,
+@@ -710,13 +760,16 @@
+                 "status": quality_status,
+                 # Compatibility for older frontend readers; not computed from source counts.
+                 "verification_status": "not_required",
+-                "max_source_score": json_safe(support.get("max_source_score")),
+-                "average_source_score": json_safe(support.get("average_source_score")),
+-                "full_text_support_count": json_safe(support.get("full_text_support_count")),
+-                "ontology_valid": True,
+-                "evidence_validated": True,
+-                "direction_explicit": json_safe(support.get("direction_explicit")),
+-                "frontier_eligible": bool(support.get("frontier_eligible", False)),
++                "max_source_score": max(scores) if scores else None,
++                "average_source_score": sum(scores) / len(scores) if scores else None,
++                "full_text_support_count": sum(
++                    item.get("content_source") == "full_text" for item in evidence_items
++                ),
++                "ontology_valid": ontology_valid,
++                "evidence_validated": evidence_validated,
++                "evidence_quote_grounded": evidence_quote_grounded,
++                "direction_explicit": direction_explicit,
++                "frontier_eligible": frontier_eligible,
+                 "expansion_relevant": expansion_relevant,
+                 "frontier_reason": json_safe(support.get("frontier_reason")),
+                 "frontier_rejection_reason": json_safe(
+@@ -728,7 +781,7 @@
+         edges.append(edge)
+ 
+     _recompute_shortest_tiers(nodes, edges, seed_ids, max_tier=max_tier)
+-    tier_stats = _apply_tier_semantics(nodes, edges)
++    tier_stats = _apply_tier_semantics(nodes, edges, max_tier=max_tier)
+     return nodes, edges, all_fact_ids, tier_stats
+ 
+ 
+@@ -884,7 +937,10 @@
+                 pass
+ 
+     discovery_tiers: dict[str, int] = {}
+-    tier_counts = {i: 0 for i in range(0, 6)}
++    configured_depth = int(((config or {}).get("expansion") or {}).get("max_tier", 5))
++    observed_depth = max((int(node["discovery_tier"]) for node in nodes
++                          if node.get("discovery_tier") is not None), default=0)
++    tier_counts = {i: 0 for i in range(max(5, configured_depth, observed_depth) + 1)}
+     tiered_supply = context_nodes = 0
+     for node in nodes:
+         tier = node.get("discovery_tier")
+@@ -922,7 +978,8 @@
+         "nodes": len(nodes),
+         "edges": len(edges),
+         "documents": len(documents),
+-        "documents_processed": len(documents),
++        # Filled from checkpoint completion states by build_graph_bundle.
++        "documents_processed": None,
+         "evidence_items": evidence_items,
+         "entity_types": dict(sorted(entity_types.items())),
+         "relation_types": dict(sorted(relation_types.items())),
+@@ -933,6 +990,7 @@
+         "tier_3_nodes": tier_counts[3],
+         "tier_4_nodes": tier_counts[4],
+         "tier_5_nodes": tier_counts[5],
++        **{f"tier_{tier}_nodes": count for tier, count in tier_counts.items() if tier > 5},
+         "seed_count": tier_counts[0],
+         "seeds_by_group": (config or {}).get("_seeds_by_group") or {},
+         "tiered_supply_chain_nodes": tiered_supply,
+@@ -1045,6 +1103,13 @@
+         config={**config, "_seeds_by_group": groups},
+         tier_stats=tier_stats,
+     )
++    document_states = _load_document_states(config)
++    stats["documents_available"] = len(documents)
++    stats["documents_with_facts"] = len(referenced_docs)
++    stats["document_states"] = document_states
++    stats["documents_processed"] = (
++        document_states.get("COMMITTED", 0) if document_states is not None else None
++    )
+ 
+     bundle = {
+         "schema_version": SCHEMA_VERSION,
+--- a/schain/kg/extract.py
++++ b/schain/kg/extract.py
+@@ -11,8 +11,10 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import hashlib
++import json
+ import logging
+-import time
++from pathlib import Path
+ from typing import Any
+ 
+ from neo4j_graphrag.components.entity_relation_extractor import (
+@@ -20,9 +22,10 @@
+     OnError,
+ )
+ from neo4j_graphrag.components.text_splitters.fixed_size_splitter import FixedSizeSplitter
+-from neo4j_graphrag.components.types import Neo4jGraph
++from neo4j_graphrag.components.types import Neo4jGraph, TextChunks
+ from neo4j_graphrag.llm import LLMInterface
+ 
++from ..checkpoint import atomic_write_json
+ from ..ontology import EXTRACTION_EXAMPLES, SupplyChainERTemplate, build_graph_schema
+ 
+ logger = logging.getLogger(__name__)
+@@ -34,6 +37,8 @@
+         "connection", "timeout", "timed out", "temporarily unavailable",
+         "connect error", "server disconnected", "remote protocol",
+         "network", "unavailable", "connectionerror",
++        "rate limit", "ratelimit", "too many requests", "429",
++        "bad gateway", "gateway timeout", "502", "503", "504",
+     )
+     return any(needle in text for needle in needles)
+ 
+@@ -44,49 +49,109 @@
+     ontology: dict[str, Any],
+     chunk_size: int = 2000,
+     chunk_overlap: int = 200,
+-    on_error: str = "IGNORE",
++    on_error: str = "RAISE",
+     max_concurrency: int = 4,
+     structured_output: bool = False,
++    checkpoint_dir: Path | None = None,
+ ) -> tuple[Neo4jGraph, dict[str, int]]:
+     """Extract a graph from one normalized document record.
+ 
+     Returns the extracted graph plus a ``chunk_id -> chunk index`` map. The extractor
+     prefixes every node id with its chunk id, so that map is what lets a fact be traced
+-    back to the part of the document it came from.
++    back to the part of the document it came from. When ``checkpoint_dir`` is supplied,
++    successful chunks are saved separately and reused after an interruption. The cache
++    key includes the exact prompt, model settings and parsing policy.
+     """
++    if max_concurrency < 1:
++        raise ValueError("max_concurrency must be at least 1")
++    if chunk_overlap < 0:
++        raise ValueError("chunk_overlap must be non-negative")
+     splitter = FixedSizeSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+     chunks = asyncio.run(splitter.run(text=document["text"]))
+     logger.info("split doc %s into %d chunk(s)", document["doc_id"], len(chunks.chunks))
+ 
++    template = SupplyChainERTemplate()
++    schema = build_graph_schema(ontology)
+     extractor = LLMEntityRelationExtractor(
+         llm=llm,
+-        prompt_template=SupplyChainERTemplate(),
++        prompt_template=template,
+         create_lexical_graph=False,
+         on_error=OnError(on_error),
+         max_concurrency=max_concurrency,
+         use_structured_output=structured_output,
+     )
+ 
+-    def _run_extract() -> Neo4jGraph:
+-        return asyncio.run(
+-            extractor.run(
+-                chunks=chunks,
+-                schema=build_graph_schema(ontology),
+-                examples=EXTRACTION_EXAMPLES,
+-            )
++    # FixedSizeSplitter normally generates random ids. Stable ids preserve provenance
++    # when old and newly extracted chunks are combined during resume.
++    for chunk in chunks.chunks:
++        chunk.uid = hashlib.sha256(
++            f"{document['doc_id']}:{chunk.index}:{chunk.text}".encode("utf-8")
++        ).hexdigest()[:32]
++
++    async def _run_extract() -> Neo4jGraph:
++        semaphore = asyncio.Semaphore(max_concurrency)
++
++        async def extract_chunk(chunk) -> Neo4jGraph:
++            cache_file = None
++            if checkpoint_dir is not None:
++                signature = {
++                    "version": 1,
++                    "chunk_id": chunk.chunk_id,
++                    "prompt": template.format(
++                        text=chunk.text, schema=schema.model_dump(exclude_none=True),
++                        examples=EXTRACTION_EXAMPLES,
++                    ),
++                    "model": getattr(llm, "model_name", None),
++                    "provider": f"{type(llm).__module__}.{type(llm).__qualname__}",
++                    "model_params": getattr(llm, "model_params", None),
++                    "structured_output": structured_output,
++                    "on_error": on_error,
++                }
++                digest = hashlib.sha256(
++                    json.dumps(signature, sort_keys=True, default=str).encode("utf-8")
++                ).hexdigest()
++                cache_file = Path(checkpoint_dir) / f"{chunk.index}-{digest}.json"
++                if cache_file.exists():
++                    try:
++                        cached = Neo4jGraph.model_validate_json(
++                            cache_file.read_text(encoding="utf-8")
++                        )
++                    except (ValueError, OSError):
++                        logger.warning("ignoring damaged chunk checkpoint %s", cache_file)
++                    else:
++                        logger.info("doc %s: reusing chunk %d", document["doc_id"], chunk.index)
++                        return cached
++
++            async with semaphore:
++                for attempt in range(2):
++                    try:
++                        result = await extractor.run(
++                            chunks=TextChunks(chunks=[chunk]), schema=schema,
++                            examples=EXTRACTION_EXAMPLES,
++                        )
++                        break
++                    except Exception as error:  # noqa: BLE001
++                        if attempt or not _is_transient_llm_error(error):
++                            raise
++                        logger.warning(
++                            "transient LLM error on doc %s chunk %d (%s); retrying once",
++                            document["doc_id"], chunk.index, error,
++                        )
++                        await asyncio.sleep(1.5)
++                if cache_file is not None:
++                    atomic_write_json(cache_file, result.model_dump())
++                return result
++
++        # Await every started chunk so completed work is saved even if a sibling fails.
++        results = await asyncio.gather(
++            *(extract_chunk(chunk) for chunk in chunks.chunks), return_exceptions=True,
+         )
++        for result in results:
++            if isinstance(result, BaseException):
++                raise result
++        return extractor.combine_chunk_graphs(None, results)
+ 
+-    try:
+-        graph = _run_extract()
+-    except Exception as error:  # noqa: BLE001
+-        if not _is_transient_llm_error(error):
+-            raise
+-        logger.warning(
+-            "transient LLM error on doc %s (%s); retrying once",
+-            document["doc_id"], error,
+-        )
+-        time.sleep(1.5)
+-        graph = _run_extract()
++    graph = asyncio.run(_run_extract())
+ 
+     logger.info(
+         "extracted %d node(s) and %d relationship(s) from doc %s",
+--- a/schain/kg/facts.py
++++ b/schain/kg/facts.py
+@@ -11,6 +11,7 @@
+ from __future__ import annotations
+ 
+ import hashlib
++import json
+ import logging
+ from datetime import datetime, timezone
+ from pathlib import Path
+@@ -34,13 +35,28 @@
+     "content_source", "source_group_id",
+     "provider", "query", "origin_entity", "tier",
+     "expansion_relevant",
+-    "direction_explicit",
++    "direction_explicit", "evidence_quote_grounded",
+ ]
+ 
+ 
+-def fact_id(doc_id: str, subject_id: str, relation: str, object_id: str) -> str:
+-    """Deterministic row identifier, so re-running a document cannot duplicate facts."""
+-    payload = "|".join([doc_id, subject_id, relation, object_id])
++def fact_id(
++    doc_id: str, subject_id: str, relation: str, object_id: str,
++    evidence: Optional[str] = None, chunk_index: Optional[int] = None,
++) -> str:
++    """Identify a witnessed triple without collapsing its other supporting quotes.
++
++    The four-argument form retains the legacy document/triple identity for callers
++    reading older artifacts. New extraction includes the quote and chunk. Resume
++    continues to load existing artifacts; a fresh run is needed to recover quotes
++    already discarded by older versions.
++    """
++    if evidence is None and chunk_index is None:
++        payload = "|".join([doc_id, subject_id, relation, object_id])
++    else:
++        payload = json.dumps(
++            [doc_id, subject_id, relation, object_id, evidence, chunk_index],
++            ensure_ascii=False, separators=(",", ":"),
++        )
+     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+ 
+ 
+@@ -94,14 +110,17 @@
+             subject_type=subject["label"],
+             origin_entity=origin,
+         )
++        evidence = (relationship.properties or {}).get("evidence", "")
++        chunk_index = chunk_index_of(relationship.start_node_id, chunk_index_by_id)
+         rows.append(
+             {
+                 "fact_id": fact_id(
+                     document["doc_id"], subject["canonical_id"],
+                     relationship.type, target["canonical_id"],
++                    evidence=evidence, chunk_index=chunk_index,
+                 ),
+                 "doc_id": document["doc_id"],
+-                "chunk_index": chunk_index_of(relationship.start_node_id, chunk_index_by_id),
++                "chunk_index": chunk_index,
+                 "source_url": document.get("source_url"),
+                 "subject_id": subject["canonical_id"],
+                 "subject_type": subject["label"],
+@@ -112,7 +131,7 @@
+                 "object_type": target["label"],
+                 "object_name": target["canonical_name"],
+                 "object_mention": target["mention"],
+-                "evidence": (relationship.properties or {}).get("evidence", ""),
++                "evidence": evidence,
+                 "model": model,
+                 "extracted_at": extracted_at,
+                 "validation_status": None,
+--- a/schain/kg/validate.py
++++ b/schain/kg/validate.py
+@@ -9,6 +9,7 @@
+ import hashlib
+ import json
+ import logging
++import unicodedata
+ from datetime import datetime, timezone
+ from pathlib import Path
+ from typing import Any, Optional
+@@ -17,7 +18,7 @@
+ from json_repair import repair_json
+ 
+ from ..config import storage_path
+-from .facts import FACT_COLUMNS
++from .facts import FACT_COLUMNS, fact_id
+ from .relation_evidence import (
+     check_supplies_to_direction,
+     lexical_relation_gate,
+@@ -276,12 +277,16 @@
+     try:
+         raw = llm.invoke(prompt).content
+         payload = json.loads(repair_json(raw))
+-        results = payload.get("results") or []
++        results = payload.get("results", []) if isinstance(payload, dict) else []
+     except Exception as error:  # noqa: BLE001
+         logger.warning("evidence batch validation failed (%s); leaving unchecked", error)
+         return {row["candidate_fact_id"]: "unclear" for row in rows}
+     decisions: dict[str, str] = {}
++    if not isinstance(results, list):
++        results = []
+     for item in results:
++        if not isinstance(item, dict):
++            continue
+         cid = str(item.get("candidate_fact_id") or "")
+         decision = str(item.get("decision") or "unclear").lower()
+         if decision not in ("supports", "contradicts", "unclear"):
+@@ -293,13 +298,22 @@
+     return decisions
+ 
+ 
++def normalize_evidence_text(value: Any) -> str:
++    """Match source quotes with Unicode NFKC and whitespace normalization only.
++
++    Case, punctuation, negation and numbers remain significant. No fuzzy matching
++    can turn a hallucinated paraphrase into source evidence.
++    """
++    return " ".join(unicodedata.normalize("NFKC", str(value or "")).split())
++
++
+ def validate_facts_frame(
+     facts: pd.DataFrame,
+     *,
+     config: dict[str, Any],
+     ontology: dict[str, Any],
+     llm=None,
+-    document_text: str = "",
++    document_text: Optional[str] = None,
+ ) -> tuple[pd.DataFrame, pd.DataFrame]:
+     """Validate candidate facts; return (accepted, rejected)."""
+     if facts is None or facts.empty:
+@@ -314,6 +328,10 @@
+     evidence_cfg = validation.get("evidence") or {}
+     evidence_batch = int(evidence_cfg.get("batch_size", 10))
+     policy = load_relation_evidence(evidence_cfg.get("policy_file"))
++
++    # Normalize once per document; whitespace variation from PDF/text splitting is harmless.
++    source_text = normalize_evidence_text(document_text) if document_text is not None else None
++    require_quote = evidence_cfg.get("require_source_quote", True)
+ 
+     accepted_rows: list[dict[str, Any]] = []
+     rejected_rows: list[dict[str, Any]] = []
+@@ -336,6 +354,17 @@
+             row["evidence_validated"] = False
+         if row.get("direction_explicit") is None:
+             row["direction_explicit"] = None
++        # Never inherit stale validation assertions from an input frame.
++        row["ontology_valid"] = is_ontology_valid(
++            str(row.get("subject_type")), str(row.get("relation")),
++            str(row.get("object_type")), ontology,
++        ) if ontology_enabled else False
++        row["evidence_validated"] = False
++        quote = normalize_evidence_text(row.get("evidence"))
++        row["evidence_quote_grounded"] = bool(quote and quote in source_text) if source_text is not None else None
++        if require_quote and source_text is not None and not row["evidence_quote_grounded"]:
++            rejected_rows.append(_reject_row(row, "grounding", "evidence_not_in_source"))
++            continue
+         repaired = False
+ 
+         # Reject generic category phrases labelled as Company (auditable rejection).
+@@ -377,6 +406,11 @@
+                     row.get("object_name"), new_relation,
+                 )
+                 row["relation"] = new_relation
++                row["fact_id"] = fact_id(
++                    str(row.get("doc_id") or ""), str(row.get("subject_id") or ""),
++                    new_relation, str(row.get("object_id") or ""),
++                    str(row.get("evidence") or ""), row.get("chunk_index"),
++                )
+                 row["ontology_valid"] = True
+                 row["validation_status"] = "repaired"
+             else:
+@@ -433,9 +467,14 @@
+     for start in range(0, len(pending_evidence), max(1, evidence_batch)):
+         batch = pending_evidence[start:start + max(1, evidence_batch)]
+         if llm is None:
+-            decisions = {row["candidate_fact_id"]: "supports" for row in batch}
+-        else:
+-            decisions = _batch_evidence_validate(llm, batch)
++            # Retain deterministic-only candidates for offline inspection without
++            # asserting model entailment or allowing them to pass the frontier gate.
++            for row in batch:
++                row["evidence_validated"] = False
++                row["validation_status"] = "unchecked"
++                accepted_rows.append(row)
++            continue
++        decisions = _batch_evidence_validate(llm, batch)
+         for row in batch:
+             decision = decisions.get(row["candidate_fact_id"], "unclear")
+             if decision == "supports":
+--- a/schain/kg/writer.py
++++ b/schain/kg/writer.py
+@@ -13,10 +13,12 @@
+ 
+ from __future__ import annotations
+ 
++import json
+ import logging
+ from typing import Any, Iterable, Optional
+ 
+ import neo4j
++import pandas as pd
+ 
+ logger = logging.getLogger(__name__)
+ 
+@@ -63,8 +65,10 @@
+     for node in nodes:
+         by_label.setdefault(node["label"], []).append(node)
+ 
++    entity_types = tuple(entity_types)
++    for label in by_label:
++        _validate(label, entity_types, "entity label")
+     for label, rows in by_label.items():
+-        _validate(label, entity_types, "entity label")
+         query = (
+             "UNWIND $rows AS row "
+             f"MERGE (e:{label}:Entity {{canonical_id: row.canonical_id}}) "
+@@ -90,31 +94,69 @@
+ ) -> int:
+     """MERGE relationships, one statement per relation type.
+ 
+-    ``source_doc_ids`` accumulates the documents a relationship was seen in, so the same
+-    fact arriving from a second document is recorded without creating a second edge.
++    Each semantic edge retains all source documents and quote-to-document records.
++    Neo4j properties cannot hold a list of maps, so ``evidence_records`` is a list of
++    JSON strings. Stable serialization makes repeated writes idempotent. The original
++    scalar ``evidence`` property remains available to older Cypher queries.
+     """
+     written = 0
+     by_type: dict[str, list[dict[str, Any]]] = {}
+     for relationship in relationships:
+-        by_type.setdefault(relationship["type"], []).append(relationship)
+-
++        row = dict(relationship)
++        record = {
++            key: _property_value(row.get(key))
++            for key in (
++                "fact_id", "doc_id", "chunk_index", "evidence", "source_url",
++                "canonical_source_url", "retrieval_url", "model",
++                "validation_status", "ontology_valid", "evidence_validated",
++                "evidence_quote_grounded", "direction_explicit",
++            )
++        }
++        row["evidence_record"] = json.dumps(
++            record, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
++            allow_nan=False,
++        )
++        row["fact_ids"] = [record["fact_id"]] if record["fact_id"] else []
++        row["source_urls"] = sorted({
++            record[key] for key in ("source_url", "canonical_source_url", "retrieval_url")
++            if record[key]
++        })
++        by_type.setdefault(row["type"], []).append(row)
++
++    relation_types = tuple(relation_types)
++    for relation_type in by_type:
++        _validate(relation_type, relation_types, "relation type")
+     for relation_type, rows in by_type.items():
+-        _validate(relation_type, relation_types, "relation type")
+         query = (
+             "UNWIND $rows AS row "
+             "MATCH (a:Entity {canonical_id: row.start_id}) "
+             "MATCH (b:Entity {canonical_id: row.end_id}) "
+             f"MERGE (a)-[r:{relation_type}]->(b) "
+             "ON CREATE SET r.first_seen_doc_id = row.doc_id "
+-            "SET r.evidence = row.evidence, "
++            "SET r.evidence = coalesce(r.evidence, row.evidence), "
+             "    r.source_doc_ids = [d IN coalesce(r.source_doc_ids, []) "
+-            "                        WHERE d <> row.doc_id] + [row.doc_id]"
++            "                        WHERE d <> row.doc_id] + [row.doc_id], "
++            "    r.fact_ids = [f IN coalesce(r.fact_ids, []) "
++            "                  WHERE NOT f IN row.fact_ids] + row.fact_ids, "
++            "    r.source_urls = [u IN coalesce(r.source_urls, []) "
++            "                     WHERE NOT u IN row.source_urls] + row.source_urls, "
++            "    r.evidence_records = [v IN coalesce(r.evidence_records, []) "
++            "                          WHERE v <> row.evidence_record] + [row.evidence_record]"
+         )
+         for batch in _batched(rows, batch_size):
+             driver.execute_query(query, rows=batch, database_=database)
+         written += len(rows)
+         logger.info("merged %d %s relationship(s)", len(rows), relation_type)
+     return written
++
++
++def _property_value(value: Any) -> Any:
++    """Convert nullable pandas scalars to JSON/Neo4j-compatible property values."""
++    if value is None or pd.isna(value):
++        return None
++    if hasattr(value, "item"):
++        return value.item()
++    return value
+ 
+ 
+ def facts_to_graph_rows(
+@@ -149,6 +191,14 @@
+                 "end_id": row["object_id"],
+                 "evidence": row["evidence"],
+                 "doc_id": row["doc_id"],
++                **{
++                    field: _property_value(row.get(field))
++                    for field in (
++                        "fact_id", "chunk_index", "source_url", "canonical_source_url",
++                        "retrieval_url", "model", "validation_status", "ontology_valid",
++                        "evidence_validated", "evidence_quote_grounded", "direction_explicit",
++                    )
++                },
+             }
+         )
+     return list(nodes.values()), relationships
+--- a/schain/pipeline.py
++++ b/schain/pipeline.py
+@@ -17,6 +17,7 @@
+ 
+ import json
+ import logging
++import shutil
+ from pathlib import Path
+ from typing import Any, Optional
+ 
+@@ -26,6 +27,7 @@
+ import pandas as pd
+ 
+ from . import state
++from .checkpoint import atomic_write_json
+ from .config import neo4j_settings, storage_dir, storage_path
+ from .documents import append_raw_jsonl, upsert_normalized_parquet
+ from .kg.extract import extract_graph
+@@ -52,9 +54,7 @@
+ ) -> None:
+     """Persist Prompt 1 output before anything else can fail."""
+     payload = {"graph": graph.model_dump(), "chunk_index": chunk_index}
+-    _extraction_file(config, doc_id).write_text(
+-        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+-    )
++    atomic_write_json(_extraction_file(config, doc_id), payload)
+ 
+ 
+ def load_extraction(
+@@ -79,6 +79,56 @@
+         frame = pd.concat([pd.read_parquet(path), frame], ignore_index=True)
+         frame = frame.drop_duplicates(subset=["doc_id", "node_id"], keep="last")
+     frame.reset_index(drop=True).to_parquet(path, index=False)
++
++
++def _load_resolution(
++    config: dict[str, Any], doc_id: str,
++) -> dict[str, dict[str, Any]]:
++    """Restore alias groups when the process resumes directly at the graph write."""
++    path = storage_path(config, "entity_resolution")
++    if not path.exists():
++        return {}
++    frame = pd.read_parquet(path, filters=[("doc_id", "==", doc_id)])
++    return {
++        row["node_id"]: {
++            **row, "aliases": list(row["aliases"]) if row.get("aliases") is not None else [],
++        }
++        for row in frame.to_dict(orient="records")
++    }
++
++
++def _persist_document(
++    document: dict[str, Any], config: dict[str, Any], *, is_new: bool, status: str,
++) -> dict[str, Any]:
++    """Repair registration interruptions and retain the first source attribution.
++
++    The same text may be rediscovered under a different URL before resolution finishes.
++    Resuming must keep the original record that produced the saved extraction.
++    """
++    normalized = storage_path(config, "normalized_documents")
++    raw = storage_path(config, "raw_documents")
++    stored = pd.DataFrame()
++    if not is_new and normalized.exists():
++        stored = pd.read_parquet(normalized, filters=[("doc_id", "==", document["doc_id"])])
++    if not stored.empty:
++        document = {
++            key: None if pd.isna(value) else value
++            for key, value in stored.iloc[0].to_dict().items()
++        }
++    elif not is_new and raw.exists():
++        with raw.open(encoding="utf-8") as handle:
++            for line in handle:
++                if line.strip():
++                    record = json.loads(line)
++                    if record.get("doc_id") == document["doc_id"]:
++                        document = record
++                        break
++
++    if is_new or stored.empty or status in (state.PENDING, state.PROCESSING, state.FAILED):
++        append_raw_jsonl(document, raw)
++    if stored.empty:
++        upsert_normalized_parquet(document, normalized)
++    return document
+ 
+ 
+ def clear_generated_data(config: dict[str, Any]) -> list[str]:
+@@ -102,6 +152,10 @@
+     for file in extractions.glob("*.json"):
+         file.unlink()
+         removed.append(str(file))
++    for directory in extractions.glob("*.chunks"):
++        if directory.is_dir():
++            shutil.rmtree(directory)
++            removed.append(str(directory))
+     return removed
+ 
+ 
+@@ -153,6 +207,7 @@
+     ingest_config = config.get("ingest", {})
+     model = config.get("llm", {}).get("model")
+ 
++    document = dict(document)
+     doc_id, is_new = state.register_document(connection, document, origin_entity, tier)
+     if origin_entity is not None:
+         document["origin_entity"] = origin_entity
+@@ -169,10 +224,6 @@
+         summary["status"] = state.document_status(connection, doc_id)
+         logger.info("doc %s is a duplicate of known content, skipping", document["doc_id"])
+         return summary
+-
+-    if is_new:
+-        append_raw_jsonl(document, storage_path(config, "raw_documents"))
+-        upsert_normalized_parquet(document, storage_path(config, "normalized_documents"))
+ 
+     status = state.document_status(connection, doc_id) or state.PENDING
+     if status == state.COMMITTED and resume:
+@@ -201,6 +252,7 @@
+     resolution: dict[str, dict[str, Any]] = {}
+ 
+     try:
++        document = _persist_document(document, config, is_new=is_new, status=status)
+         # --- Prompt 1 ---
+         if status in (state.PENDING, state.PROCESSING, state.FAILED):
+             state.set_document_status(connection, doc_id, state.PROCESSING, increment_attempts=True)
+@@ -208,9 +260,10 @@
+                 llm, document, ontology,
+                 chunk_size=ingest_config.get("chunk_size", 2000),
+                 chunk_overlap=ingest_config.get("chunk_overlap", 200),
+-                on_error=ingest_config.get("on_error", "IGNORE"),
++                on_error=ingest_config.get("on_error", "RAISE"),
+                 max_concurrency=config.get("concurrency", {}).get("llm_max_concurrency", 4),
+                 structured_output=config.get("llm", {}).get("structured_output", False),
++                checkpoint_dir=storage_dir(config, "extractions") / f"{doc_id}.chunks",
+             )
+             save_extraction(config, doc_id, graph, chunk_index)
+             state.set_document_status(connection, doc_id, state.EXTRACTED)
+@@ -266,6 +319,8 @@
+             if driver is None:
+                 logger.info("doc %s: no Neo4j driver, stopping at RESOLVED", doc_id)
+             else:
++                if not resolution:
++                    resolution = _load_resolution(config, doc_id)
+                 nodes, rels = commit_facts(driver, config, facts, ontology, resolution)
+                 state.set_document_status(connection, doc_id, state.COMMITTED)
+                 status = state.COMMITTED
+--- /dev/null
++++ b/schain/validation/gold.py
+@@ -0,0 +1,63 @@
++"""Exact, directed relation evaluation on a fully annotated held-out document set.
++
++Unlike external-reference coverage, this is closed-world evaluation: all in-scope
++triples in each listed document must be labeled, including zero-relation documents.
++"""
++from __future__ import annotations
++import json
++from pathlib import Path
++from typing import Any
++
++
++def _scores(predicted: set, gold: set) -> dict[str, Any]:
++    tp = len(predicted & gold)
++    fp, fn = len(predicted - gold), len(gold - predicted)
++    return {"true_positive": tp, "false_positive": fp, "false_negative": fn,
++            "precision": tp / len(predicted) if predicted else None,
++            "recall": tp / len(gold) if gold else None,
++            "f1": 2 * tp / (2 * tp + fp + fn) if (2 * tp + fp + fn) else None}
++
++
++def evaluate_gold(gold: dict, facts: Any) -> dict:
++    documents = gold.get("documents") if isinstance(gold, dict) else None
++    if not isinstance(documents, list) or not documents:
++        raise ValueError("Gold JSON must contain a non-empty documents array")
++    gold_edges, scope = set(), set()
++    for doc in documents:
++        if not isinstance(doc, dict) or not isinstance(doc.get("doc_id"), str) or not doc["doc_id"] or doc["doc_id"] in scope:
++            raise ValueError("Gold document IDs must be unique non-empty strings")
++        if not isinstance(doc.get("triples"), list):
++            raise ValueError("Each gold document needs a triples list (empty for negatives)")
++        scope.add(doc["doc_id"])
++        for edge in doc["triples"]:
++            if not isinstance(edge, dict) or any(not isinstance(edge.get(k), str) or not edge[k] for k in ("subject_id", "relation", "object_id")):
++                raise ValueError("Each gold triple needs subject_id, relation, object_id strings")
++            gold_edges.add((doc["doc_id"], edge["subject_id"], edge["relation"], edge["object_id"]))
++    rows = facts.to_dict(orient="records") if hasattr(facts, "to_dict") else facts
++    predicted, excluded_docs = set(), set()
++    for row in rows:
++        if any(not isinstance(row.get(k), str) or not row[k] for k in ("doc_id", "subject_id", "relation", "object_id")):
++            raise ValueError("Predictions need non-empty doc_id, subject_id, relation, object_id strings")
++        if row["doc_id"] not in scope:
++            excluded_docs.add(row["doc_id"])
++            continue
++        predicted.add(tuple(row[k] for k in ("doc_id", "subject_id", "relation", "object_id")))
++    relations = sorted({e[2] for e in predicted | gold_edges})
++    return {"evaluation": "exact_document_level_directed_triples", "gold_documents": len(scope),
++            "excluded_prediction_documents": len(excluded_docs),
++            "gold_triples": len(gold_edges), "predicted_triples": len(predicted),
++            "micro": _scores(predicted, gold_edges),
++            "per_relation": {r: _scores({e for e in predicted if e[2] == r}, {e for e in gold_edges if e[2] == r}) for r in relations},
++            "false_positives": [list(e) for e in sorted(predicted - gold_edges)],
++            "false_negatives": [list(e) for e in sorted(gold_edges - predicted)],
++            "notes": ["Canonical IDs and edge direction must match exactly; duplicate evidence is counted once.",
++                      "All allowed relations in the listed documents must be fully annotated.",
++                      "Null metrics mean an undefined denominator, not measured perfect performance.",
++                      "This evaluates accepted relation extraction, not isolated-entity NER or source truthfulness."]}
++
++
++def evaluate_file(gold_path: Path, facts_path: Path) -> dict:
++    import pandas as pd
++    if not facts_path.exists():
++        raise FileNotFoundError(f"Prediction facts not found: {facts_path}")
++    return evaluate_gold(json.loads(gold_path.read_text(encoding="utf-8")), pd.read_parquet(facts_path))
+--- /dev/null
++++ b/schain/viewer.py
+@@ -0,0 +1,105 @@
++"""Build a self-contained, offline graph explorer from a SChain JSON export.
++
++This module uses only the Python standard library; no model or Neo4j is needed.
++"""
++from __future__ import annotations
++
++import argparse
++import json
++import math
++from importlib.resources import files
++from pathlib import Path
++from typing import Any
++
++
++def validate_graph(data: Any) -> dict:
++    if not isinstance(data, dict) or not isinstance(data.get("nodes"), list) or not isinstance(data.get("edges"), list):
++        raise ValueError("Expected a SChain graph object with nodes and edges arrays")
++    ids = [n.get("id") for n in data["nodes"] if isinstance(n, dict)]
++    if len(ids) != len(data["nodes"]) or any(not isinstance(i, str) or not i for i in ids) or len(ids) != len(set(ids)):
++        raise ValueError("Node IDs must be unique, non-empty strings")
++    known = set(ids)
++    nodes = []
++    for n in data["nodes"]:
++        for key in ("name", "type"):
++            if n.get(key) is not None and not isinstance(n[key], str):
++                raise ValueError(f"Node {key} must be a string when present")
++        if n.get("aliases") is not None and (
++            not isinstance(n["aliases"], list) or any(not isinstance(a, str) for a in n["aliases"])
++        ):
++            raise ValueError("Node aliases must be an array of strings")
++        tier = n.get("discovery_tier")
++        if tier is not None and (
++            isinstance(tier, bool) or not isinstance(tier, (int, float))
++            or (isinstance(tier, float) and not math.isfinite(tier))
++            or tier < 0 or int(tier) != tier
++        ):
++            raise ValueError("Node discovery_tier must be a non-negative integer or null")
++        nodes.append({**n, "name": n.get("name") or n["id"], "type": n.get("type") or "Unknown"})
++    for key in ("metadata", "statistics"):
++        if data.get(key) is not None and not isinstance(data[key], dict):
++            raise ValueError(f"Graph {key} must be an object")
++    generated = (data.get("metadata") or {}).get("generated_at")
++    if generated is not None and not isinstance(generated, str):
++        raise ValueError("metadata.generated_at must be a string")
++    if data.get("documents") is not None and (
++        not isinstance(data["documents"], list)
++        or any(not isinstance(d, dict) for d in data["documents"])
++    ):
++        raise ValueError("Graph documents must be an array of objects")
++    edge_ids = set()
++    for e in data["edges"]:
++        if not isinstance(e, dict) or any(
++            not isinstance(e.get(key), str) or e[key] not in known for key in ("source", "target")
++        ):
++            raise ValueError("Each edge must reference two existing node IDs")
++        if not isinstance(e.get("id"), str) or not e["id"] or e["id"] in edge_ids:
++            raise ValueError("Edge IDs must be unique, non-empty strings")
++        edge_ids.add(e["id"])
++        if e.get("quality") is not None and not isinstance(e["quality"], dict):
++            raise ValueError("Edge quality must be an object")
++        if e.get("source_doc_ids") is not None and (
++            not isinstance(e["source_doc_ids"], list)
++            or any(not isinstance(d, str) for d in e["source_doc_ids"])
++        ):
++            raise ValueError("Edge source_doc_ids must be an array of strings")
++        if e.get("evidence") is not None and (
++            not isinstance(e["evidence"], list)
++            or any(not isinstance(item, dict) for item in e["evidence"])
++        ):
++            raise ValueError("Edge evidence must be an array of objects")
++    return {**data, "nodes": nodes}
++
++
++def write_viewer(graph: dict, output: Path) -> Path:
++    """Embed graph data safely: source text cannot close the JSON script element."""
++    graph = validate_graph(graph)
++    assets = files("schain").joinpath("viewer_assets")
++    payload = json.dumps(graph, ensure_ascii=False, allow_nan=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
++    html = assets.joinpath("index.html").read_text(encoding="utf-8")
++    # Insert data last so strings in uploaded documents cannot become template code.
++    html = html.replace("/*__STYLE__*/", assets.joinpath("style.css").read_text(encoding="utf-8"))
++    html = html.replace("/*__SCRIPT__*/", assets.joinpath("app.js").read_text(encoding="utf-8"))
++    html = html.replace("__GRAPH_DATA__", payload)
++    output = Path(output)
++    output.parent.mkdir(parents=True, exist_ok=True)
++    temp = output.with_suffix(output.suffix + ".tmp")
++    temp.write_text(html, encoding="utf-8")
++    temp.replace(output)
++    return output
++
++
++def main(argv=None) -> int:
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--input", required=True, type=Path)
++    parser.add_argument("--output", default=Path("outputs/graph-explorer.html"), type=Path)
++    args = parser.parse_args(argv)
++    try:
++        graph = json.loads(args.input.read_text(encoding="utf-8"))
++        print(write_viewer(graph, args.output))
++    except (ValueError, OSError) as error:
++        parser.exit(1, f"Cannot build graph explorer: {error}\n")
++    return 0
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+--- /dev/null
++++ b/schain/viewer_assets/app.js
+@@ -0,0 +1,124 @@
++/* Offline, deterministic tier explorer. No external libraries, servers or telemetry. */
++'use strict';
++const $=id=>document.getElementById(id), NS='http://www.w3.org/2000/svg';
++const colors={Company:'#087f8c',Mine:'#ad6b22',Product:'#526ed3',Material:'#8555af',Location:'#448951',Person:'#bf5271'};
++const text=(tag,value,cls)=>{const el=document.createElement(tag);el.textContent=String(value??'');if(cls)el.className=cls;return el;};
++const svgEl=(tag,attrs={})=>{const el=document.createElementNS(NS,tag);Object.entries(attrs).forEach(([k,v])=>el.setAttribute(k,String(v)));return el;};
++const safeUrl=value=>{try{const u=new URL(value);return ['https:','http:'].includes(u.protocol)?u.href:null;}catch{return null;}};
++let bundle,byId,selected=null,focus=null,currentNodes=[],currentEdges=[],positions=new Map(),page=0,view=[0,0,1000,600],fullView=[0,0,1000,600],drag=null;
++const loaded=[];
++function validate(data){
++ if(!data||!Array.isArray(data.nodes)||!Array.isArray(data.edges))throw Error('Expected a SChain JSON object with nodes and edges arrays.');
++ const object=x=>x!==null&&typeof x==='object'&&!Array.isArray(x);
++ const ids=new Set(),nodes=[];for(const n of data.nodes){if(!object(n)||typeof n.id!=='string'||!n.id||ids.has(n.id))throw Error('Node IDs must be unique non-empty strings.');ids.add(n.id);
++  for(const key of ['name','type'])if(n[key]!=null&&typeof n[key]!=='string')throw Error('Node '+key+' must be a string when present.');
++  if(n.aliases!=null&&(!Array.isArray(n.aliases)||n.aliases.some(a=>typeof a!=='string')))throw Error('Node aliases must be an array of strings.');
++  if(n.discovery_tier!=null&&(!Number.isInteger(n.discovery_tier)||n.discovery_tier<0))throw Error('Node discovery_tier must be a non-negative integer or null.');
++  nodes.push({...n,name:n.name||n.id,type:n.type||'Unknown'});
++ }
++ for(const key of ['metadata','statistics'])if(data[key]!=null&&!object(data[key]))throw Error('Graph '+key+' must be an object.');
++ if(data.metadata?.generated_at!=null&&typeof data.metadata.generated_at!=='string')throw Error('metadata.generated_at must be a string.');
++ if(data.documents!=null&&(!Array.isArray(data.documents)||data.documents.some(d=>!object(d))))throw Error('Graph documents must be an array of objects.');
++ const es=new Set();for(const e of data.edges){if(!object(e)||!ids.has(e.source)||!ids.has(e.target))throw Error('An edge references a missing entity.');if(typeof e.id!=='string'||!e.id||es.has(e.id))throw Error('Edge IDs must be unique non-empty strings.');es.add(e.id);
++  if(e.quality!=null&&!object(e.quality))throw Error('Edge quality must be an object.');
++  if(e.source_doc_ids!=null&&(!Array.isArray(e.source_doc_ids)||e.source_doc_ids.some(d=>typeof d!=='string')))throw Error('Edge source_doc_ids must be an array of strings.');
++  if(e.evidence!=null&&(!Array.isArray(e.evidence)||e.evidence.some(item=>!object(item))))throw Error('Edge evidence must be an array of objects.');
++ }
++ return {...data,nodes};
++}
++function option(select,value,label){const o=text('option',label);o.value=value;select.append(o);}
++function isChecked(e){return e.quality?.evidence_validated===true;}
++function stateName(e){return e.quality?.contested||e.quality?.status==='contested'?'Contested':isChecked(e)?'Model-checked':'Unchecked / unknown';}
++function docs(e){return new Set((e.source_doc_ids||e.evidence?.map(x=>x.doc_id)||[]).filter(Boolean)).size||Number(e.support_count)||0;}
++function load(data,name){bundle=validate(data);byId=new Map(bundle.nodes.map(n=>[n.id,n]));selected=null;focus=null;page=0;
++ $('dataset').textContent=name;
++ $('banner').textContent=bundle.metadata?.demo?'SYNTHETIC DEMO · Fictional companies and relationships, for interface testing only.':'Model checks indicate textual support, not independent factual verification. This graph is a dated observation, not a complete supply-chain inventory.';
++ for(const id of ['seed','relation','type','tier'])$(id).replaceChildren();
++ option($('seed'),'','All configured seeds');bundle.nodes.filter(n=>n.is_seed).sort((a,b)=>a.name.localeCompare(b.name)).forEach(n=>option($('seed'),n.id,n.name));
++ option($('relation'),'suppliesTo','Supply relationships');option($('relation'),'','All relationships');[...new Set(bundle.edges.map(e=>e.relation))].filter(x=>x!=='suppliesTo').sort().forEach(x=>option($('relation'),x,x));
++ option($('type'),'','All types');[...new Set(bundle.nodes.map(n=>n.type))].sort().forEach(x=>option($('type'),x,x));
++ option($('tier'),'','All available tiers');[...new Set(bundle.nodes.map(n=>n.discovery_tier).filter(x=>Number.isInteger(x)&&x>=0))].sort((a,b)=>a-b).forEach(x=>option($('tier'),String(x),'Through tier '+x));
++ reset();
++}
++function reset(){for(const id of ['seed','type','tier','quality'])$(id).value='';$('relation').value='suppliesTo';$('support').value='1';$('search').value='';$('context').checked=true;focus=null;selected=null;page=0;render();showIntro();}
++function neighbors(id,edges,hops=1,upstream=false){
++ const adjacency=new Map();for(const e of edges){if(!adjacency.has(e.target))adjacency.set(e.target,[]);adjacency.get(e.target).push(e.source);if(!upstream){if(!adjacency.has(e.source))adjacency.set(e.source,[]);adjacency.get(e.source).push(e.target);}}
++ const seen=new Set([id]),queue=[[id,0]];for(let head=0;head<queue.length;head++){const [node,depth]=queue[head];if(depth>=hops)continue;for(const other of adjacency.get(node)||[])if(!seen.has(other)){seen.add(other);queue.push([other,depth+1]);}}return seen;
++}
++
++function filtered(){
++ const relation=$('relation').value,type=$('type').value,tier=$('tier').value,quality=$('quality').value,query=$('search').value.trim().toLocaleLowerCase();
++ let edges=bundle.edges.filter(e=>(!relation||e.relation===relation)&&docs(e)>=Number($('support').value));
++ edges=edges.filter(e=>!quality||(quality==='checked'&&isChecked(e))||(quality==='unchecked'&&!isChecked(e))||(quality==='contested'&&stateName(e)==='Contested'));
++ let allowed=new Set(bundle.nodes.filter(n=>(!type||n.type===type)&&(tier===''||n.discovery_tier==null||n.discovery_tier<=Number(tier))&&($('context').checked||n.discovery_tier!=null)).map(n=>n.id));
++ if($('seed').value){const ns=neighbors($('seed').value,bundle.edges.filter(e=>e.relation==='suppliesTo'),bundle.nodes.length,true);allowed=new Set([...allowed].filter(x=>ns.has(x)));}
++ if(query){const matching=new Set(bundle.nodes.filter(n=>[n.name,...(n.aliases||[])].some(x=>String(x).toLocaleLowerCase().includes(query))).map(n=>n.id));const ns=new Set(matching);for(const e of edges)if(matching.has(e.source)||matching.has(e.target)){ns.add(e.source);ns.add(e.target);}allowed=new Set([...allowed].filter(x=>ns.has(x)));}
++ if(focus){const ns=neighbors(focus,edges,1);allowed=new Set([...allowed].filter(x=>ns.has(x)));}
++ edges=edges.filter(e=>allowed.has(e.source)&&allowed.has(e.target));
++ const used=new Set(edges.flatMap(e=>[e.source,e.target]));
++ let nodes=bundle.nodes.filter(n=>allowed.has(n.id)&&(used.has(n.id)||n.is_seed||n.id===focus||(query&&[n.name,...(n.aliases||[])].some(x=>String(x).toLocaleLowerCase().includes(query)))));
++ return{nodes,edges};
++}
++function render(){const f=filtered();currentNodes=f.nodes;currentEdges=f.edges;page=0;
++ $('nodeCount').textContent=currentNodes.length.toLocaleString();$('edgeCount').textContent=currentEdges.length.toLocaleString();$('docCount').textContent=new Set(currentEdges.flatMap(e=>e.source_doc_ids||[])).size.toLocaleString();$('checkedCount').textContent=currentEdges.filter(isChecked).length.toLocaleString();
++ $('focusLabel').textContent=focus?'Neighborhood: '+byId.get(focus)?.name:'';$('clearFocus').hidden=!focus;
++ $('viewInfo').textContent=`${bundle.nodes.length.toLocaleString()} entities / ${bundle.edges.length.toLocaleString()} relationships in file · ${bundle.metadata?.generated_at?.slice(0,10)||'date unavailable'}`;
++ draw();drawTable();if(selected&&!currentEdges.some(e=>e.id===selected)){selected=null;showIntro();}
++}
++function draw(preserveView=false){
++ const svg=$('graph');svg.replaceChildren();positions=new Map();
++ const defs=svgEl('defs'),marker=svgEl('marker',{id:'arrow',viewBox:'0 0 10 10',refX:9,refY:5,markerWidth:7,markerHeight:7,orient:'auto-start-reverse'});marker.append(svgEl('path',{d:'M 0 0 L 10 5 L 0 10 z',fill:'#7994a8'}));defs.append(marker);svg.append(defs);
++ const nodes=[...currentNodes].sort((a,b)=>(Number(b.is_seed)-Number(a.is_seed))||((a.discovery_tier??999)-(b.discovery_tier??999))||String(a.name).localeCompare(String(b.name))).slice(0,300),allowed=new Set(nodes.map(n=>n.id));
++ const edges=currentEdges.filter(e=>allowed.has(e.source)&&allowed.has(e.target)).slice(0,1000);
++ const buckets=new Map();for(const n of nodes){const k=Number.isInteger(n.discovery_tier)?n.discovery_tier:'context';if(!buckets.has(k))buckets.set(k,[]);buckets.get(k).push(n);}
++ const keys=[...buckets.keys()].sort((a,b)=>a==='context'?1:b==='context'?-1:b-a);
++ const colWidth=250,w=Math.max(800,keys.length*colWidth+60),h=Math.max(520,...[...buckets.values()].map(b=>b.length*92+130));
++ fullView=[0,0,w,h];if(!preserveView)view=[...fullView];svg.setAttribute('viewBox',view.join(' '));
++ svg.append(svgEl('rect',{x:0,y:0,width:w,height:h,fill:'#f7fafc'}));
++ keys.forEach((k,i)=>{const x=40+i*colWidth;if(i%2===0)svg.append(svgEl('rect',{x:x-20,y:30,width:colWidth-5,height:h-55,rx:12,fill:'#edf3f7'}));const label=svgEl('text',{x:x+12,y:62,fill:'#5b7185','font-family':'Segoe UI, Arial, sans-serif','font-size':15,'font-weight':600});label.textContent=k==='context'?'UNTIERED CONTEXT':k===0?'TIER 0 · SEEDS':'UPSTREAM · TIER '+k;svg.append(label);buckets.get(k).sort((a,b)=>String(a.name).localeCompare(String(b.name))).forEach((n,j)=>positions.set(n.id,{x:x+100,y:125+j*92}));});
++ for(const e of edges){const a=positions.get(e.source),b=positions.get(e.target);const dx=b.x-a.x,dy=b.y-a.y,len=Math.hypot(dx,dy)||1;const end={x:b.x-dx/len*24,y:b.y-dy/len*24};let d;
++ if(e.source===e.target)d=`M ${a.x-12} ${a.y-15} C ${a.x-65} ${a.y-85},${a.x+65} ${a.y-85},${a.x+15} ${a.y-18}`;
++ else if(a.x===b.x)d=`M ${a.x+18} ${a.y} C ${a.x+92} ${a.y},${b.x+92} ${b.y},${b.x+20} ${b.y}`;
++ else d=`M ${a.x+dx/len*23} ${a.y+dy/len*23} C ${(a.x+b.x)/2} ${a.y},${(a.x+b.x)/2} ${b.y},${end.x} ${end.y}`;
++ const g=svgEl('g',{'data-edge':e.id,tabindex:0,role:'button','aria-label':`${byId.get(e.source).name} ${e.relation} ${byId.get(e.target).name}. Inspect evidence.`});
++ const path=svgEl('path',{d,fill:'none',stroke:e.id===selected?'#087f8c':stateName(e)==='Contested'?'#bd843d':'#8da5b7','stroke-width':e.id===selected?3:1.7,'marker-end':'url(#arrow)'});if(!isChecked(e))path.setAttribute('stroke-dasharray','6 4');
++ const hit=svgEl('path',{d,fill:'none',stroke:'transparent','stroke-width':17,cursor:'pointer'});g.append(path,hit);const title=svgEl('title');title.textContent=`${byId.get(e.source).name} → ${byId.get(e.target).name} · ${e.relation} · ${docs(e)} source documents`;g.append(title);g.addEventListener('click',ev=>{ev.stopPropagation();inspectEdge(e);});g.addEventListener('keydown',ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();inspectEdge(e);}});svg.append(g);
++ }
++ for(const n of nodes){const p=positions.get(n.id),g=svgEl('g',{'data-node':n.id,tabindex:0,role:'button','aria-label':n.name+'. Inspect entity',cursor:'pointer'});if(n.is_seed)g.append(svgEl('circle',{cx:p.x,cy:p.y,r:27,fill:'none',stroke:colors[n.type]||'#677','stroke-width':1.3}));g.append(svgEl('circle',{cx:p.x,cy:p.y,r:20,fill:colors[n.type]||'#677',stroke:'#fff','stroke-width':3}));const letter=svgEl('text',{x:p.x,y:p.y+5,'text-anchor':'middle',fill:'#fff','font-size':14,'font-weight':700,'font-family':'Segoe UI, Arial, sans-serif'});letter.textContent=n.type==='Company'?'C':String(n.type||'?')[0];g.append(letter);const name=svgEl('text',{x:p.x,y:p.y+44,'text-anchor':'middle',fill:'#213b51','font-size':14,'font-weight':600,'font-family':'Segoe UI, Arial, sans-serif'});name.textContent=String(n.name||n.id).length>27?String(n.name).slice(0,25)+'…':n.name||n.id;g.append(name);const title=svgEl('title');title.textContent=n.name+' · '+n.type;g.append(title);g.addEventListener('click',ev=>{ev.stopPropagation();inspectNode(n);});g.addEventListener('keydown',ev=>{if(ev.key==='Enter'||ev.key===' '){ev.preventDefault();inspectNode(n);}});svg.append(g);}
++ $('empty').hidden=nodes.length!==0;
++ if(nodes.length<currentNodes.length||edges.length<currentEdges.length)$('viewInfo').textContent+=` · Drawing limited to ${nodes.length} nodes / ${edges.length} edges; filter further or use Relationships.`;
++}
++function showIntro(){$('details').replaceChildren(text('h2','Select a relationship'),text('p','Inspect its exact source quote and evidence status. Select a node to focus on its immediate connections.','muted'));}
++function pill(parent,label,warn=false){parent.append(text('span',label,'pill'+(warn?' warning':'')));}
++function inspectNode(n){selected=null;const box=$('details');box.replaceChildren(text('h2',n.name));pill(box,n.type);pill(box,n.discovery_tier==null?'Untiered context':'Tier '+n.discovery_tier);if(n.is_seed)pill(box,'Configured seed');const list=text('dl','');for(const [k,v]of [['Suppliers',bundle.edges.filter(e=>e.relation==='suppliesTo'&&e.target===n.id).length],['Customers',bundle.edges.filter(e=>e.relation==='suppliesTo'&&e.source===n.id).length],['Aliases',(n.aliases||[]).join(', ')||'None']]){list.append(text('dt',k),text('dd',v));}box.append(list);const b=text('button','Focus on this entity and its neighbors');b.onclick=()=>{focus=n.id;render();inspectNode(n);};box.append(b);box.append(text('p','Counts describe observed relationships in this file. A missing path does not prove the absence of a supplier.','note'));draw(true);}
++function inspectEdge(e){selected=e.id;const box=$('details');box.replaceChildren(text('h2',`${byId.get(e.source).name} → ${byId.get(e.target).name}`));pill(box,e.relation);pill(box,stateName(e),!isChecked(e));pill(box,docs(e)+' source document'+(docs(e)===1?'':'s'));
++ box.append(text('p','Model-checked means the validator judged the quote to support the relation. It does not establish external truth or current contractual status.','note'));
++ const evidence=e.evidence||[];if(!evidence.length)box.append(text('p','No source quote is available in this export.','muted'));
++ for(const item of evidence){const card=text('section','','evidence');card.append(text('strong',item.document_title||item.doc_id||'Untitled source'));card.append(text('blockquote',item.quote||'Quote unavailable'));
++ pill(card,item.content_source==='title_snippet'?'Title / snippet only':item.content_source||'Content type unknown',item.content_source==='title_snippet');
++ if(item.evidence_quote_grounded===true)pill(card,'Quote matched source');else if(item.evidence_quote_grounded===false)pill(card,'Quote did not match source',true);else pill(card,'Source match unknown',true);
++ const url=safeUrl(item.canonical_source_url||item.source_url);if(url){const a=text('a','Open source ↗');a.href=url;a.target='_blank';a.rel='noopener noreferrer';card.append(text('p',''),a);}
++ const meta=[item.source_domain,item.provider,Number.isInteger(item.chunk_index)?'Chunk '+item.chunk_index:null,item.extracted_at?'Extracted '+item.extracted_at:null,item.model?'Model: '+item.model:null].filter(Boolean).join(' · ');card.append(text('p',meta));box.append(card);
++ }draw(true);drawTable();
++}
++function drawTable(){const body=$('rows');body.replaceChildren();const max=Math.max(1,Math.ceil(currentEdges.length/100));page=Math.min(page,max-1);for(const e of currentEdges.slice(page*100,(page+1)*100)){const tr=text('tr','');tr.tabIndex=0;for(const v of [byId.get(e.source).name,e.relation,byId.get(e.target).name,docs(e),stateName(e)])tr.append(text('td',v));tr.onclick=()=>inspectEdge(e);tr.onkeydown=ev=>{if(ev.key==='Enter')inspectEdge(e);};body.append(tr);}$('page').textContent=`Page ${page+1} of ${max}`;$('prev').disabled=page===0;$('next').disabled=page>=max-1;}
++function download(name,content,type){const url=URL.createObjectURL(new Blob([content],{type})),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
++function zoom(factor){const [x,y,w,h]=view;view=[x+w*(1-factor)/2,y+h*(1-factor)/2,w*factor,h*factor];$('graph').setAttribute('viewBox',view.join(' '));}
++$('zoomIn').onclick=()=>zoom(.8);$('zoomOut').onclick=()=>zoom(1.25);$('fit').onclick=()=>{view=[...fullView];$('graph').setAttribute('viewBox',view.join(' '));};
++$('graph').addEventListener('wheel',ev=>{ev.preventDefault();zoom(ev.deltaY>0?1.1:.9);},{passive:false});
++$('graph').addEventListener('pointerdown',ev=>{if(ev.target.closest('[data-node],[data-edge]'))return;drag={x:ev.clientX,y:ev.clientY,view:[...view]};$('graph').setPointerCapture(ev.pointerId);});
++$('graph').addEventListener('pointermove',ev=>{if(!drag)return;const r=$('graph').getBoundingClientRect(),scale=Math.max(drag.view[2]/r.width,drag.view[3]/r.height);view=[drag.view[0]-(ev.clientX-drag.x)*scale,drag.view[1]-(ev.clientY-drag.y)*scale,...drag.view.slice(2)];$('graph').setAttribute('viewBox',view.join(' '));});
++for(const evt of ['pointerup','pointercancel'])$('graph').addEventListener(evt,()=>drag=null);
++for(const id of ['seed','relation','type','tier','quality','support','context'])$(id).onchange=render;
++let searchTimer;$('search').oninput=()=>{clearTimeout(searchTimer);searchTimer=setTimeout(render,140);};
++$('clearFocus').onclick=()=>{focus=null;render();};$('reset').onclick=reset;
++$('prev').onclick=()=>{page--;drawTable();};$('next').onclick=()=>{page++;drawTable();};
++function tab(isGraph){$('canvas').hidden=!isGraph;$('tableWrap').hidden=isGraph;$('graphTab').setAttribute('aria-pressed',String(isGraph));$('tableTab').setAttribute('aria-pressed',String(!isGraph));for(const id of ['zoomIn','zoomOut','fit','saveSvg'])$(id).hidden=!isGraph;}
++$('graphTab').onclick=()=>tab(true);$('tableTab').onclick=()=>tab(false);
++$('saveSvg').onclick=()=>{const copy=$('graph').cloneNode(true);copy.setAttribute('viewBox',fullView.join(' '));copy.setAttribute('width',fullView[2]);copy.setAttribute('height',fullView[3]);download('supply-network.svg',new XMLSerializer().serializeToString(copy),'image/svg+xml');};
++$('saveJson').onclick=()=>{const ids=new Set(currentEdges.flatMap(e=>e.source_doc_ids||[]));const out={...bundle,metadata:{...bundle.metadata,filtered_view:true,original_graph_fingerprint:bundle.metadata?.graph_fingerprint,graph_fingerprint:null},statistics:{nodes:currentNodes.length,edges:currentEdges.length,documents:ids.size},nodes:currentNodes,edges:currentEdges,documents:(bundle.documents||[]).filter(d=>ids.has(d.doc_id))};download('filtered-graph.json',JSON.stringify(out,null,2),'application/json');};
++$('openGraph').onclick=()=>$('upload').click();
++$('upload').onchange=async ev=>{const errors=[];for(const file of ev.target.files){try{if(file.size>50*1024*1024)throw Error('File exceeds the 50 MB viewer limit.');const data=validate(JSON.parse(await file.text()));loaded.push({name:file.name,data});option($('files'),String(loaded.length-1),file.name);}catch(e){errors.push(file.name+': '+e.message);}}if(loaded.length){$('files').value=String(loaded.length-1);load(loaded.at(-1).data,loaded.at(-1).name);}if(errors.length)$('banner').textContent=errors.join(' ');ev.target.value='';};
++$('files').onchange=()=>{const item=loaded[Number($('files').value)];load(item.data,item.name);};
++for(const [name,color]of Object.entries(colors)){const l=text('span','','legendItem'),d=text('span','','dot');d.style.background=color;l.append(d,text('span',name));$('legend').append(l);}
++try{const data=JSON.parse($('graphData').textContent);loaded.push({name:data.metadata?.demo?'Synthetic demo':'Embedded graph',data:validate(data)});option($('files'),'0',loaded[0].name);load(data,loaded[0].name);}catch(e){$('banner').textContent='Cannot open graph: '+e.message;}
+--- /dev/null
++++ b/schain/viewer_assets/index.html
+@@ -0,0 +1,29 @@
++<!doctype html>
++<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>SChain · Evidence explorer</title><style>/*__STYLE__*/</style></head>
++<body>
++<header><div class="brand"><span class="mark">S</span><div><strong>SChain</strong><span class="subtitle">Evidence explorer</span></div></div><div id="dataset" class="dataset"></div><button id="openGraph" class="button primary">Open graph JSON</button><input id="upload" type="file" accept=".json,application/json" multiple hidden></header>
++<div id="banner" role="status"></div>
++<div class="workspace">
++<aside class="controls"><h1>Supply network</h1><p class="muted">Follow suppliers upstream. Inspect the source behind each relationship.</p>
++<label>Loaded graph<select id="files"></select></label>
++<label>Find an entity<input id="search" type="search" placeholder="Name or alias…" autocomplete="off"></label>
++<label>Seed network<select id="seed"><option value="">All configured seeds</option></select></label>
++<label>Relationship<select id="relation"><option value="suppliesTo">Supply relationships</option><option value="">All relationships</option></select></label>
++<label>Entity type<select id="type"><option value="">All types</option></select></label>
++<label>Maximum supply tier<select id="tier"><option value="">All available tiers</option></select></label>
++<label>Evidence<select id="quality"><option value="">All evidence states</option><option value="checked">Model-checked evidence</option><option value="unchecked">Unchecked / unknown</option><option value="contested">Contested</option></select></label>
++<label>Minimum source documents<select id="support"><option value="1">1 document</option><option value="2">2 documents</option><option value="3">3 documents</option></select></label>
++<label class="check"><input id="context" type="checkbox" checked>Include untiered context</label>
++<button id="reset">Reset filters</button>
++<div class="legend"><h2>Entity types</h2><div id="legend"></div></div>
++<p class="note">Arrows point from supplier to customer. Tier is the shortest observed supply path to a seed. Source counts are not independent confirmations or confidence scores.</p>
++</aside>
++<main><section class="stats" aria-label="Graph statistics"><div><strong id="nodeCount">0</strong><span>visible entities</span></div><div><strong id="edgeCount">0</strong><span>visible relationships</span></div><div><strong id="docCount">0</strong><span>source documents</span></div><div><strong id="checkedCount">0</strong><span>model-checked edges</span></div></section>
++<div class="toolbar"><div class="tabs"><button id="graphTab" aria-pressed="true">Graph</button><button id="tableTab" aria-pressed="false">Relationships</button></div><span id="focusLabel"></span><button id="clearFocus" hidden>Clear focus</button><div class="spacer"></div><button id="zoomIn" aria-label="Zoom in">+</button><button id="zoomOut" aria-label="Zoom out">−</button><button id="fit">Fit</button><button id="saveSvg">Save SVG</button></div>
++<div id="canvas"><svg id="graph" role="img" aria-label="Directed supply chain graph" xmlns="http://www.w3.org/2000/svg"></svg><div id="empty" hidden>No relationships match these filters.</div><div class="canvasHint">Scroll to zoom · Drag to pan · Select a node or relationship</div></div>
++<div id="tableWrap" hidden><table><thead><tr><th>Supplier / subject</th><th>Relationship</th><th>Customer / object</th><th>Documents</th><th>Evidence</th></tr></thead><tbody id="rows"></tbody></table><div class="pager"><button id="prev">Previous</button><span id="page"></span><button id="next">Next</button></div></div>
++<footer><span id="viewInfo"></span><button id="saveJson">Save filtered JSON</button></footer>
++</main>
++<aside class="inspector"><div class="eyebrow">SOURCE INSPECTION</div><div id="details"><h2>Select a relationship</h2><p class="muted">Its exact quote, source, and validation status appear here.</p></div></aside>
++</div>
++<script type="application/json" id="graphData">__GRAPH_DATA__</script><script>/*__SCRIPT__*/</script></body></html>
+--- /dev/null
++++ b/schain/viewer_assets/style.css
+@@ -0,0 +1 @@
++:root{font-family:Inter,Segoe UI,Arial,sans-serif;color:#172a3e;background:#f0f4f8;font-size:16px;--line:#dce5ed;--muted:#596c7f;--accent:#087f8c}*{box-sizing:border-box}body{margin:0}header{min-height:82px;background:#11283e;color:white;display:flex;align-items:center;padding:18px 26px;gap:22px}.brand{display:flex;gap:12px;align-items:center}.mark{display:grid;place-items:center;width:40px;height:40px;background:#17b6b3;color:#102c41;border-radius:10px;font-size:25px;font-weight:800}.brand strong{font-size:22px}.subtitle{display:block;color:#b6c7d5;font-size:14px;margin-top:2px}.dataset{margin-left:auto;font-size:14px;max-width:40%;overflow-wrap:anywhere}button,.button,select,input{font:inherit}button,.button{border:1px solid #c9d6e1;border-radius:7px;padding:9px 12px;background:white;color:#213b51;font-size:14px;cursor:pointer;text-align:center;white-space:nowrap}button:hover,.button:hover{background:#eaf3f6}button:disabled{opacity:.45;cursor:default}.primary{background:#20b9b5;border-color:#20b9b5;color:#092d40;font-weight:650}.primary:hover{background:#5ad1cb}button:focus-visible,input:focus-visible,select:focus-visible,.button:focus-within{outline:3px solid #368ff0;outline-offset:2px}#banner:empty{display:none}#banner{padding:10px 26px;font-size:14px;background:#fff1cd;color:#65450e;border-bottom:1px solid #e6d399}.workspace{display:grid;grid-template-columns:246px minmax(0,1fr) 320px;min-height:calc(100vh - 82px)}aside{background:white;padding:24px 20px}.controls{border-right:1px solid var(--line)}h1{font-size:22px;letter-spacing:-.5px;margin:0 0 10px}h2{font-size:18px;line-height:1.4;margin:16px 0 10px}.muted{color:var(--muted);line-height:1.55;font-size:14px}.controls label{font-size:14px;font-weight:600;display:block;margin:18px 0 0}.controls select,.controls input[type=search]{width:100%;display:block;margin-top:7px;border:1px solid #cdd9e3;border-radius:6px;background:#fbfcfd;padding:9px;color:#263e52;font-size:14px}.controls .check{display:flex;align-items:center;gap:8px;font-weight:400}input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px}#reset{margin:18px 0;width:100%}.legend{border-top:1px solid var(--line)}.legend h2{font-size:14px}.legendItem{display:inline-flex;align-items:center;gap:6px;font-size:13px;margin:4px 10px 4px 0}.dot{width:10px;height:10px;border-radius:50%;display:inline-block}.note{font-size:13px;color:var(--muted);line-height:1.6}.stats{display:grid;grid-template-columns:repeat(4,1fr);background:#fff;border-bottom:1px solid var(--line)}.stats>div{padding:20px 12px 19px 22px;border-right:1px solid var(--line)}.stats strong{display:block;font-size:28px;font-weight:600}.stats span{font-size:12px;color:var(--muted);display:block;margin-top:5px}.toolbar{display:flex;align-items:center;gap:6px;padding:12px;border-bottom:1px solid var(--line);flex-wrap:wrap}.tabs{display:flex;margin-right:10px}.tabs button{border-radius:0}.tabs button:first-child{border-radius:7px 0 0 7px}.tabs button:last-child{border-radius:0 7px 7px 0}.tabs button[aria-pressed=true]{background:#153e56;color:white;border-color:#153e56}.spacer{flex:1}#focusLabel{font-size:13px;color:var(--accent)}#canvas{height:650px;max-height:73vh;min-height:400px;position:relative;overflow:hidden;background:#f7fafc;background-image:radial-gradient(#ccd9e2 .6px,transparent .6px);background-size:18px 18px}#graph{width:100%;height:100%;touch-action:none;cursor:grab}#graph:active{cursor:grabbing}.canvasHint{position:absolute;bottom:12px;left:15px;font-size:12px;background:#f7fafce8;color:#657a8b;padding:6px;border-radius:4px;pointer-events:none}#empty{position:absolute;top:45%;left:12%;right:12%;text-align:center;color:var(--muted)}footer{padding:13px 16px;display:flex;gap:10px;align-items:center;justify-content:space-between;color:var(--muted);font-size:12px}.inspector{border-left:1px solid var(--line);overflow-wrap:anywhere}.eyebrow{font-size:12px;color:#61798c;letter-spacing:1.6px;font-weight:700}.pill{display:inline-block;font-size:12px;border:1px solid #cbdde5;background:#f1f7fa;color:#356075;padding:5px 8px;border-radius:4px;margin:3px 4px 3px 0}.warning{background:#fff0d5;color:#775017;border-color:#efd29e}.evidence{padding:16px 0;border-top:1px solid var(--line);margin-top:18px}.evidence blockquote{border-left:3px solid #1ca9b4;padding:0 0 0 12px;margin:12px 0;color:#253d51;line-height:1.65;font-size:15px}.evidence p{font-size:13px;color:var(--muted);line-height:1.6}.evidence a{color:#007c8a;font-size:14px;overflow-wrap:anywhere}dl{font-size:14px;display:grid;grid-template-columns:auto 1fr;gap:9px 12px}dt{color:var(--muted)}dd{margin:0}.inspector button{white-space:normal;margin:6px 0;width:100%}#tableWrap{overflow:auto;min-height:480px;max-height:73vh;background:#fff}table{width:100%;border-collapse:collapse;font-size:14px}th{text-align:left;background:#eaf1f6;padding:14px;position:sticky;top:0}td{border-bottom:1px solid var(--line);padding:14px}tr:hover td{background:#f1f8fa}tbody tr{cursor:pointer}.pager{padding:16px;display:flex;gap:16px;align-items:center;justify-content:center}[hidden]{display:none!important}@media(min-width:1600px){#canvas{height:760px}.workspace{grid-template-columns:260px minmax(0,1fr) 360px}}@media(max-width:1150px){.workspace{grid-template-columns:215px minmax(0,1fr)}.inspector{grid-column:1/-1;border-top:1px solid var(--line);border-left:0}#details{max-width:850px}.stats>div{padding-left:12px}.stats strong{font-size:24px}}@media(max-width:700px){header{padding:14px;gap:10px;flex-wrap:wrap}.dataset{max-width:100%;order:3;width:100%;margin-left:0}.workspace{display:flex;flex-direction:column}.controls{border-right:0;border-bottom:1px solid var(--line);display:grid;grid-template-columns:1fr 1fr;gap:0 14px;padding:18px}.controls h1,.controls>p,.legend{grid-column:1/-1}.controls>p.muted{margin:0}.note{margin-bottom:0}.stats span{font-size:12px}.stats strong{font-size:24px}.stats>div{padding:15px 8px}.toolbar{gap:5px}#canvas{height:520px;min-height:350px;max-height:none}.inspector{padding:22px}.brand strong{font-size:20px}.subtitle{font-size:13px}footer{align-items:flex-start}.tabs{margin-right:2px}}
+--- a/scripts/lib.sh
++++ b/scripts/lib.sh
+@@ -37,12 +37,26 @@
+ 
+ # --- project configuration ---------------------------------------------------------
+ 
++# Inspection must also work before server_run.sh has created .venv. Prefer the project
++# interpreter, then an available Python for read-only configuration and driver probes.
++# The workload still runs only in the managed project .venv.
++inspection_python() {
++    if [ -x "$VENV_PY" ]; then
++        printf '%s\n' "$VENV_PY"
++    else
++        command -v python3
++    fi
++}
++
+ # Read the values the scripts need straight from the project's config loader, so the
+ # shell and the application can never disagree about model, endpoint or paths.
+ # Usage: eval "$(config_values config/expansion.yaml)"
+-config_values() {
++config_values() (
+     local config_file="$1"
+-    "$VENV_PY" - "$config_file" <<'PY'
++    local inspect_py
++    inspect_py="$(inspection_python)" || return 1
++    cd "$REPO_ROOT" || return 1
++    "$inspect_py" - "$config_file" <<'PY'
+ import shlex
+ import sys
+ 
+@@ -64,7 +78,7 @@
+ emit("CFG_NEO4J_DATABASE", neo4j["database"])
+ emit("CFG_STATE_DB", resolve_path(config["storage"]["state_db"]))
+ PY
+-}
++)
+ 
+ # --- service health ----------------------------------------------------------------
+ 
+@@ -78,20 +92,20 @@
+ # TCP reachability, using bash's own /dev/tcp so no extra tool is required.
+ tcp_open() {
+     local host="$1" port="$2" timeout="${3:-2}"
+-    timeout "$timeout" bash -c "exec 3<>/dev/tcp/$host/$port" 2>/dev/null
++    timeout "$timeout" bash -c 'exec 3<>"/dev/tcp/$1/$2"' _ "$host" "$port" 2>/dev/null
+ }
+ 
+ # A TCP connect only proves that something is listening on the port - any unrelated
+ # process holding 7687 would look like Neo4j. The reuse-or-start decision depends on this
+ # answer, so confirm with the project's own driver, exactly as the pipeline will.
+ neo4j_reachable() {
+-    local uri="$1"
++    local uri="$1" inspect_py
+     tcp_open "$(neo4j_host "$uri")" "$(neo4j_port "$uri")" 2 || return 1
+-    [ -x "$VENV_PY" ] || return 0     # cannot verify further; the port is open
+     [ -n "${SCHAIN_NEO4J_SKIP_BOLT_CHECK:-}" ] && return 0
++    inspect_py="$(inspection_python)" || return 1
+     # Hard timeout: the driver completes the TCP connect and then waits indefinitely for
+     # a Bolt handshake that a non-Neo4j listener never sends.
+-    timeout "${SCHAIN_NEO4J_PROBE_TIMEOUT:-8}" "$VENV_PY" - "$uri" <<'NEO4JCHECK' 2>/dev/null
++    timeout "${SCHAIN_NEO4J_PROBE_TIMEOUT:-8}" "$inspect_py" - "$uri" <<'NEO4JCHECK' 2>/dev/null
+ import os
+ import sys
+ 
+--- a/scripts/server_preflight.sh
++++ b/scripts/server_preflight.sh
+@@ -67,7 +67,7 @@
+ fi
+ 
+ section "configuration ($CONFIG_FILE)"
+-if [ -x "$VENV_PY" ] && values="$(config_values "$CONFIG_FILE" 2>/dev/null)"; then
++if values="$(config_values "$CONFIG_FILE" 2>/dev/null)"; then
+     eval "$values"
+     item "llm provider"  "$CFG_LLM_PROVIDER"
+     item "llm model"     "$CFG_LLM_MODEL"
+@@ -76,7 +76,7 @@
+     item "neo4j database" "$CFG_NEO4J_DATABASE"
+     item "state db"      "$CFG_STATE_DB $([ -f "$CFG_STATE_DB" ] && echo '(exists: a run can resume)' || echo '(absent: first run)')"
+ else
+-    item "config"        "not readable yet (.venv missing or config error)"
++    item "config"        "not readable (Python dependencies missing or config error)"
+ fi
+ 
+ section "secrets (.env)"
+--- a/scripts/server_run.sh
++++ b/scripts/server_run.sh
+@@ -185,17 +185,15 @@
+ ensure_venv
+ 
+ # Configuration comes from the project's own loader, so it cannot drift from the app.
+-if [ "$DRY_RUN" -eq 1 ] && [ ! -x "$VENV_PY" ]; then
+-    CFG_LLM_BASE_URL="http://localhost:8000/v1"; CFG_NEO4J_URI="bolt://localhost:7687"
+-    CFG_LLM_MODEL="(unknown until .venv exists)"; CFG_NEO4J_DATABASE="neo4j"
+-else
+-    # Capture first: eval of an empty string would succeed and leave variables unset.
+-    if ! CONFIG_OUTPUT="$(config_values "$CONFIG_FILE" 2>&1)"; then
+-        die "could not read $CONFIG_FILE:
++# Capture first: eval of an empty string would succeed and leave variables unset.
++# A dry run must use the actual config too; guessed localhost defaults can report the
++# wrong services and an unintended model, especially on the first run without .venv.
++if ! CONFIG_OUTPUT="$(config_values "$CONFIG_FILE" 2>&1)"; then
++    die "could not read $CONFIG_FILE with the available Python interpreter.
++Install the project dependencies before running this configuration:
+ $CONFIG_OUTPUT"
+-    fi
+-    eval "$CONFIG_OUTPUT"
+-fi
++fi
++eval "$CONFIG_OUTPUT"
+ 
+ LOG_DIR="$REPO_ROOT/logs"
+ mkdir -p "$LOG_DIR"
+@@ -367,6 +365,15 @@
+         log "Neo4j already reachable at $CFG_NEO4J_URI - reusing it (it will not be stopped)"
+         return 0
+     fi
++    if tcp_open "$(neo4j_host "$CFG_NEO4J_URI")" "$(neo4j_port "$CFG_NEO4J_URI")"; then
++        die "the port at $CFG_NEO4J_URI is occupied but Neo4j could not be verified.
++Check the service, Bolt connectivity and credentials before starting another instance."
++    fi
++    case "$(neo4j_host "$CFG_NEO4J_URI")" in
++        localhost|127.0.0.1|0.0.0.0) : ;;
++        *) die "NEO4J_URI points at a remote host that is not reachable: $CFG_NEO4J_URI.
++Start Neo4j there, or configure a reachable instance before running this script." ;;
++    esac
+     if [ "$DRY_RUN" -eq 1 ]; then
+         if have docker; then
+             echo "  would start Neo4j container '$NEO4J_CONTAINER' from $NEO4J_IMAGE, data in $NEO4J_DATA_DIR"
+--- a/tests/conftest.py
++++ b/tests/conftest.py
+@@ -33,9 +33,9 @@
+         ],
+         "relationships": [
+             {"type": "suppliesTo", "start_node_id": "0", "end_node_id": "1",
+-             "properties": {"evidence": "CATL supplies battery cells to BMW AG."}},
++             "properties": {"evidence": "CATL supplies battery cells to BMW AG for its electric vehicle plants."}},
+             {"type": "locatedIn", "start_node_id": "2", "end_node_id": "3",
+-             "properties": {"evidence": "CATL operates a plant located in Germany."}},
++             "properties": {"evidence": "Contemporary Amperex Technology Co. Limited operates a plant located in Germany."}},
+             {"type": "produces", "start_node_id": "5", "end_node_id": "4",
+              "properties": {"evidence": "BMW produces electric vehicles."}},
+         ],
+--- a/tests/test_extract.py
++++ b/tests/test_extract.py
+@@ -265,10 +265,11 @@
+     assert len(graph.nodes) == 2 and len(graph.relationships) == 1
+ 
+ 
+-def test_the_same_fact_in_two_chunks_collapses_to_one_row(ontology, ingest_config):
+-    """Chunking must not inflate the graph: identical facts share a deterministic id."""
++def test_chunk_evidence_is_preserved_on_one_semantic_edge(ontology, ingest_config):
++    """Retain chunk provenance while counting one edge and one source document."""
+     from schain.kg.facts import graph_to_facts
+     from schain.kg.resolve import resolve_entities
++    from schain.graph_export import _build_nodes_and_edges
+ 
+     # a document long enough to split, with every chunk returning the same fact
+     document = make_document("CATL supplies battery cells to BMW AG. " * 200)
+@@ -278,6 +279,12 @@
+ 
+     resolution, _ = resolve_entities(graph, llm=None)
+     facts = graph_to_facts(graph, document, chunk_index, resolution)
+-    # the facts table collapses them: same doc, same canonical endpoints, same relation
+-    assert facts.fact_id.nunique() == 1
+-    assert len(facts.drop_duplicates(subset="fact_id")) == 1
++    assert facts.fact_id.nunique() == len(chunk_index)
++    nodes, edges, _, _ = _build_nodes_and_edges(
++        facts, {}, {}, [], {}, ontology,
++    )
++    assert len(nodes) == 2
++    assert len(edges) == 1
++    assert edges[0]["support_count"] == 1
++    assert edges[0]["evidence_count"] == len(chunk_index)
++    assert {item["chunk_index"] for item in edges[0]["evidence"]} == set(chunk_index.values())
+--- /dev/null
++++ b/tests/test_graph_integrity.py
+@@ -0,0 +1,274 @@
++"""Regression cases for grounded graph metadata, seed aliases and supply paths."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pandas as pd
++import pytest
++from neo4j_graphrag.components.types import Neo4jGraph, Neo4jRelationship
++
++from schain import state
++from schain.graph_export import (
++    _apply_tier_semantics,
++    _build_nodes_and_edges,
++    _recompute_shortest_tiers,
++    _statistics,
++    build_graph_bundle,
++)
++from schain.kg.writer import facts_to_graph_rows, merge_nodes, merge_relationships
++from schain.kg.facts import fact_id, graph_to_facts, upsert_facts_parquet
++from schain.names import canonical_id
++from schain.ontology import load_ontology
++
++
++def fact(**changes):
++    row = {
++        "fact_id": "f1", "doc_id": "d1", "chunk_index": 0,
++        "subject_id": "company:catl", "subject_type": "Company",
++        "subject_name": "CATL", "subject_mention": "CATL",
++        "object_id": "company:bmw", "object_type": "Company",
++        "object_name": "BMW", "object_mention": "BMW",
++        "relation": "suppliesTo", "evidence": "CATL supplies BMW.",
++        "ontology_valid": True, "evidence_validated": True,
++        "evidence_quote_grounded": True,
++        "direction_explicit": True, "expansion_relevant": True,
++    }
++    return {**row, **changes}
++
++
++def make_graph(config, rows, *, seeds=None, support=None, aliases=None, max_tier=None):
++    return _build_nodes_and_edges(
++        pd.DataFrame(rows), aliases or {}, {}, ["BMW"] if seeds is None else seeds,
++        {}, load_ontology(config), edge_support=support, max_tier=max_tier,
++    )
++
++
++def test_facts_determine_support_count_and_missing_cache_flags(ingest_config):
++    rows = [fact(), fact(fact_id="f2", doc_id="d2")]
++    stale_support = pd.DataFrame([{
++        "subject_id": "company:catl", "object_id": "company:bmw",
++        "relation": "suppliesTo", "document_count": 999,
++        "has_supporting_conflict": float("nan"),
++    }])
++    nodes, edges, _, _ = make_graph(ingest_config, rows, support=stale_support)
++    assert edges[0]["support_count"] == 2
++    assert edges[0]["quality"]["contested"] is False
++    assert edges[0]["quality"]["frontier_eligible"] is True
++    assert edges[0]["expansion_relevant"] is True
++    assert next(n for n in nodes if n["id"] == "company:catl")["discovery_tier"] == 1
++
++
++@pytest.mark.parametrize("missing", [None, float("nan"), pd.NA])
++def test_legacy_validation_is_unknown_and_false_stays_false(ingest_config, missing):
++    row = fact(ontology_valid=missing, evidence_validated=missing,
++               evidence_quote_grounded=missing, direction_explicit=missing,
++               expansion_relevant=missing)
++    _, edges, _, _ = make_graph(ingest_config, [row])
++    quality = edges[0]["quality"]
++    for key in ("ontology_valid", "evidence_validated", "direction_explicit",
++                "evidence_quote_grounded", "frontier_eligible", "expansion_relevant"):
++        assert quality[key] is None
++    _, edges, _, _ = make_graph(ingest_config, [fact(evidence_validated=False)])
++    assert edges[0]["quality"]["evidence_validated"] is False
++    assert edges[0]["quality"]["frontier_eligible"] is False
++
++
++def test_frontier_gates_must_hold_on_the_same_witness(ingest_config):
++    rows = [fact(evidence_validated=False),
++            fact(fact_id="f2", doc_id="d2", expansion_relevant=False)]
++    nodes, edges, _, _ = make_graph(ingest_config, rows)
++    assert edges[0]["quality"]["evidence_validated"] is True
++    assert edges[0]["expansion_relevant"] is True
++    assert edges[0]["quality"]["frontier_eligible"] is False
++    assert next(n for n in nodes if n["id"] == "company:catl")["discovery_tier"] is None
++
++
++def test_quote_grounding_is_exported_per_witness_and_aggregated(ingest_config):
++    _, edges, _, _ = make_graph(ingest_config, [fact(evidence_quote_grounded=False)])
++    edge = edges[0]
++    assert edge["evidence"][0]["evidence_quote_grounded"] is False
++    assert edge["quality"]["evidence_quote_grounded"] is False
++    assert edge["quality"]["frontier_eligible"] is False
++
++
++def test_seed_alias_does_not_create_a_duplicate_isolated_seed(ingest_config):
++    resolved_id = canonical_id("Company", "Contemporary Amperex Technology")
++    rows = [fact(subject_id=resolved_id,
++                 subject_name="Contemporary Amperex Technology",
++                 subject_mention="Contemporary Amperex Technology")]
++    nodes, _, _, _ = make_graph(
++        ingest_config, rows, seeds=["CATL"], aliases={resolved_id: {"CATL"}},
++    )
++    assert "company:catl" not in {n["id"] for n in nodes}
++    assert [n["id"] for n in nodes if n["is_seed"]] == [resolved_id]
++    assert next(n for n in nodes if n["id"] == resolved_id)["discovery_tier"] == 0
++
++
++def test_ambiguous_seed_alias_does_not_silently_merge_entities(ingest_config):
++    rows = [fact(subject_id="company:one", subject_mention="One"),
++            fact(fact_id="f2", subject_id="company:two", subject_mention="Two")]
++    nodes, _, _, _ = make_graph(
++        ingest_config, rows, seeds=["Ambiguous"],
++        aliases={"company:one": {"Ambiguous"}, "company:two": {"Ambiguous"}},
++    )
++    assert {n["id"] for n in nodes if n["is_seed"]} == {"company:ambiguous"}
++
++
++def test_tiers_discard_frontier_paths_beyond_boundary(ingest_config):
++    nodes = [
++        {"id": "company:bmw", "type": "Company", "discovery_tier": 0, "is_seed": True},
++        {"id": "company:catl", "type": "Company", "discovery_tier": 1,
++         "tier_parent_ids": ["company:bmw"], "is_seed": False},
++        {"id": "company:raw", "type": "Company", "discovery_tier": 2,
++         "tier_parent_ids": ["company:catl"], "is_seed": False},
++    ]
++    edges = [
++        {"source": "company:catl", "target": "company:bmw", "relation": "suppliesTo"},
++        {"source": "company:raw", "target": "company:catl", "relation": "suppliesTo"},
++    ]
++    _recompute_shortest_tiers(nodes, edges, {"company:bmw"}, max_tier=1)
++    _apply_tier_semantics(nodes, edges, max_tier=1)
++    assert nodes[1]["discovery_tier"] == 1
++    assert nodes[1]["is_expandable"] is False
++    assert nodes[2]["discovery_tier"] is None
++    assert nodes[2]["is_expandable"] is False
++
++
++def test_invariant_check_rejects_phantom_parent_pointers_in_any_order():
++    nodes = [
++        {"id": "company:child", "type": "Company", "discovery_tier": 2,
++         "tier_parent_ids": ["company:parent"]},
++        {"id": "company:parent", "type": "Company", "discovery_tier": 1,
++         "tier_parent_ids": ["company:bmw"]},
++        {"id": "company:bmw", "type": "Company", "discovery_tier": 0, "is_seed": True},
++    ]
++    edges = [{"source": "company:child", "target": "company:parent", "relation": "suppliesTo"}]
++    stats = _apply_tier_semantics(nodes, edges)
++    assert nodes[0]["discovery_tier"] is None
++    assert nodes[1]["discovery_tier"] is None
++    assert stats["tier_invariant_violations"] == 2
++
++
++def test_tier_statistics_cover_configured_depth(ingest_config):
++    nodes, edges, _, tier_stats = make_graph(ingest_config, [fact()])
++    stats = _statistics(nodes, edges, [], 1,
++                        config={"expansion": {"max_tier": 6}}, tier_stats=tier_stats)
++    assert stats["tier_6_nodes"] == 0
++
++
++class RecordingDriver:
++    def __init__(self):
++        self.calls = []
++
++    def execute_query(self, query, **params):
++        self.calls.append((query, params))
++
++
++def test_writer_retains_quote_document_mapping_and_stable_records():
++    frame = pd.DataFrame([fact(), fact(fact_id="f2", doc_id="d2", evidence="BMW buys CATL cells.")])
++    _, relationships = facts_to_graph_rows(frame)
++    driver = RecordingDriver()
++    merge_relationships(driver, "neo4j", relationships, ["suppliesTo"])
++    query, params = driver.calls[0]
++    records = [json.loads(row["evidence_record"]) for row in params["rows"]]
++    assert {(r["doc_id"], r["evidence"]) for r in records} == {
++        ("d1", "CATL supplies BMW."), ("d2", "BMW buys CATL cells."),
++    }
++    assert records[0]["fact_id"] == "f1"
++    assert records[0]["evidence_quote_grounded"] is True
++    assert "r.evidence_records" in query and "WHERE v <> row.evidence_record" in query
++    assert "r.evidence = coalesce(r.evidence, row.evidence)" in query
++    merge_relationships(driver, "neo4j", relationships, ["suppliesTo"])
++    assert driver.calls[0] == driver.calls[1]
++
++
++def test_writer_handles_nullable_legacy_metadata():
++    _, rows = facts_to_graph_rows(pd.DataFrame([fact(chunk_index=float("nan"), model=pd.NA)]))
++    driver = RecordingDriver()
++    merge_relationships(driver, "neo4j", rows, ["suppliesTo"])
++    record = json.loads(driver.calls[0][1]["rows"][0]["evidence_record"])
++    assert record["chunk_index"] is None and record["model"] is None
++
++
++def test_writer_validates_all_types_before_any_write():
++    nodes, rows = facts_to_graph_rows(pd.DataFrame([fact()]))
++    driver = RecordingDriver()
++    nodes.append({**nodes[0], "label": "Unsupported"})
++    with pytest.raises(ValueError):
++        merge_nodes(driver, "neo4j", nodes, ["Company"])
++    assert driver.calls == []
++    rows.append({**rows[0], "type": "Unsupported"})
++    with pytest.raises(ValueError):
++        merge_relationships(driver, "neo4j", rows, ["suppliesTo"])
++    assert driver.calls == []
++
++
++def test_writer_accepts_single_use_ontology_iterables():
++    nodes, _ = facts_to_graph_rows(pd.DataFrame([fact(object_type="Location")]))
++    driver = RecordingDriver()
++    merge_nodes(driver, "neo4j", nodes, iter(["Company", "Location"]))
++    assert len(driver.calls) == 2
++
++
++def test_distinct_quotes_in_one_document_survive_resume_upserts(tmp_path):
++    quotes = ["CATL supplies BMW.", "BMW purchases cells from CATL."]
++    graph = Neo4jGraph(nodes=[], relationships=[
++        Neo4jRelationship(start_node_id="chunk0:s", end_node_id="chunk0:t",
++                          type="suppliesTo", properties={"evidence": quote})
++        for quote in quotes
++    ])
++    resolution = {
++        "chunk0:s": {"canonical_id": "company:catl", "label": "Company",
++                     "canonical_name": "CATL", "mention": "CATL"},
++        "chunk0:t": {"canonical_id": "company:bmw", "label": "Company",
++                     "canonical_name": "BMW", "mention": "BMW"},
++    }
++    facts = graph_to_facts(graph, {"doc_id": "d1"}, {"chunk0": 0}, resolution)
++    assert len(set(facts.fact_id)) == 2
++    path = tmp_path / "facts.parquet"
++    assert upsert_facts_parquet(facts, path) == 2
++    assert upsert_facts_parquet(facts, path) == 2
++    assert set(pd.read_parquet(path).evidence) == set(quotes)
++    _, rows = facts_to_graph_rows(facts)
++    assert len(rows) == 2
++    assert len({(r["start_id"], r["type"], r["end_id"]) for r in rows}) == 1
++
++
++def test_legacy_fact_id_api_stays_compatible():
++    import hashlib
++
++    expected = hashlib.sha256(b"d1|company:catl|suppliesTo|company:bmw").hexdigest()[:16]
++    assert fact_id("d1", "company:catl", "suppliesTo", "company:bmw") == expected
++    assert fact_id("d1", "company:catl", "suppliesTo", "company:bmw", "q", 0) != expected
++
++
++def test_document_counts_include_completed_zero_fact_documents(ingest_config):
++    path = Path(ingest_config["storage"]["normalized_documents"])
++    path.parent.mkdir(parents=True, exist_ok=True)
++    docs = [{"doc_id": "empty", "content_hash": "empty"},
++            {"doc_id": "pending", "content_hash": "pending"},
++            {"doc_id": "d1", "content_hash": "d1"}]
++    pd.DataFrame(docs).to_parquet(path, index=False)
++    pd.DataFrame([fact()]).to_parquet(ingest_config["storage"]["extracted_facts"], index=False)
++    connection = state.connect(Path(ingest_config["storage"]["state_db"]))
++    try:
++        for doc in docs:
++            state.register_document(connection, doc)
++        state.set_document_status(connection, "empty", state.COMMITTED)
++        state.set_document_status(connection, "d1", state.COMMITTED)
++    finally:
++        connection.close()
++    stats = build_graph_bundle(ingest_config)["statistics"]
++    assert stats["documents_processed"] == 2
++    assert stats["documents_available"] == 3
++    assert stats["documents_with_facts"] == 1
++    assert stats["document_states"]["PENDING"] == 1
++
++
++def test_document_processing_count_is_unknown_without_checkpoint(ingest_config):
++    Path(ingest_config["storage"]["state_db"]).unlink(missing_ok=True)
++    stats = build_graph_bundle(ingest_config)["statistics"]
++    assert stats["documents_processed"] is None
++    assert stats["document_states"] is None
+--- a/tests/test_ingest.py
++++ b/tests/test_ingest.py
+@@ -1,6 +1,8 @@
+ """Multi-document INGEST and its resume behaviour."""
+ 
+ from __future__ import annotations
++
++import json
+ 
+ import pandas as pd
+ 
+@@ -75,8 +77,23 @@
+ 
+ 
+ def test_facts_accumulate_across_documents(tmp_path, ingest_config, connection, ontology):
++    class SourceAwareLLM(StubLLM):
++        def _answer(self, prompt):
++            # An extraction stub must return evidence from the document it receives.
++            if "Input text:" in prompt and SECOND_DOCUMENT.strip() in prompt:
++                self.prompts.append(prompt)
++                return json.dumps({
++                    "nodes": [
++                        {"id": "0", "label": "Company", "properties": {"name": "Ganfeng Lithium Co Ltd"}},
++                        {"id": "1", "label": "Company", "properties": {"name": "CATL"}},
++                    ],
++                    "relationships": [{"type": "suppliesTo", "start_node_id": "0", "end_node_id": "1",
++                        "properties": {"evidence": SECOND_DOCUMENT.splitlines()[0]}}],
++                })
++            return super()._answer(prompt)
++
+     directory = corpus(tmp_path, DOCUMENT_TEXT, SECOND_DOCUMENT)
+-    run_ingest(ingest_config, connection, StubLLM(), ontology, None, directory)
++    run_ingest(ingest_config, connection, SourceAwareLLM(), ontology, None, directory)
+     facts = pd.read_parquet(ingest_config["storage"]["extracted_facts"])
+     assert facts.doc_id.nunique() == 2
+     # fact ids are deterministic, so nothing is duplicated
+--- /dev/null
++++ b/tests/test_pipeline_reliability.py
+@@ -0,0 +1,180 @@
++"""Regression tests for partial extraction and durable resume, using local stubs."""
++
++from __future__ import annotations
++
++import json
++from pathlib import Path
++
++import pandas as pd
++import pytest
++from neo4j_graphrag.llm import LLMInterface, LLMResponse
++
++from schain import state
++from schain.checkpoint import atomic_write_json
++from schain.documents import load_document, make_document
++from schain.kg.extract import extract_graph
++from schain.pipeline import clear_generated_data, process_document
++
++from .conftest import StubLLM
++from .test_extract import VALID
++from .test_pipeline import Prompt2FailsLLM
++
++
++class ChunkLLM(LLMInterface):
++    def __init__(self, fail_bravo: bool = False, transient_once: bool = False):
++        super().__init__(model_name="stub")
++        self.fail_bravo = fail_bravo
++        self.transient_once = transient_once
++        self.inputs: list[str] = []
++
++    def invoke(self, input, message_history=None, system_instruction=None):
++        return LLMResponse(content=VALID)
++
++    async def ainvoke(self, input, message_history=None, system_instruction=None):
++        text = input.rsplit("Input text:", 1)[-1].strip()
++        self.inputs.append(text)
++        if self.fail_bravo and "bravo" in text:
++            raise RuntimeError("deliberate chunk failure")
++        if self.transient_once and "bravo" in text:
++            self.transient_once = False
++            raise RuntimeError("connection temporarily unavailable")
++        return LLMResponse(content=VALID)
++
++
++def chunk_document():
++    return make_document("alpha " * 20 + "bravo " * 20 + "charlie " * 20)
++
++
++def test_resume_reuses_successful_chunks_and_preserves_their_ids(tmp_path, ontology):
++    document = chunk_document()
++    options = dict(chunk_size=120, chunk_overlap=0, on_error="RAISE", checkpoint_dir=tmp_path)
++    failing = ChunkLLM(fail_bravo=True)
++    with pytest.raises(RuntimeError, match="deliberate chunk failure"):
++        extract_graph(failing, document, ontology, **options)
++    completed = list(tmp_path.glob("*.json"))
++    assert len(completed) == len(failing.inputs) - 1
++
++    resumed = ChunkLLM()
++    graph, index = extract_graph(resumed, document, ontology, **options)
++    assert len(resumed.inputs) == 1 and "bravo" in resumed.inputs[0]
++    assert len(graph.nodes) == len(index) * 2
++    assert {node.id.split(":", 1)[0] for node in graph.nodes} == set(index)
++
++    cached = ChunkLLM()
++    again, again_index = extract_graph(cached, document, ontology, **options)
++    assert cached.inputs == []
++    assert again.model_dump() == graph.model_dump() and again_index == index
++
++
++def test_transient_error_retries_only_its_own_chunk(tmp_path, ontology):
++    llm = ChunkLLM(transient_once=True)
++    _, index = extract_graph(
++        llm, chunk_document(), ontology, chunk_size=120, chunk_overlap=0,
++        on_error="RAISE", checkpoint_dir=tmp_path,
++    )
++    assert len(llm.inputs) == len(index) + 1
++    assert sum("bravo" in text for text in llm.inputs) == 2
++    assert sum("alpha" in text for text in llm.inputs) == 1
++
++
++def test_chunk_cache_invalidates_when_model_parameters_change(tmp_path, ontology):
++    document = chunk_document()
++    llm = ChunkLLM()
++    options = dict(chunk_size=120, chunk_overlap=0, checkpoint_dir=tmp_path)
++    _, index = extract_graph(llm, document, ontology, **options)
++    llm.inputs.clear()
++    llm.model_params["temperature"] = 0.5
++    extract_graph(llm, document, ontology, **options)
++    assert len(llm.inputs) == len(index)
++
++
++def test_damaged_chunk_cache_is_recomputed(tmp_path, ontology):
++    llm = ChunkLLM()
++    options = dict(chunk_size=10000, chunk_overlap=0, checkpoint_dir=tmp_path)
++    extract_graph(llm, chunk_document(), ontology, **options)
++    next(tmp_path.glob("*.json")).write_text('{"nodes":', encoding="utf-8")
++    llm.inputs.clear()
++    graph, _ = extract_graph(llm, chunk_document(), ontology, **options)
++    assert len(llm.inputs) == 1 and graph.nodes
++
++
++def test_interrupted_json_write_keeps_previous_checkpoint(tmp_path, monkeypatch):
++    target = tmp_path / "checkpoint.json"
++    atomic_write_json(target, {"complete": True})
++
++    def interrupted(payload, handle, **kwargs):
++        handle.write('{"incomplete":')
++        raise OSError("disk write failed")
++
++    monkeypatch.setattr("schain.checkpoint.json.dump", interrupted)
++    with pytest.raises(OSError, match="disk write failed"):
++        atomic_write_json(target, {"complete": False})
++    assert json.loads(target.read_text()) == {"complete": True}
++    assert sorted(path.name for path in tmp_path.iterdir()) == [target.name]
++
++
++def test_resume_repairs_source_persistence_after_registration(
++    document_file, ingest_config, connection, ontology, monkeypatch,
++):
++    document = load_document(document_file, source_url="https://original.test/article")
++
++    def broken_write(*args, **kwargs):
++        raise OSError("normalized document write failed")
++
++    with monkeypatch.context() as patch:
++        patch.setattr("schain.pipeline.upsert_normalized_parquet", broken_write)
++        with pytest.raises(OSError, match="normalized document write failed"):
++            process_document(document, ingest_config, connection, StubLLM(), ontology)
++    assert state.document_status(connection, document["doc_id"]) == state.FAILED
++
++    rediscovered = load_document(document_file, source_url="https://mirror.test/article")
++    process_document(rediscovered, ingest_config, connection, StubLLM(), ontology)
++    normalized = pd.read_parquet(ingest_config["storage"]["normalized_documents"])
++    facts = pd.read_parquet(ingest_config["storage"]["extracted_facts"])
++    assert normalized.source_url.tolist() == ["https://original.test/article"]
++    assert facts.source_url.eq("https://original.test/article").all()
++    raw = Path(ingest_config["storage"]["raw_documents"]).read_text().splitlines()
++    assert len(raw) == 1
++
++
++def test_prompt2_resume_keeps_the_original_source_attribution(
++    document_file, ingest_config, connection, ontology,
++):
++    original = load_document(document_file, source_url="https://original.test/article")
++    with pytest.raises(RuntimeError, match="disambiguation endpoint down"):
++        process_document(original, ingest_config, connection, Prompt2FailsLLM(), ontology)
++    rediscovered = load_document(document_file, source_url="https://mirror.test/article")
++    llm = StubLLM()
++    process_document(rediscovered, ingest_config, connection, llm, ontology)
++    facts = pd.read_parquet(ingest_config["storage"]["extracted_facts"])
++    assert llm.extraction_calls == 0
++    assert facts.source_url.eq("https://original.test/article").all()
++
++
++def test_resolved_resume_restores_saved_alias_groups_before_commit(
++    document_file, ingest_config, connection, ontology, monkeypatch,
++):
++    document = load_document(document_file)
++    process_document(document, ingest_config, connection, StubLLM(), ontology)
++    captured = {}
++
++    def capture(driver, config, facts, ontology, resolution):
++        captured.update(resolution)
++        return 0, 0
++
++    monkeypatch.setattr("schain.pipeline.commit_facts", capture)
++    llm = StubLLM()
++    summary = process_document(document, ingest_config, connection, llm, ontology, object())
++    assert summary["status"] == state.COMMITTED and llm.prompts == []
++    assert any(set(row["aliases"]) == {"BMW", "BMW AG"} for row in captured.values())
++
++
++def test_restart_removes_chunk_checkpoints(
++    document_file, ingest_config, connection, ontology,
++):
++    process_document(load_document(document_file), ingest_config, connection, StubLLM(), ontology)
++    extraction_dir = Path(ingest_config["storage"]["extractions"])
++    assert list(extraction_dir.glob("*.chunks/*.json"))
++    connection.close()
++    clear_generated_data(ingest_config)
++    assert not list(extraction_dir.glob("*.chunks"))
+--- a/tests/test_server_scripts.py
++++ b/tests/test_server_scripts.py
+@@ -8,6 +8,7 @@
+ from __future__ import annotations
+ 
+ import os
++import shlex
+ import shutil
+ import socket
+ import subprocess
+@@ -351,6 +352,65 @@
+             process.wait(timeout=10)
+ 
+ 
++def test_config_inspection_works_without_a_project_venv(tmp_path):
++    """A fresh checkout must report real configured endpoints before installing .venv."""
++    config = write_temp_config(tmp_path, 9123)
++    command = (
++        f"source {shlex.quote(str(LIB))}; "
++        f"VENV_PY={shlex.quote(str(tmp_path / 'missing-python'))}; "
++        f"config_values {shlex.quote(str(config))}"
++    )
++    result = run(
++        ["bash", "-c", command], cwd=tmp_path,
++        env={"NEO4J_URI": "bolt://configured.test:7687"},
++    )
++    assert result.returncode == 0, result.stderr
++    assert "CFG_LLM_BASE_URL=http://127.0.0.1:9123/v1" in result.stdout
++    assert "CFG_NEO4J_URI=bolt://configured.test:7687" in result.stdout
++    assert "Qwen/Qwen3.8-27B" in result.stdout
++    assert not (tmp_path / ".venv").exists()
++
++
++def test_open_http_port_is_not_neo4j_when_project_venv_is_missing(tmp_path):
++    port = free_port()
++    listener = start_http_stub(port)
++    try:
++        command = (
++            f"source {shlex.quote(str(LIB))}; "
++            f"VENV_PY={shlex.quote(str(tmp_path / 'missing-python'))}; "
++            f"neo4j_reachable bolt://127.0.0.1:{port}"
++        )
++        result = run(
++            ["bash", "-c", command], env={"SCHAIN_NEO4J_SKIP_BOLT_CHECK": ""},
++        )
++        assert result.returncode != 0
++        assert alive(listener)
++    finally:
++        listener.terminate()
++        listener.wait(timeout=10)
++
++
++def test_occupied_unverified_neo4j_port_never_starts_another_instance(tmp_path):
++    port = free_port()
++    listener = start_http_stub(port)
++    try:
++        config = write_temp_config(tmp_path, port)
++        result = run(
++            [str(RUN), "--dry-run", "--config", str(config)],
++            env={"NEO4J_URI": f"bolt://127.0.0.1:{port}",
++                 "SCHAIN_NEO4J_SKIP_BOLT_CHECK": ""},
++        )
++        output = result.stdout + result.stderr
++        assert result.returncode != 0
++        assert "occupied but Neo4j could not be verified" in output
++        assert "would start Neo4j" not in output
++        assert "would install and start local Neo4j" not in output
++        assert alive(listener)
++    finally:
++        listener.terminate()
++        listener.wait(timeout=10)
++
++
+ def test_a_service_started_by_the_run_is_stopped_when_the_workload_finishes(tmp_path):
+     """The other half: an owned vLLM must not be left holding the GPU afterwards."""
+     llm_port, neo4j_port = free_port(), free_port()
+--- /dev/null
++++ b/tests/test_upgrade.py
+@@ -0,0 +1,61 @@
++"""Regression checks for source grounding, exact evaluation and offline export."""
++import json
++import pandas as pd
++import pytest
++from schain.kg.validate import validate_facts_frame
++from schain.validation.gold import evaluate_gold
++from schain.viewer import write_viewer, validate_graph
++from .test_quality import _accepted_supply
++
++
++def test_hallucinated_quote_rejected_before_llm(ingest_config, ontology, stub_llm):
++    facts = pd.DataFrame([_accepted_supply("CATL", "BMW", "d")])
++    accepted, rejected = validate_facts_frame(facts, config=ingest_config, ontology=ontology, llm=stub_llm,
++                                             document_text="CATL does not supply BMW.")
++    assert accepted.empty
++    assert rejected.iloc[0].rejection_reason == "evidence_not_in_source"
++    assert not stub_llm.prompts
++
++
++def test_literal_quote_matches_normalized_whitespace(ingest_config, ontology, stub_llm):
++    facts = pd.DataFrame([_accepted_supply("CATL", "BMW", "d")])
++    accepted, rejected = validate_facts_frame(facts, config=ingest_config, ontology=ontology, llm=stub_llm,
++                                             document_text="CATL\n supplies   to BMW.")
++    assert rejected.empty and len(accepted) == 1
++    assert bool(accepted.iloc[0].evidence_quote_grounded)
++
++
++def test_no_model_does_not_claim_validation(ingest_config, ontology):
++    facts = pd.DataFrame([_accepted_supply("CATL", "BMW", "d")])
++    accepted, _ = validate_facts_frame(facts, config=ingest_config, ontology=ontology, document_text="CATL supplies to BMW.")
++    assert not bool(accepted.iloc[0].evidence_validated)
++    assert accepted.iloc[0].validation_status == "unchecked"
++
++
++def test_evaluation_direction_negatives_and_document_scope():
++    edge = {"subject_id":"A", "relation":"suppliesTo", "object_id":"B"}
++    gold = {"documents":[{"doc_id":"positive", "triples":[edge]}, {"doc_id":"negative", "triples":[]}]}
++    pred = [{"doc_id":"positive", **edge}, {"doc_id":"positive", **edge},
++            {"doc_id":"negative", **edge}, {"doc_id":"outside", **edge},
++            {"doc_id":"positive", "subject_id":"B", "relation":"suppliesTo", "object_id":"A"}]
++    r = evaluate_gold(gold, pred)
++    assert r["micro"] == {"true_positive":1,"false_positive":2,"false_negative":0,"precision":1/3,"recall":1.0,"f1":.5}
++    assert r["excluded_prediction_documents"] == 1
++    assert evaluate_gold(gold, [])["micro"]["recall"] == 0
++
++
++def test_viewer_is_self_contained_and_source_cannot_inject_script(tmp_path):
++    payload = {"nodes":[{"id":"a","name":"</script><script>alert(1)</script>"}],"edges":[]}
++    path = write_viewer(payload, tmp_path / "graph.html")
++    html = path.read_text()
++    assert "</script><script>alert(1)</script>" not in html
++    assert "__GRAPH_DATA__" not in html and "/*__SCRIPT__*/" not in html
++    embedded = html.split('id="graphData">')[1].split('</script>')[0]
++    assert json.loads(embedded) == validate_graph(payload)
++    assert json.loads(embedded)["nodes"][0]["name"] == payload["nodes"][0]["name"]
++    assert 'src="https://' not in html
++
++
++def test_viewer_rejects_dangling_edges():
++    with pytest.raises(ValueError, match="existing node"):
++        validate_graph({"nodes":[{"id":"a"}], "edges":[{"id":"e","source":"a","target":"b"}]})
+--- /dev/null
++++ b/tests/test_viewer_integrity.py
+@@ -0,0 +1,100 @@
++"""Offline viewer validation and interaction regressions; no browser or network."""
++
++from __future__ import annotations
++
++import json
++import shutil
++import subprocess
++from importlib.resources import files
++
++import pytest
++
++from schain.viewer import validate_graph, write_viewer
++
++
++def graph():
++    return {"nodes": [{"id": "a"}, {"id": "b", "name": "B", "type": "Company"}],
++            "edges": [{"id": "e", "source": "b", "target": "a", "relation": "suppliesTo"}]}
++
++
++def test_missing_optional_labels_have_safe_fallbacks_without_mutating_input():
++    data = graph()
++    result = validate_graph(data)
++    assert result["nodes"][0]["name"] == "a"
++    assert result["nodes"][0]["type"] == "Unknown"
++    assert "name" not in data["nodes"][0]
++
++
++@pytest.mark.parametrize("field,value", [
++    ("name", 123), ("aliases", {}), ("aliases", [1]),
++    ("discovery_tier", "1"), ("discovery_tier", 0.5),
++    ("discovery_tier", True), ("discovery_tier", -1),
++])
++def test_malformed_node_shapes_are_rejected(field, value):
++    data = graph()
++    data["nodes"][0][field] = value
++    with pytest.raises(ValueError):
++        validate_graph(data)
++
++
++@pytest.mark.parametrize("field,value", [
++    ("source", []), ("quality", []), ("quality", "checked"),
++    ("evidence", {}), ("evidence", [None]), ("source_doc_ids", "doc"),
++])
++def test_malformed_evidence_shapes_are_rejected(field, value):
++    data = graph()
++    data["edges"][0][field] = value
++    with pytest.raises(ValueError):
++        validate_graph(data)
++
++
++def test_source_text_cannot_escape_embedded_json_script(tmp_path):
++    data = graph()
++    attack = '</script><script>alert("source text")</script>/*__SCRIPT__*/'
++    data["nodes"][0]["name"] = attack
++    output = write_viewer(data, tmp_path / "viewer.html")
++    html = output.read_text()
++    assert attack not in html
++    payload = html.split('<script type="application/json" id="graphData">', 1)[1].split('</script>', 1)[0]
++    assert json.loads(payload)["nodes"][0]["name"] == attack
++
++
++@pytest.mark.skipif(shutil.which("node") is None, reason="Node.js not installed (optional viewer interaction test)")
++def test_inspection_keeps_zoom_and_distinguishes_failed_grounding():
++    script = r'''
++const fs=require('fs'),vm=require('vm'),assert=require('assert');
++class Element {
++ constructor(tag){this.tag=tag;this.children=[];this.attrs={};this.textContent='';this.value='';this.checked=false;this.hidden=false;this.style={};this.listeners={};}
++ append(...children){this.children.push(...children);if(this.tag==='select'&&!this.value&&children[0])this.value=children[0].value;}
++ replaceChildren(...children){this.children=[...children];}
++ setAttribute(k,v){this.attrs[k]=v;}
++ addEventListener(k,v){this.listeners[k]=v;}
++ getBoundingClientRect(){return {width:1000,height:600};}
++}
++const elements=new Map();
++const get=id=>{if(!elements.has(id))elements.set(id,new Element(['seed','relation','type','tier','quality','support'].includes(id)?'select':id));return elements.get(id)};
++get('graphData').textContent=JSON.stringify({nodes:[{id:'a',name:'A',type:'Company',is_seed:true,discovery_tier:0},{id:'b',name:'B',type:'Company',discovery_tier:1}],edges:[{id:'e',source:'b',target:'a',relation:'suppliesTo',source_doc_ids:['d'],evidence:[{doc_id:'d',quote:'q',evidence_quote_grounded:false}],quality:{evidence_validated:true}}]});
++const context=vm.createContext({document:{getElementById:get,createElement:t=>new Element(t),createElementNS:(_,t)=>new Element(t)},URL,Blob,setTimeout,clearTimeout,console});
++vm.runInContext(fs.readFileSync(process.argv[1],'utf8'),context);
++vm.runInContext('zoom(0.5)',context);
++const before=vm.runInContext('JSON.stringify(view)',context);
++vm.runInContext('inspectEdge(bundle.edges[0])',context);
++assert.equal(vm.runInContext('JSON.stringify(view)',context),before);
++const gather=e=>[e.textContent,...e.children.flatMap(gather)].filter(Boolean);
++assert(gather(get('details')).includes('Quote did not match source'));
++vm.runInContext('inspectNode(bundle.nodes[0])',context);
++assert.equal(vm.runInContext('JSON.stringify(view)',context),before);
++const original=vm.runInContext('JSON.stringify(bundle)',context);
++context.bad={nodes:[{id:'x',name:7,is_seed:true}],edges:[]};
++assert.throws(()=>vm.runInContext('load(bad,"bad")',context),/must be a string/);
++assert.equal(vm.runInContext('JSON.stringify(bundle)',context),original);
++context.minimal={nodes:[{id:'x',is_seed:true},{id:'y',is_seed:true}],edges:[]};
++vm.runInContext('load(minimal,"minimal")',context);
++assert.equal(vm.runInContext('bundle.nodes[0].name',context),'x');
++assert.equal(vm.runInContext('bundle.nodes[0].type',context),'Unknown');
++console.log('Viewer interaction checks passed');
++'''
++    app = files("schain").joinpath("viewer_assets/app.js")
++    result = subprocess.run([shutil.which("node"), "-e", script, str(app)],
++                            capture_output=True, text=True, timeout=20)
++    assert result.returncode == 0, result.stderr

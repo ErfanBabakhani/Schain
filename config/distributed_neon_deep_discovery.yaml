@@ -1,0 +1,26 @@
+include:
+  - config/deep_discovery.yaml
+
+state:
+  backend: postgres
+  experiment_id: bmw-supply-chain-v2
+  database_url_env: NEON_DATABASE_URL
+
+distributed:
+  enabled: true
+  resume_existing_only: true
+  worker_concurrency: 1
+  tasks_per_session: 40
+  task_lease_seconds: 900
+  heartbeat_seconds: 30
+  max_task_attempts: 3
+  poll_seconds: 3.0
+  connection_pool_min: 1
+  connection_pool_max: 4
+  event_retention_days: 30
+
+# The existing experiment was created without Neo4j persistence. Keep that invariant.
+save:
+  enabled: false
+  backend: neo4j
+  mode: incremental

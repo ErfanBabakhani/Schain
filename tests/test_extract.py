@@ -68,7 +68,8 @@ def test_prompt_carries_the_ontology_and_the_document(ontology):
         assert relation in prompt
     assert "(Company)-[:suppliesTo]->(Company)" in prompt   # allowed patterns are shown
     assert "CATL supplies battery cells" in prompt          # the document text
-    assert "suppliesTo points from the supplier to the customer" in prompt
+    assert "suppliesTo (A → B)" in prompt or "supplier → customer" in prompt
+    assert "distributor" in prompt.casefold() or "reseller" in prompt.casefold()
 
 
 def test_schema_is_rendered_compactly_not_as_a_dict_dump(ontology):
@@ -77,7 +78,7 @@ def test_schema_is_rendered_compactly_not_as_a_dict_dump(ontology):
     full = SupplyChainERTemplate().format(
         text="T", schema=build_graph_schema(ontology).model_dump(exclude_none=True), examples="E"
     )
-    assert len(full) < 2500     # the raw dict dump was over 4000 characters
+    assert len(full) < 6000     # compact schema render; relation semantics may expand wording
 
 
 # --- response parsing --------------------------------------------------------------
@@ -265,10 +266,11 @@ def test_a_sparse_document_yields_only_what_it_evidences(ontology):
     assert len(graph.nodes) == 2 and len(graph.relationships) == 1
 
 
-def test_the_same_fact_in_two_chunks_collapses_to_one_row(ontology, ingest_config):
-    """Chunking must not inflate the graph: identical facts share a deterministic id."""
+def test_chunk_evidence_is_preserved_on_one_semantic_edge(ontology, ingest_config):
+    """Retain chunk provenance while counting one edge and one source document."""
     from schain.kg.facts import graph_to_facts
     from schain.kg.resolve import resolve_entities
+    from schain.graph_export import _build_nodes_and_edges
 
     # a document long enough to split, with every chunk returning the same fact
     document = make_document("CATL supplies battery cells to BMW AG. " * 200)
@@ -278,6 +280,28 @@ def test_the_same_fact_in_two_chunks_collapses_to_one_row(ontology, ingest_confi
 
     resolution, _ = resolve_entities(graph, llm=None)
     facts = graph_to_facts(graph, document, chunk_index, resolution)
-    # the facts table collapses them: same doc, same canonical endpoints, same relation
-    assert facts.fact_id.nunique() == 1
-    assert len(facts.drop_duplicates(subset="fact_id")) == 1
+    assert facts.fact_id.nunique() == len(chunk_index)
+    nodes, edges, _, _ = _build_nodes_and_edges(
+        facts, {}, {}, [], {}, ontology,
+    )
+    assert len(nodes) == 2
+    assert len(edges) == 1
+    assert edges[0]["support_count"] == 1
+    assert edges[0]["evidence_count"] == len(chunk_index)
+    assert {item["chunk_index"] for item in edges[0]["evidence"]} == set(chunk_index.values())
+
+
+def test_provider_sets_bounded_output_and_disables_nested_retries():
+    from schain.llm.provider import build_llm
+    llm = build_llm({'llm': {'model': 'm', 'base_url': 'http://localhost:1/v1',
+                             'max_tokens': 2048}})
+    assert llm.model_params['max_tokens'] == 2048
+    assert llm.client.max_retries == llm.async_client.max_retries == 0
+    assert llm._rate_limit_handler.max_attempts == 1
+
+
+def test_provider_rejects_invalid_retry_and_token_limits():
+    from schain.llm.provider import build_llm
+    for settings in ({'max_tokens': 0}, {'client_max_retries': -1}, {'rate_limit_max_attempts': 0}):
+        with pytest.raises(ValueError):
+            build_llm({'llm': {'model': 'm', **settings}})

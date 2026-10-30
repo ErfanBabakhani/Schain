@@ -217,17 +217,25 @@ def test_expand_also_writes_graph_export(tmp_path, expand_config, llms, monkeypa
     expand_config["seeds"] = {"ev_manufacturers": ["BMW"]}
     expand_config["expansion"]["max_tier"] = 0
     expand_config["expansion"]["max_documents"] = 1
+    expand_config.setdefault("verification", {})["enabled"] = False
     config_path = tmp_path / "expand.yaml"
     config_path.write_text(yaml.safe_dump(expand_config), encoding="utf-8")
 
-    def fake(config, entity_name, entity_key, tier, connection, manifest=None):
-        return [
-            SearchResult(
-                provider="test", query='"BMW" suppliers',
-                title="BMW supplier news", url="https://news.test/0",
-                text=DOCUMENT_TEXT,
-            )
-        ]
+    def fake(config, entity_name, entity_key, tier, connection, manifest=None, **_kwargs):
+        result = SearchResult(
+            provider="test", query='"BMW" suppliers',
+            title="BMW supplier news", url="https://www.bmwgroup.com/news/0",
+            text=DOCUMENT_TEXT,
+            retrieval_url="https://www.bmwgroup.com/news/0",
+            canonical_source_url="https://www.bmwgroup.com/news/0",
+            source_domain="bmwgroup.com",
+        )
+        result._source_known = True
+        result._source_class = "official_primary"
+        result._source_base_score = 94
+        result._source_effective_score = 99
+        result._source_group_id = "domain:bmwgroup.com"
+        return [result]
 
     monkeypatch.setattr("schain.expansion.loop.retrieve_for_entity", fake)
     assert run_cli(
