@@ -12,7 +12,6 @@ import json
 import logging
 import math
 import sqlite3
-import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -20,10 +19,9 @@ from typing import Any, Optional
 import pandas as pd
 
 from . import __version__
-from .config import seed_entities, storage_dir, storage_path
+from .config import seed_entities, storage_path
 from .documents import normalize_url
 from .kg.facts import FACT_COLUMNS
-from .kg.support import aggregate_edge_support, contextualize_facts, load_document_origins
 from .ontology import load_ontology
 
 logger = logging.getLogger(__name__)
@@ -80,23 +78,6 @@ def _as_str(value: Any, default: str = "") -> str:
     if cleaned is None:
         return default
     return str(cleaned)
-
-
-def _optional_bool(value: Any) -> Optional[bool]:
-    """Keep absent legacy validation flags unknown, including pandas nulls."""
-    value = json_safe(value)
-    if isinstance(value, bool):
-        return value
-    if value in (0, 1):
-        return bool(value)
-    return None
-
-
-def _any_flag(rows: list[dict[str, Any]], field: str) -> Optional[bool]:
-    flags = [_optional_bool(row.get(field)) for row in rows]
-    if True in flags:
-        return True
-    return False if False in flags else None
 
 
 def _unique_sorted(values: list[Any]) -> list[str]:
