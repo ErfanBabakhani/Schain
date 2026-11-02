@@ -256,7 +256,7 @@ Discover them on this cluster with:
   sinfo -o '%P %G %l'        # partitions, their GRES and time limits
   sacctmgr show assoc where user=$USER format=account,partition,qos
 
-See docs/SERVER_REQUIRED_INFO.md.
+See docs/SERVER_HANDOFF.md.
 HINT
         exit 1
     fi

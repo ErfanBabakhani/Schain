@@ -104,8 +104,6 @@ uses fictional companies and manually authored source sentences, not extraction 
 ## What each supplied paper contributes
 
 These are design transfers, not claims that this release reproduces each paper's system.
-The detailed reviews under `docs/literature/` include full bibliographic identities,
-PDF page references, method summaries, results and limitations.
 
 | Source | Useful transfer to this implementation | Boundary |
 |---|---|---|
@@ -164,7 +162,7 @@ NER and entity-resolution quality need their own labels and metrics.
 ## Validation and practical limits
 
 The final test suite completed with **421 passed, 4 skipped** (86.39 seconds; six existing
-pandas FutureWarnings). See `TEST_RESULTS.md` for the environment. Checks exercise parsing,
+pandas FutureWarnings) at the time of this review. Checks exercise parsing,
 source grounding, negative documents, directed edge scoring, cache failure/recovery, metadata,
 Neo4j query parameters, tiers, seeds and shell probes. Four existing integration tests require
 external services and are skipped when unavailable. Python tests use model/database stubs;

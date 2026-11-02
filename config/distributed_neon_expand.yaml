@@ -2,7 +2,7 @@
 #
 #   python -m schain expand --config config/distributed_neon_expand.yaml
 #
-# Needs NEON_DATABASE_URL in .env. See docs/DISTRIBUTED_NEON_EXPAND.md.
+# Needs NEON_DATABASE_URL in .env. See docs/COLAB_AND_DISTRIBUTED.md.
 
 include:
   - config/expansion.yaml

@@ -3,7 +3,7 @@
 #
 #   python -m schain expand --config config/distributed_neon_deep_discovery.yaml
 #
-# Needs NEON_DATABASE_URL in .env. See docs/DEEP_DISCOVERY_SAFE_RESUME.md.
+# Needs NEON_DATABASE_URL in .env. See docs/COLAB_AND_DISTRIBUTED.md.
 
 include:
   - config/deep_discovery.yaml

@@ -161,15 +161,11 @@ a browser and load a graph JSON, or build a standalone page with `python -m scha
 
 | Document | Contents |
 |---|---|
-| [docs/PIPELINE.md](docs/PIPELINE.md) | how the pipeline works: tiers, sources, graph semantics, resume |
+| [docs/PIPELINE.md](docs/PIPELINE.md) | how the pipeline works: tiers, sources, fact acceptance, resume, audit trace, evaluation, code layout |
 | [config/README.md](config/README.md) | configuration layering and what to edit |
+| [docs/SERVER_HANDOFF.md](docs/SERVER_HANDOFF.md) | running on a GPU server, and the verified setup |
+| [docs/COLAB_AND_DISTRIBUTED.md](docs/COLAB_AND_DISTRIBUTED.md) | Neo4j saving, Colab checkpoints, distributed and deep-discovery runs |
 | [docs/PROJECT_DECISIONS.md](docs/PROJECT_DECISIONS.md) | the frozen V1 scope |
-| [docs/PROJECT_STRUCTURE.md](docs/PROJECT_STRUCTURE.md) | repository layout |
-| [Architecture brief (PDF)](docs/SupplyChain_KG_V1_Architecture_Brief_Final.pdf) | the V1 architecture |
-| [docs/SERVER_HANDOFF.md](docs/SERVER_HANDOFF.md) · [SERVER_REQUIRED_INFO.md](docs/SERVER_REQUIRED_INFO.md) | GPU server checklist |
-| [docs/SAVE_AND_COLAB_RESUME.md](docs/SAVE_AND_COLAB_RESUME.md) | incremental Neo4j save and Colab resume |
-| [docs/DISTRIBUTED_NEON_EXPAND.md](docs/DISTRIBUTED_NEON_EXPAND.md) · [DEEP_DISCOVERY_SAFE_RESUME.md](docs/DEEP_DISCOVERY_SAFE_RESUME.md) | distributed runs |
-| [docs/SOURCE_REPUTATION_AND_VERIFICATION.md](docs/SOURCE_REPUTATION_AND_VERIFICATION.md) | source reputation, validation statuses, frontier gate |
 | [docs/EXTERNAL_DATASETS.md](docs/EXTERNAL_DATASETS.md) | external validation datasets |
-| [docs/AUDIT_TRACE_JSON.md](docs/AUDIT_TRACE_JSON.md) | the optional audit trace |
-| [docs/AUDIT_V0.3.0.md](docs/AUDIT_V0.3.0.md) · [UPGRADE_REVIEW.md](docs/UPGRADE_REVIEW.md) · [RELEASE_NOTES_0.3.0.md](docs/RELEASE_NOTES_0.3.0.md) | audits and release history |
+| [docs/PAPER_REVIEW.md](docs/PAPER_REVIEW.md) | how SChain relates to the reviewed papers, and research ideas |
+| [Architecture brief (PDF)](docs/SupplyChain_KG_V1_Architecture_Brief_Final.pdf) | the V1 architecture |

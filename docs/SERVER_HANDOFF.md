@@ -1,11 +1,9 @@
-> Current experiment policy and readiness: [AUDIT_V0.3.0.md](AUDIT_V0.3.0.md). Colab uses the dedicated runtime profile and can omit Neo4j.
+# Running on a GPU server
 
-# Server handoff
-
-For moving V1 to the GPU server. `./scripts/server_run.sh smoke` has passed end to end on
-a SLURM cluster (RTX A6000, NVIDIA driver 535) with the real model and live retrieval;
-see [TEST_RESULTS.md](TEST_RESULTS.md). Neo4j persistence (`--save`) and full-size runs
-have not been exercised on a server yet.
+How to run SChain on a GPU server with `scripts/server_run.sh`. The smoke test has passed
+end to end on a SLURM cluster with the real model and live retrieval (see
+[Verified setup](#verified-setup)); Neo4j persistence (`--save`) and full-size runs have
+not been exercised on a server yet.
 
 ## First run
 
@@ -46,9 +44,22 @@ Nothing, unless one of these applies:
 - the model weights are gated → `HF_TOKEN`;
 - you want the weights cached on a shared filesystem → `HF_HOME`.
 
-The script tells you exactly which value is missing and how to discover it. See
-[SERVER_REQUIRED_INFO.md](SERVER_REQUIRED_INFO.md). Every other `SCHAIN_*` setting in
-`.env.example` is optional and has a working default.
+The script fails immediately and names exactly what is missing; it never guesses SLURM
+values, because partitions, accounts and GRES syntax differ per cluster. To discover them:
+
+| Variable | How to find it |
+|---|---|
+| `SCHAIN_SLURM_PARTITION` | `sinfo -o '%P %G %l'`: partitions with a non-null GRES can run GPU jobs; `%l` is the time limit |
+| `SCHAIN_SLURM_ACCOUNT` (only if required) | `sacctmgr show assoc where user=$USER format=account,partition,qos` |
+| `SCHAIN_SLURM_GRES` (default `gpu:1`) | the `%G` column above, e.g. `gpu:a100:2` |
+| `SCHAIN_SLURM_TIME` (default `24:00:00`) | must not exceed the partition's `%l` limit |
+
+Everything else is detected: OS, Python, `.venv`, tmux, Docker, the GPUs and driver,
+whether vLLM is installed, SLURM and any current allocation, disk space, the configured
+model, endpoint and Neo4j database, which `.env` values are set, and whether Neo4j and the
+LLM endpoint already answer. `./scripts/server_preflight.sh` prints all of it, showing
+secrets only as `set` / `not set`. Every other `SCHAIN_*` setting in `.env.example` is
+optional and has a working default.
 
 If `.env` already exists, leave it alone — `cp` would overwrite it.
 
@@ -174,3 +185,30 @@ mistaken for a hang. Set `HF_HOME` to cache on shared storage.
    MATCH (s:Company)-[r:suppliesTo]->(c:Company) RETURN s.name, c.name, r.evidence LIMIT 25;
    ```
 7. `./scripts/server_run.sh` for the full run, then `./scripts/server_status.sh` to watch it.
+
+## Verified setup
+
+On 2 November 2026 `./scripts/server_run.sh smoke` passed as a SLURM batch job on one
+NVIDIA RTX A6000 with about 13 GB free (the GPU was shared with other users), driver
+535.183.01 (CUDA 12.2), Python 3.10 and vLLM 0.19.1 serving `Qwen/Qwen3-4B-Instruct-2507`,
+with Neo4j saving off. The `.env` was:
+
+```bash
+SCHAIN_VLLM_MAX_MODEL_LEN=8192
+SCHAIN_VLLM_GPU_MEMORY_UTILIZATION=0.25
+SCHAIN_VLLM_EXTRA_ARGS=--enforce-eager
+SCHAIN_VLLM_PACKAGE=vllm==0.19.1
+```
+
+From seed BMW it retrieved 18 candidates, processed 3 documents, accepted 8 facts and
+exported 9 nodes and 7 edges with no tier violations, finding four Tier-1 suppliers
+(Albemarle, ArcelorMittal, Lhyfe, Qualcomm Technologies). The pipeline took 7 minutes
+after a one-time vLLM install and model download. GDELT answered `429 Too Many Requests`
+during the run; failed queries are recorded and retried by the next run.
+
+If the home directory is network storage (NFS), keep the repository and its `.venv` on a
+local disk: a vLLM environment is tens of thousands of small files, and creating it on
+NFS can stall.
+
+The offline suite (`.venv/bin/python -m pytest -q`) passed with 723 tests and 18 skipped
+integration tests that need a live model, network or Neo4j.

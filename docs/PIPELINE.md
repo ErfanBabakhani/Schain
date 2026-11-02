@@ -25,7 +25,6 @@ The default experiment has four OEM seeds and `max_tier: 5`: Tiers 0–4 are sea
 Tier 5 is terminal (stored, never searched). Per-tier document targets and maxima, the
 per-run document ceiling (`expansion.max_documents`) and the wall-clock budget
 (`runtime.max_minutes`) are all in the config files, and are cumulative across resumes.
-See [the v0.3.0 audit](AUDIT_V0.3.0.md) for the reasoning behind the tier allocations.
 
 ## Retrieval sources
 
@@ -73,6 +72,41 @@ relation, or a dozen entities and several relations. Long documents are split by
 configured chunking; after chunks are combined, repeated entities and facts collapse (a
 fact id is derived from document plus canonical endpoints plus relation), and evidence is
 retained.
+
+## When a fact is accepted
+
+A fact is accepted when the retrieved text explicitly supports it: **one valid source is
+enough**. SChain does not require several independent websites to agree; multi-source
+verification is disabled (`verification.enabled: false`, and `schain/verification.py` is
+a no-op stub kept for imports).
+
+A `suppliesTo` edge advances the frontier when the subject is a `Company`, the ontology
+pattern is valid, evidence validation supports the relation, and the subject is not a
+generic category phrase such as "chip suppliers". Title/snippet evidence counts when it is
+explicit.
+
+Source reputation (`config/source_reputation.yaml`, `schain/sources/reputation.py`) is
+informational. Scores appear on documents, facts, evidence and the graph export, but they
+never reject a fact, block an edge, change frontier eligibility or require full text; a
+Google News wrapper may score `0` and still yield an accepted edge. Each exported edge
+carries a quality object:
+
+```json
+"quality": {
+  "status": "accepted",
+  "verification_status": "not_required",
+  "max_source_score": 94,
+  "average_source_score": 72,
+  "ontology_valid": true,
+  "evidence_validated": true,
+  "frontier_eligible": true,
+  "contested": false
+}
+```
+
+`support_count` is the number of unique accepted documents behind the semantic edge;
+`independent_support_count` is deprecated and exported as `null`. URL, content-hash,
+document-id and fact-id deduplication still run.
 
 ## What V1 does to the graph, exactly
 
@@ -129,6 +163,59 @@ summary (raw candidates, unique URLs, fetch outcomes, full-text vs snippet-only,
 relevance, how many reached Prompt 1, per provider and per tier) is printed at the end of
 every run.
 
+## Optional audit trace
+
+`SCHAIN_AUDIT_TRACE=1` writes one self-contained audit JSON beside each graph export
+(`outputs/run.v1.json` gets `outputs/run.v1.audit.json`). It adds no model calls and
+changes no decision. `SCHAIN_AUDIT_FULL_CONTENT=1` also stores source and chunk text, the
+exact model inputs and responses, parsed graphs, evidence and resolution payloads. The
+YAML equivalents are `audit.enabled` and `audit.capture_content`.
+
+The JSON (schema version `1.0`) has sections for the run, configuration, documents,
+chunks, LLM calls, extraction graphs, integrity checks, entity resolution, candidate,
+accepted and rejected facts, validation decisions, repair attempts, relationship
+outcomes, graph export, events, errors and a summary. The chronological `events` list is
+the lossless source, and stable IDs join documents, chunks, LLM calls, facts and exported
+edges. Anything the model interface does not expose, such as the raw HTTP body or token
+usage, is marked unavailable rather than reconstructed. Events are journalled during the
+run and the final JSON is assembled atomically; a failed run sets `run.complete: false`.
+
+Full-content traces can contain confidential documents, prompts and responses: keep them
+in the ignored `outputs/` directory and never commit them. Secrets in the configuration
+are redacted.
+
+## Evaluating extraction quality
+
+`python -m schain evaluate` scores accepted relations against a held-out, fully labelled
+gold file:
+
+```json
+{
+  "documents": [
+    {
+      "doc_id": "actual-document-id",
+      "triples": [
+        {"subject_id": "actual-supplier-canonical-id", "relation": "suppliesTo", "object_id": "actual-customer-canonical-id"}
+      ]
+    },
+    {"doc_id": "actual-negative-document-id", "triples": []}
+  ]
+}
+```
+
+Label every ontology-allowed relation in each included document, including documents
+with none, and keep these documents out of prompt tuning. Then:
+
+```bash
+python -m schain evaluate --config config/ingest.yaml --gold path/to/gold.json --output outputs/evaluation.json
+```
+
+It reports exact directed precision, recall and F1. Duplicate evidence does not inflate
+the score, and predictions in documents outside the gold set are excluded. It does not
+judge isolated entities, source truth or temporal validity. `python -m schain validate`
+is different: it measures overlap with an external reference dataset (see
+[EXTERNAL_DATASETS.md](EXTERNAL_DATASETS.md)), not precision.
+
 ## Inspecting the graph in Neo4j
 
 Use Neo4j Browser at http://localhost:7474.
@@ -171,3 +258,43 @@ MATCH ()-[r:suppliesTo]->() RETURN r.evidence, r.source_doc_ids LIMIT 25;
   server and is off by default.
 - **No lexical graph in Neo4j.** `create_lexical_graph=False`, so Neo4j holds only the
   static ontology; the evidence trail lives in the facts Parquet layer.
+
+## Code layout
+
+```text
+schain/
+├── __main__.py             CLI: ingest | expand | export | view | validate | evaluate
+├── config.py               config loading, include merge, search-limit precedence
+├── pipeline.py             the per-document path shared by both modes
+├── ingest.py               INGEST driver
+├── documents.py            loading, normalization, hashing, raw/normalized layers
+├── names.py                deterministic name normalization and canonical ids
+├── ontology.py             static ontology -> GraphSchema, and Prompt 1
+├── state.py                SQLite checkpoint/resume state
+├── state_backend.py        local SQLite versus distributed PostgreSQL state
+├── run_config.py           experiment identity, safe config snapshots, provenance
+├── checkpoint.py           atomic writes for expensive intermediate results
+├── durable.py              durable snapshots for ephemeral runtimes (Colab)
+├── async_runtime.py        one long-lived event loop for async clients
+├── audit_trace.py          optional run-scoped audit trace
+├── graph_export.py         frontend-ready semantic graph JSON (derived artifact)
+├── viewer.py               offline HTML graph explorer (assets in viewer_assets/)
+├── verification.py         no-op stub (multi-source verification removed)
+├── llm/                    provider factory (vLLM or a hosted OpenAI-compatible API)
+├── kg/                     extraction, resolution, validation, facts, support, writer
+├── sources/                retrieval providers, ranking, origin relevance, reputation
+├── expansion/              frontier, tier queries, escalation, budgets, the EXPAND loop
+├── distributed/            PostgreSQL leases, outbox and maintenance for many workers
+└── validation/             external reference comparison and gold-set evaluation
+```
+
+Outside the package: `config/` (see [config/README.md](../config/README.md)),
+`scripts/` (the GPU server runner, status and preflight), `notebooks/` (Colab),
+`examples/` and `demo/` (standalone graph explorers), and `tests/`. Everything under
+`data/` and `outputs/` is generated and gitignored.
+
+Keep modules narrow: `sources/` only retrieves and scores domains, `llm/` only builds the
+model client, `kg/` holds extraction through the idempotent writer, `expansion/` decides
+what is processed next, `state.py` only persists, and `pipeline.py`, `ingest.py` and
+`expansion/loop.py` orchestrate. The package lives in `schain/` rather than `src/` so that
+`python -m schain` works as the CLI.
