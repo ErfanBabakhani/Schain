@@ -9,7 +9,10 @@ import pandas as pd
 import pytest
 
 from schain.config import load_config
-from schain.expansion.budget import entity_document_limits, remaining_target_reserve
+from schain.expansion.budget import (
+    documents_per_run_limit, entity_document_limits, remaining_target_reserve,
+    scheduling_batch_sizes,
+)
 from schain.expansion.escalation import STAGE_C, STAGE_D, STAGE_E, build_escalation_queries
 from schain.expansion.loop import _admit_above_target
 from schain.expansion.telemetry import premature_discovery_exhaustion_warning
@@ -30,12 +33,12 @@ def test_default_document_policy_v031():
     config = load_config("config/expansion.yaml")
     expansion = config["expansion"]
     assert expansion["max_documents"] == 320
-    assert expansion.get("max_documents_per_run", expansion["max_documents"]) == 320
+    assert documents_per_run_limit(expansion) == 320
     assert config["runtime"]["max_minutes"] == 120 or load_config("config/base.yaml")["runtime"]["max_minutes"] == 120
     assert [entity_document_limits(expansion, t) for t in range(6)] == [
         (24, 36), (14, 24), (10, 18), (8, 14), (6, 10), (0, 0),
     ]
-    assert expansion["max_expandable_entities_by_tier"] == {1: 10, 2: 8, 3: 6, 4: 4}
+    assert scheduling_batch_sizes(expansion) == {1: 10, 2: 8, 3: 6, 4: 4}
     assert expansion["retrieval"]["max_title_lookups_per_entity"] == 12
     assert expansion["retrieval"]["max_candidates_per_entity"] == 96
     assert expansion["retrieval"]["query_planner_max_categories"] == 8
@@ -50,7 +53,7 @@ def test_tier5_terminal_and_frontier_caps_do_not_limit_storage(expand_config):
     expansion = expand_config["expansion"]
     assert entity_document_limits(expansion, 5) == (0, 0)
     # Caps only limit expansion search beam — graph may store more suppliers.
-    assert expansion["max_expandable_entities_by_tier"][1] == 10
+    assert scheduling_batch_sizes(expansion)[1] == 10
 
 
 def test_productive_entity_continues_above_target():

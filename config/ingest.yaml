@@ -1,6 +1,6 @@
-# INGEST: process documents already in hand. No search, no graph expansion.
+# INGEST mode: process documents you already have. No search, no graph expansion.
 #
-#   .venv/bin/python -m schain ingest --config config/ingest.yaml --input data/corpus
+#   python -m schain ingest --input path/to/docs
 
 include:
   - config/base.yaml
@@ -8,10 +8,9 @@ include:
 mode: ingest
 
 ingest:
-  # Default input location when --input is not given. A file or a directory.
+  # Default input when --input is not given: a file or a directory.
   input: data/corpus
-  # Extensions picked up when the input is a directory.
+  # Extensions picked up when the input is a directory (searched recursively).
   file_patterns: ["*.txt", "*.md", "*.pdf"]
   chunk_size: 2000
   chunk_overlap: 200
-  on_error: RAISE             # RAISE preserves failed chunks for resume; IGNORE allows partial documents

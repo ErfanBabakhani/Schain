@@ -57,6 +57,18 @@ def run(coroutine):
 # --- Wikipedia ---------------------------------------------------------------------
 
 
+def test_user_agent_carries_contact_information():
+    """Wikimedia answers 403 to clients whose User-Agent has no contact URL or email."""
+    from schain.sources.base import USER_AGENT, build_client
+
+    assert "https://" in USER_AGENT
+    client = build_client()
+    try:
+        assert client.headers["user-agent"] == USER_AGENT
+    finally:
+        asyncio.run(client.aclose())
+
+
 def test_wikipedia_searches_and_returns_article_text():
     def handler(request):
         if request.url.params.get("list") == "search":

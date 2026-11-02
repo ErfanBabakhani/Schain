@@ -127,7 +127,7 @@ and aggregate into one semantic edge. New validation/gold.py adds exact held-out
 relation scoring; it is separate from external-reference coverage. These changes
 are engineering improvements, not measured replication or accuracy claims.
 
-See START_HERE.md, docs/UPGRADE_REVIEW.md and docs/TEST_RESULTS.md. Completed legacy
+See RELEASE_NOTES_0.3.0.md, UPGRADE_REVIEW.md and TEST_RESULTS.md. Completed legacy
 checkpoints are reused; re-extract into separate paths/database to compare quality.
 
 ## v0.3.0 audited policy

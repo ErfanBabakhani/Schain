@@ -2,37 +2,47 @@
 
 # Server handoff
 
-For moving V1 to the GPU server. **None of this has been executed yet** — the development
-laptop cannot serve the configured 4B model (4 GB VRAM) and has no Neo4j, so the real model, the real
-database and any end-to-end run belong to the server phase.
+For moving V1 to the GPU server. `./scripts/server_run.sh smoke` has passed end to end on
+a SLURM cluster (RTX A6000, NVIDIA driver 535) with the real model and live retrieval;
+see [TEST_RESULTS.md](TEST_RESULTS.md). Neo4j persistence (`--save`) and full-size runs
+have not been exercised on a server yet.
 
 ## First run
 
 ```bash
 git clone git@github.com:ErfanBabakhani/SChain.git    # or: git pull
 cd SChain
-cp .env.example .env          # then set NEO4J_PASSWORD; see below for the rest
-./scripts/server_run.sh --smoke-test
+cp .env.example .env          # see below for the few values a cluster may need
+./scripts/server_run.sh smoke
 ```
 
-The smoke test is a tiny real run — one tier, three documents, the normal pipeline code,
-the real LLM and the real Neo4j. If it passes, do the full run:
+The smoke test is a tiny real run (`config/smoke.yaml`): one seed, one searched tier,
+three documents, the normal pipeline code and the real LLM, with its own data directory
+so it never touches a real experiment. If it passes, do the full run:
 
 ```bash
 ./scripts/server_run.sh
 ```
 
 Everything else is automatic: the script creates `.venv` and installs the project if
-needed, reads the model and endpoint from `config/base.yaml`, starts Neo4j and vLLM if
-they are not already up, waits for both to be healthy, and then launches
-`python -m schain expand`.
+needed, reads the model and endpoint from `config/base.yaml`, starts vLLM if it is not
+already up (and Neo4j too, for a run that saves to it), waits for the services to be
+healthy, and then launches `python -m schain expand`.
 
 ### What you must set in `.env`
 
-Only `NEO4J_PASSWORD`, unless one of these applies:
+Nothing, unless one of these applies:
 
-- the cluster uses SLURM and no GPU is visible in your shell → `SCHAIN_SLURM_PARTITION`
-  (and possibly `SCHAIN_SLURM_ACCOUNT`);
+- the run saves to Neo4j (`--save`) → `NEO4J_PASSWORD`;
+- the cluster uses SLURM → `SCHAIN_SLURM_PARTITION` (and possibly `SCHAIN_SLURM_ACCOUNT`).
+  Set it even when your login shell shows GPUs: on some clusters the login node is a
+  GPU node whose GPUs belong to other jobs;
+- the GPU is shared with other processes → a lower `SCHAIN_VLLM_GPU_MEMORY_UTILIZATION`
+  and `SCHAIN_VLLM_MAX_MODEL_LEN`;
+- the GPU predates Ampere (no bfloat16) → `SCHAIN_VLLM_EXTRA_ARGS=--dtype half`;
+- the NVIDIA driver is older than the newest vLLM's PyTorch needs (the vLLM log says
+  "driver on your system is too old") → pin a release, e.g.
+  `SCHAIN_VLLM_PACKAGE=vllm==0.19.1`, the last one on a CUDA 12 build of PyTorch;
 - the model weights are gated → `HF_TOKEN`;
 - you want the weights cached on a shared filesystem → `HF_HOME`.
 
@@ -56,9 +66,11 @@ over. Re-running after any interruption is always safe.
 
 | Task | Command |
 |---|---|
+| Smoke test first | `./scripts/server_run.sh smoke` |
 | Full EXPAND run | `./scripts/server_run.sh` |
+| Deep-discovery EXPAND | `./scripts/server_run.sh deep` |
 | INGEST documents | `./scripts/server_run.sh ingest path/to/docs` |
-| Smoke test first | `./scripts/server_run.sh --smoke-test` |
+| Save to Neo4j as well | add `--save` to any of the above |
 | Status | `./scripts/server_status.sh` |
 | Environment report only | `./scripts/server_preflight.sh` |
 | Attach to a running run | `tmux attach -t schain` |
@@ -156,7 +168,7 @@ mistaken for a hang. Set `HF_HOME` to cache on shared storage.
    `MERGE` is idempotent against the real database.
 4. `SCHAIN_RUN_LLM_TESTS=1 .venv/bin/python -m pytest tests/test_integration.py -v` —
    proves both prompts behave against the real model.
-5. `./scripts/server_run.sh --smoke-test`.
+5. `./scripts/server_run.sh smoke`.
 6. Inspect the graph in Neo4j Browser:
    ```cypher
    MATCH (s:Company)-[r:suppliesTo]->(c:Company) RETURN s.name, c.name, r.evidence LIMIT 25;

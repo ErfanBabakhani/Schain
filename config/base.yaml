@@ -1,38 +1,59 @@
-# Settings shared by INGEST and EXPAND. Included by config/ingest.yaml and
-# config/expansion.yaml so the LLM, Neo4j and storage settings exist in one place.
+# Settings shared by every mode. ingest.yaml and expansion.yaml include this file, and
+# every other config includes one of those, so each setting below exists exactly once.
+# See config/README.md for how the files fit together.
 #
-# Secrets never belong here. Neo4j credentials and API keys come from .env.
+# Secrets never belong in config files: Neo4j credentials and API keys come from .env.
 
 ontology_file: config/ontology.yaml
 
-# Applies to both INGEST and EXPAND; a failed chunk remains retryable.
-ingest:
-  on_error: RAISE
+# --- model -------------------------------------------------------------------------
+
+llm:
+  provider: local              # local = OpenAI-compatible server (vLLM) | api = hosted API
+  model: Qwen/Qwen3-4B-Instruct-2507
+  backend: vllm
+  base_url: http://localhost:8000/v1   # LLM_API_BASE_URL in .env overrides this
+  enable_thinking: false       # sent to vLLM as chat_template_kwargs.enable_thinking
+  temperature: 0.0
+  # Ask the server for guaranteed-parseable JSON. Set false if the endpoint rejects it.
+  json_mode: true
+  # Full JSON-schema-constrained decoding for Prompt 1. Off by default: it needs a
+  # grammar backend on the server (vLLM has one), and json_mode plus the strict prompt is
+  # enough in practice. Independent of json_mode, which still constrains Prompt 2.
+  structured_output: false
+  request_timeout_seconds: 120
+  max_tokens: 2048
+  client_max_retries: 0
+  rate_limit_max_attempts: 1
+
+concurrency:
+  # Bounded async retrieval. The LLM server does its own batching, so there is no
+  # thread pool around the model here.
+  retrieval: 8
+  llm_max_concurrency: 4
+  http_timeout_seconds: 20
+
+# --- run lifecycle -----------------------------------------------------------------
 
 runtime:
   # Resume is the default: work already completed in a previous run is not redone.
   resume: true
   # Set true (or pass --restart) to clear checkpoint state and recompute from scratch.
   restart_from_scratch: false
-  # Wall-clock budget for a whole run (minutes). Soft stop: finish current unit, persist, export.
-  # Professor / Colab runs may use ~120 minutes when useful evidence remains.
+  # Wall-clock budget for a whole run (minutes). Soft stop: finish the current unit,
+  # persist, export.
   max_minutes: 120
   max_consecutive_failures: 5
   max_document_attempts: 2
 
-# Optional per-document JSONL trace. Content capture can include sensitive source text
-# and model output, so both tracing and full-content capture are disabled by default.
-audit:
-  enabled: false
-  capture_content: false
-  path: data/processed/audit
+ingest:
+  # RAISE keeps a failed chunk retryable on resume; IGNORE accepts partial documents.
+  # Applies to both INGEST and EXPAND.
+  on_error: RAISE
 
-source_reputation:
-  enabled: true
-  path: config/source_reputation.yaml
+# --- fact validation ---------------------------------------------------------------
 
 # Ontology gate + selective evidence entailment (before edge aggregation).
-# Source reputation is informational only and does not gate acceptance or frontier.
 validation:
   ontology:
     enabled: true
@@ -58,76 +79,17 @@ validation:
     # Relation-specific lexical + directional policy (assists LLM; not a lone filter).
     policy_file: config/relation_evidence.yaml
 
-# Multi-source / second-source verification is disabled.
-# Kept as an explicit off-switch so old configs do not re-enable dead behavior.
+# Informational source metadata only: it never gates fact acceptance or the frontier.
+source_reputation:
+  enabled: true
+  path: config/source_reputation.yaml
+
+# Multi-source / second-source verification is retired. The explicit off-switch stops
+# old configs from re-enabling it.
 verification:
   enabled: false
 
-llm:
-  provider: local              # local = OpenAI-compatible server (vLLM) | api = hosted API
-  model: Qwen/Qwen3-4B-Instruct-2507
-  backend: vllm
-  base_url: http://localhost:8000/v1
-  enable_thinking: false       # sent to vLLM as chat_template_kwargs.enable_thinking
-  temperature: 0.0
-  # Ask the server for guaranteed-parseable JSON. Set false if the endpoint rejects it.
-  json_mode: true
-  # Full JSON-schema-constrained decoding for Prompt 1. Off by default: it needs a
-  # grammar backend on the server (vLLM has one), and json_mode plus the strict prompt is
-  # enough in practice. Independent of json_mode, which still constrains Prompt 2.
-  structured_output: false
-  request_timeout_seconds: 120
-  max_tokens: 2048
-  client_max_retries: 0
-  rate_limit_max_attempts: 1
-
-neo4j:
-  database: neo4j
-  batch_size: 1000
-
-# Explicit graph-database persistence. Local Parquet/SQLite checkpoints and graph
-# JSON export remain active regardless of this switch.
-save:
-  enabled: false
-  backend: neo4j
-  mode: incremental
-  max_attempts: 3
-  retry_backoff_seconds: 1.0
-
-# SQLite remains the default local/offline state backend. Distributed Expand uses
-# PostgreSQL as its authoritative state and requires an explicit experiment id.
-state:
-  backend: sqlite
-  experiment_id: null
-  database_url_env: NEON_DATABASE_URL
-
-distributed:
-  enabled: false
-  worker_concurrency: 1
-  task_lease_seconds: 600
-  heartbeat_seconds: 30
-  max_task_attempts: 3
-  poll_seconds: 3.0
-  connection_pool_min: 1
-  connection_pool_max: 4
-  event_retention_days: 30
-
-# Optional durable experiment snapshots. Colab overlays should point directory at
-# Google Drive while keeping storage.* on the fast local /content filesystem.
-checkpoint_store:
-  enabled: false
-  experiment_id: null
-  directory: null
-  snapshot_every_documents: 1
-  keep_snapshots: 3
-  lock_stale_seconds: 21600
-
-concurrency:
-  # Bounded async retrieval. The LLM server does its own batching, so there is no
-  # thread pool around the model here.
-  retrieval: 8
-  llm_max_concurrency: 4
-  http_timeout_seconds: 20
+# --- outputs -----------------------------------------------------------------------
 
 storage:
   raw_documents: data/raw/documents.jsonl
@@ -145,3 +107,53 @@ storage:
   state_db: data/state/state.db
   # Derived frontend-ready semantic graph (not a source of truth; regenerated on demand).
   graph_export: outputs/supply_chain_graph.v1.json
+
+# Neo4j persistence is opt-in (--save). Local Parquet/SQLite checkpoints and the graph
+# JSON export are written either way.
+save:
+  enabled: false
+  backend: neo4j
+  mode: incremental
+  max_attempts: 3
+  retry_backoff_seconds: 1.0
+
+neo4j:
+  database: neo4j
+  batch_size: 1000
+
+# Optional per-document JSONL trace. Content capture can include sensitive source text
+# and model output, so both tracing and full-content capture are off by default.
+audit:
+  enabled: false
+  capture_content: false
+  path: data/processed/audit
+
+# --- optional backends -------------------------------------------------------------
+
+# SQLite is the default local state backend. Distributed EXPAND uses PostgreSQL as its
+# authoritative state and requires an explicit experiment id.
+state:
+  backend: sqlite
+  experiment_id: null
+  database_url_env: NEON_DATABASE_URL
+
+distributed:
+  enabled: false
+  worker_concurrency: 1
+  task_lease_seconds: 600
+  heartbeat_seconds: 30
+  max_task_attempts: 3
+  poll_seconds: 3.0
+  connection_pool_min: 1
+  connection_pool_max: 4
+  event_retention_days: 30
+
+# Durable experiment snapshots. Colab overlays point `directory` at Google Drive while
+# keeping storage.* on the fast local /content filesystem.
+checkpoint_store:
+  enabled: false
+  experiment_id: null
+  directory: null
+  snapshot_every_documents: 1
+  keep_snapshots: 3
+  lock_stale_seconds: 21600

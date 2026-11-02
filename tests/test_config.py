@@ -104,3 +104,31 @@ def test_storage_path_creates_parent(ingest_config):
 def test_missing_storage_key_is_reported(ingest_config):
     with pytest.raises(KeyError, match="storage.nope"):
         storage_path(ingest_config, "nope")
+
+
+SHIPPED_CONFIGS = (
+    "ingest", "expansion", "smoke", "deep_discovery", "colab_professor_expand",
+    "distributed_neon_expand", "distributed_neon_deep_discovery",
+)
+
+
+@pytest.mark.parametrize("name", SHIPPED_CONFIGS)
+def test_every_shipped_config_loads(name):
+    config = load_config(REPO_ROOT / f"config/{name}.yaml")
+    assert config["llm"]["model"] and config["storage"]["state_db"]
+
+
+def test_smoke_config_is_small_and_isolated_from_real_runs():
+    base = load_config(REPO_ROOT / "config/base.yaml")
+    smoke = load_config(REPO_ROOT / "config/smoke.yaml")
+    assert seed_entities(smoke) == ["BMW"]
+    assert smoke["expansion"]["max_tier"] == 1
+    assert smoke["expansion"]["max_documents"] == 3
+    assert [spec["query"] for spec in resolve_tier_queries(smoke, 0)] == [
+        '"supplier to" "{entity}"', '"{entity}" suppliers',
+    ]
+    # every storage location is overridden, so a smoke run never shares a checkpoint
+    assert set(smoke["storage"]) == set(base["storage"])
+    for key, path in smoke["storage"].items():
+        assert path != base["storage"][key], key
+        assert path.startswith(("data/smoke/", "outputs/smoke")), key

@@ -4,7 +4,7 @@ This is the front of the INGEST path. It is deliberately dull: read the file,
 normalize the text, compute the identifiers that later deduplication depends on,
 and append to the raw/normalized data layers.
 
-Identifiers (PROJECT_DECISIONS.md section 9):
+Identifiers (docs/PROJECT_DECISIONS.md section 9):
 
 * ``content_hash`` - sha256 of the normalized text; catches the same text arriving twice.
 * ``source_url``   - normalized URL; catches the same location arriving twice.

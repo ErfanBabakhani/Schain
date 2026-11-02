@@ -1,3 +1,42 @@
+# Verification — 2 November 2026
+
+## Offline test suite
+
+`python -m pytest -q`
+
+**723 passed, 18 skipped, 0 failed.** The skipped tests are the integration tests that
+need a live model, network or Neo4j. Before this round the suite had 102 failures: a merge
+had dropped three imports and two helpers from `schain/graph_export.py`, the server scripts
+had lost their executable bit, and one script test still assumed Neo4j was mandatory.
+
+## Smoke run on a GPU server
+
+`./scripts/server_run.sh smoke` (`config/smoke.yaml`), as SLURM job 4187 on the itec
+cluster: one NVIDIA RTX A6000 with about 13 GB free (shared with other users), driver
+535.183.01 (CUDA 12.2), Python 3.10, vLLM 0.19.1 with torch 2.10.0,
+`Qwen/Qwen3-4B-Instruct-2507` with `--max-model-len 8192 --gpu-memory-utilization 0.25
+--enforce-eager`, Neo4j saving off.
+
+**Passed, exit status 0.** Seed BMW; 18 retrieval candidates (Google News and general
+web), 13 selected, 3 documents processed within the smoke budget, 8 accepted facts and 29
+rejected by validation; graph export with 9 nodes and 7 edges, 0 tier-invariant
+violations; four Tier-1 suppliers of BMW discovered (Albemarle, ArcelorMittal, Lhyfe,
+Qualcomm Technologies). Pipeline time 7 minutes on top of a one-time vLLM install and
+model download.
+
+Found and fixed by this run:
+
+- The newest vLLM (0.31.0, torch 2.13) needs a newer NVIDIA driver than 535; vLLM 0.19.1
+  is the last release on a CUDA 12 build of PyTorch. `SCHAIN_VLLM_PACKAGE` pins it.
+- Wikipedia answered `403 Forbidden` to every query: Wikimedia requires contact
+  information in the User-Agent. It now includes the repository URL.
+- The runner started Neo4j even when nothing saves to it, bypassed SLURM when the login
+  node itself shows GPUs, and counted every GPU on the node instead of the allocation.
+- GDELT answered `429 Too Many Requests` during the run. That is the provider's rate
+  limit; the failed queries are recorded and retried by the next run.
+
+---
+
 # v0.3.0 offline verification — 8 September 2026
 
 `python -m pytest -q -m 'not integration'`
@@ -66,4 +105,4 @@ relation scoring, offline HTML safety and service checks. Two old test fixtures 
 quotes unrelated to the source; their evidence was corrected instead of disabling grounding.
 
 Tests do not assert an accuracy/speed percentage. A held-out annotation study and a live
-smoke run on your environment remain necessary; see UPGRADE_REVIEW.md and START_HERE.md.
+smoke run on your environment remain necessary; see UPGRADE_REVIEW.md and RELEASE_NOTES_0.3.0.md.

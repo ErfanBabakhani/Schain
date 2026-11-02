@@ -1,0 +1,52 @@
+# SMOKE: a few-minute end-to-end check that the model endpoint, retrieval, extraction,
+# entity resolution, validation and graph export all work together. Not an experiment.
+#
+#   python -m schain expand --config config/smoke.yaml
+#   ./scripts/server_run.sh smoke          # also starts vLLM on a GPU first
+#
+# One seed, one searched tier, three documents, and its own data directory, so it never
+# mixes with (or blocks resuming) a real experiment. Delete data/smoke/ to start over.
+
+include:
+  - config/expansion.yaml
+
+# Replaces the expansion.yaml group of the same name (lists replace, dicts merge).
+seeds:
+  ev_manufacturers: [BMW]
+
+runtime:
+  max_minutes: 20
+
+expansion:
+  # Tier 0 is searched; the suppliers it finds are stored as Tier 1 but not searched.
+  max_tier: 1
+  max_documents: 3
+  retrieval:
+    # No escalation ladder or LLM query planning: the primary queries only.
+    zero_yield_rescue: false
+    query_planner_enabled: false
+    max_full_text_fetches_per_entity: 8
+    max_title_lookups_per_entity: 2
+  search:
+    defaults:
+      max_results: 5
+      max_results_by_provider: {google_news: 5, gdelt: 5, general_web: 5, wikipedia: 2}
+    tiers:
+      0:
+        queries:
+          - query: '"supplier to" "{entity}"'
+          - query: '"{entity}" suppliers'
+
+storage:
+  raw_documents: data/smoke/raw/documents.jsonl
+  normalized_documents: data/smoke/processed/documents.parquet
+  extracted_facts: data/smoke/processed/facts.parquet
+  extractions: data/smoke/processed/extractions
+  search_results: data/smoke/processed/search_results.parquet
+  entity_resolution: data/smoke/processed/entity_resolution.parquet
+  rejected_facts: data/smoke/processed/rejected_facts.parquet
+  edge_support: data/smoke/processed/edge_support.parquet
+  verification_evidence: data/smoke/processed/verification_evidence.parquet
+  extraction_integrity: data/smoke/processed/extraction_integrity.json
+  state_db: data/smoke/state/state.db
+  graph_export: outputs/smoke_graph.json

@@ -180,5 +180,5 @@ lost quotes need fresh extraction. A crash after a model response but before its
 still repeat that call. JSON checkpoints are atomic, while existing Parquet storage remains
 single-writer and is not transactional across all layers.
 
-Follow `START_HERE.md` for installation and commands. This release makes the implementation
+Follow the [README](../README.md) for installation and commands. This release makes the implementation
 more auditable and resilient; measured accuracy and performance gains remain to be established.

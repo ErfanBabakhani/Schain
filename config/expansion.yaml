@@ -1,15 +1,17 @@
-# EXPAND: discover upstream suppliers from seed companies.
+# EXPAND mode: discover upstream suppliers, tier by tier, starting from seed companies.
 #
-#   .venv/bin/python -m schain expand --config config/expansion.yaml
+#   python -m schain expand
+#
+# deep_discovery.yaml, smoke.yaml and the distributed/Colab configs build on this file.
 
 include:
   - config/base.yaml
 
 mode: expand
 
-# Tier 0. For testing automatic expansion these are OEM seeds only, so that suppliers
-# are actually discovered rather than supplied up front. The full AlMahri selected-company
-# set (add the two groups below to seeds) is the strict replication configuration.
+# Tier 0. These are OEM seeds only, so that suppliers are actually discovered rather
+# than supplied up front. For strict replication of the AlMahri selected-company set,
+# uncomment the two groups below as well.
 seeds:
   ev_manufacturers:
     - Toyota
@@ -29,69 +31,65 @@ seeds:
   #   - Jinchuan Group
 
 expansion:
-  # Tier is graph distance along supplier --suppliesTo--> customer, never industrial
-  # role: a mining company selling directly to an OEM is Tier 1, not a "deep" tier.
-  # Tier 5 is stored but never searched. Only suppliesTo advances tiers.
+  # Tier = graph distance along supplier --suppliesTo--> customer, never industrial
+  # role: a mining company selling directly to an OEM is Tier 1. Only suppliesTo
+  # advances tiers. Tiers below max_tier are searched; max_tier itself is stored only.
   max_tier: 5
-  # Per-run discovery-document ceiling (pauses the run; does NOT prune PENDING
-  # frontier entities). Lifetime progress is tracked in SQLite usage tables.
-  # max_documents_per_run is authoritative; max_documents kept as alias.
-  # Tier-0 has higher leverage (each Tier-1 opens a new branch).
-  max_documents: 320
-  max_documents_per_run: 320
 
-  # Per-frontier-entity processing. TARGET is a checkpoint, not a hard stop.
-  # MAX is the useful spend ceiling including zero-yield escalation.
-  # max_documents_per_entity must be >= max(tier maxima) or it silently caps tiers.
+  # Documents selected per run (the --max-documents flag). Reaching it pauses the run;
+  # it never prunes the frontier, and the next run resumes where this one stopped.
+  max_documents: 320
+
+  # Soft per-run scheduling batch per tier: ORDER fairness only. Every accepted
+  # supplier is enqueued and eventually processed; nobody is excluded by a cutoff.
+  scheduling_batch_size_by_tier: {1: 10, 2: 8, 3: 6, 4: 4}
+
+  # Per frontier entity. A target is a checkpoint, not a stop; a maximum is the useful
+  # spend ceiling including zero-yield escalation.
   retrieval:
-    target_documents_per_entity: 24
-    max_documents_per_entity: 36
     target_documents_by_tier: {0: 24, 1: 14, 2: 10, 3: 8, 4: 6, 5: 0}
     max_documents_by_tier: {0: 36, 1: 24, 2: 18, 3: 14, 4: 10, 5: 0}
+    # Fallback target for a tier missing above, and a cap over every tier. Keep the cap
+    # >= the largest tier maximum, or it silently lowers those maxima.
+    target_documents_per_entity: 24
+    max_documents_per_entity: 36
     zero_gain_patience: 3
     min_documents_before_diminishing_returns: 3
     # Resolve/fetch a bounded ranked pool; selected snippets remain valid evidence.
     max_full_text_fetches_per_entity: 48
-    # Title+publisher recovery attempts per entity after Google News wrapper failure.
+    # Title+publisher recovery attempts per entity after a Google News wrapper failure.
     max_title_lookups_per_entity: 12
-    # When primary pass yields zero expansion edges, escalate search stages up to max.
+    max_candidates_per_entity: 96
+    # When the primary pass yields no expansion edge, escalate through search stages.
     zero_yield_rescue: true
-    # Strong-LLM-first: semantic adjudication for genuinely ambiguous candidates.
+    # LLM-assisted steps: semantic adjudication of genuinely ambiguous candidates, a
+    # second evidence pass, and planned upstream queries during escalation.
     semantic_direction_adjudication: true
     evidence_second_pass: true
     query_planner_enabled: true
     query_planner_max_categories: 8
     query_planner_max_queries: 12
-    max_candidates_per_entity: 96
-
-  # Soft per-run SCHEDULING batch sizes (ORDER fairness across tiers only).
-  # Every accepted valid supplier is enqueued and eventually processed.
-  # These numbers do NOT permanently exclude suppliers ranked below a cutoff.
-  # Alias retained: max_expandable_entities_by_tier == scheduling_batch_size_by_tier.
-  max_expandable_entities_by_tier: {1: 10, 2: 8, 3: 6, 4: 4}
-  scheduling_batch_size_by_tier: {1: 10, 2: 8, 3: 6, 4: 4}
 
   sources:
-    # News: explicit new supply agreements.
+    # News: new supply agreements.
     google_news:
       enabled: true
       language: en-US
-      # Resolve publisher links before full-text fetch; retain explicit snippet fallback.
+      # Resolve publisher links before full-text fetch; snippets remain the fallback.
       fetch_full_text: true
     gdelt:
       enabled: true
       fetch_full_text: true
-    # General web: company supplier/sourcing pages, press releases, investor relations,
-    # annual and sustainability reports, filings. Older and more stable than news.
+    # General web: supplier/sourcing pages, press releases, investor relations, annual
+    # and sustainability reports, filings. Older and more stable than news.
     general_web:
       enabled: true
-      # duckduckgo needs no credentials. Set backend: brave and BRAVE_SEARCH_API_KEY in
-      # .env for the official API, which is more reliable for a long run.
+      # duckduckgo needs no credentials. `backend: brave` plus BRAVE_SEARCH_API_KEY in
+      # .env uses the official API, which is more reliable over a long run.
       backend: duckduckgo
       fetch_full_text: true
-    # Reference material. Wikipedia is an ordinary search provider here: queries go to
-    # its search endpoint and matching articles come back. It has no special graph role,
-    # and the pipeline never assumes "fetch this entity's own page".
+    # An ordinary search provider: queries go to Wikipedia search and matching articles
+    # come back. The pipeline never assumes "fetch this entity's own page".
     wikipedia:
       enabled: true
       language: en
@@ -118,9 +116,8 @@ expansion:
       - raw material
       - offtake
 
-  # Optional EV vocabulary, used only to widen the relevance filter above. It is NOT
-  # multiplied with entity names to generate queries: the fixed tier templates remain
-  # the only query mechanism.
+  # Widens the relevance filter only. It is never combined with entity names to make
+  # queries: the tier templates below are the only query mechanism.
   vocabulary:
     components:
       [battery, battery cell, battery pack, cathode, anode, electrolyte, separator,
@@ -132,16 +129,11 @@ expansion:
        hydroxide, carbonate, concentrate, MHP, matte, refinery, refining, smelter, mine,
        mining, extraction, ore, brine, spodumene, laterite]
 
-  # Query limits use "closest value wins", resolved per field:
-  #     global defaults  <  tier defaults  <  per-query override
-  #
-  # max_results is a limit PER PROVIDER, PER QUERY, and is a ceiling on candidates
-  # retrieved - not a target number of relevant documents.
-  # max_results_by_provider overrides max_results for the providers it names.
+  # Query limits resolve field by field, closest value wins:
+  #     search.defaults  <  tier defaults  <  per-query override
+  # max_results is a candidate ceiling PER PROVIDER, PER QUERY - not a document target.
   search:
     defaults:
-      # Candidate ceilings per provider per query — not LLM quotas.
-      # Prefer GDELT/web breadth over Google News dominance.
       max_results: 14
       providers: [google_news, gdelt, general_web, wikipedia]
       max_results_by_provider:
@@ -150,9 +142,8 @@ expansion:
         general_web: 18
         wikipedia: 4
 
-    # Stage A (directional) + Stage B (broad). Stages C–E are generated at runtime
-    # by the escalation ladder / query planner when zero-yield rescue activates.
-    # Strict validation still decides which facts become expansion edges.
+    # Stage A (directional) and Stage B (broad) templates, shared by Tiers 0-4.
+    # Stages C-E are generated at runtime by the escalation ladder when rescue runs.
     tiers:
       0: &tier_queries
         queries:

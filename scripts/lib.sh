@@ -60,11 +60,12 @@ config_values() (
 import shlex
 import sys
 
-from schain.config import load_config, neo4j_settings, resolve_path
+from schain.config import load_config, neo4j_settings, resolve_path, save_settings
 
 config = load_config(sys.argv[1])
 llm = config.get("llm", {})
 neo4j = neo4j_settings(config)
+save = save_settings(config)
 
 
 def emit(key, value):
@@ -76,6 +77,7 @@ emit("CFG_LLM_MODEL", llm.get("model", ""))
 emit("CFG_LLM_BASE_URL", llm.get("base_url", ""))
 emit("CFG_NEO4J_URI", neo4j["uri"])
 emit("CFG_NEO4J_DATABASE", neo4j["database"])
+emit("CFG_SAVE_ENABLED", int(save["enabled"]))
 emit("CFG_STATE_DB", resolve_path(config["storage"]["state_db"]))
 PY
 )
@@ -136,6 +138,15 @@ llm_healthy() {
 # --- GPU and scheduler -------------------------------------------------------------
 
 gpu_count() {
+    # A scheduler that does not isolate devices still lists every GPU in nvidia-smi;
+    # CUDA_VISIBLE_DEVICES is what this job was actually given.
+    if [ -n "${CUDA_VISIBLE_DEVICES+set}" ]; then
+        case "$CUDA_VISIBLE_DEVICES" in
+            ""|NoDevFiles|-1) echo 0 ;;
+            *) printf '%s\n' "$CUDA_VISIBLE_DEVICES" | tr ',' '\n' | grep -c . ;;
+        esac
+        return
+    fi
     have nvidia-smi || { echo 0; return; }
     nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '
 }

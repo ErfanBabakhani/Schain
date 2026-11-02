@@ -16,13 +16,13 @@ Run `./scripts/server_preflight.sh` to see all of it. Secrets are shown as `set`
 
 ## You must provide once — only in these cases
 
-### Always (unless you run everything with `--no-neo4j`)
+### Only for runs that save to Neo4j (`--save`)
 
 | Variable | Why |
 |---|---|
 | `NEO4J_PASSWORD` | Your choice. Also used as the container password if the script starts Neo4j. |
 
-### Only if the server uses SLURM *and* no GPU is visible *and* no LLM endpoint is running
+### Only if the server uses SLURM and no LLM endpoint is already running
 
 The script cannot invent these: partition names, accounts and GRES syntax differ per
 cluster, and guessing them produces jobs that are rejected or silently mis-scheduled. It
@@ -44,5 +44,4 @@ Put them in `.env`. Nothing is hard-coded in the scripts.
 | `HF_TOKEN` | the weights are gated on Hugging Face |
 | `HF_HOME` | you want the cache on a large shared filesystem rather than `~/.cache` |
 
-If none of the SLURM or Hugging Face cases apply, `NEO4J_PASSWORD` is the only value you
-need to set.
+If none of these cases apply, nothing needs to be set.

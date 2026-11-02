@@ -2,9 +2,9 @@
 
 Why this is not ``neo4j_graphrag.components.kg_writer.Neo4jWriter``: that writer issues
 ``CREATE (n:__KGBuilder__ {...})`` and relies on a follow-up resolver pass
-(``apoc.refactor.mergeNodes``) to collapse duplicates afterwards. PROJECT_DECISIONS.md
-section 9 requires the opposite order - canonical ids plus MERGE, so a repeated or
-resumed run cannot create a duplicate in the first place.
+(``apoc.refactor.mergeNodes``) to collapse duplicates afterwards.
+docs/PROJECT_DECISIONS.md section 9 requires the opposite order - canonical ids plus
+MERGE, so a repeated or resumed run cannot create a duplicate in the first place.
 
 Every node gets its ontology label plus a shared ``:Entity`` label. The shared label
 carries the uniqueness constraint on ``canonical_id`` and lets relationship writes match

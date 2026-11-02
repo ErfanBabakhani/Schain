@@ -1,35 +1,40 @@
+# Deep discovery: the high-recall EXPAND profile (larger budgets, broader queries).
+#
+#   python -m schain expand --config config/deep_discovery.yaml
+#
+# Also the base of distributed_neon_deep_discovery.yaml. Its budgets are a versioned
+# policy that the distributed maintenance CLI persists with an experiment, and workers
+# refuse to resume if they no longer match (schain/distributed/profile.py).
+
 include:
   - config/expansion.yaml
 
-# Versioned policy persisted with a distributed experiment by the maintenance CLI.
 discovery_profile:
   name: deep_discovery
   version: deep_discovery_v1
 
 expansion:
+  # Pinned here as part of the approved profile, independently of expansion.yaml.
   max_tier: 5
   # A distributed task expands one company. The experiment-wide ceiling is enforced
   # separately in PostgreSQL, so this must not silently cap the approved tier maxima.
   max_documents: 200
-  max_documents_per_run: 200
   max_documents_per_experiment: 20000
 
   retrieval:
-    target_documents_per_entity: 80
-    max_documents_per_entity: 200
     target_documents_by_tier: {0: 80, 1: 80, 2: 60, 3: 50, 4: 40, 5: 0}
     max_documents_by_tier: {0: 200, 1: 160, 2: 120, 3: 100, 4: 80, 5: 0}
+    target_documents_per_entity: 80
+    max_documents_per_entity: 200
     max_full_text_fetches_per_entity: 250
     max_title_lookups_per_entity: 100
     max_candidates_per_entity: 600
     max_full_text_fetches_per_domain: 30
     max_candidates_per_domain: 20
-    query_planner_enabled: true
     query_planner_max_categories: 12
     query_planner_max_queries: 30
     max_initial_query_variants: 30
     alias_query_max: 2
-    zero_yield_rescue: true
     # Adaptive stopping uses independent source/query-family coverage. A raw streak
     # alone is never enough to declare an entity exhausted.
     zero_gain_patience: 12

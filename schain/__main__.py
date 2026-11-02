@@ -256,7 +256,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.max_tier is not None:
             config.setdefault("expansion", {})["max_tier"] = args.max_tier
         if args.max_documents is not None:
+            # max_documents_per_run wins over max_documents when set, so set both.
             config.setdefault("expansion", {})["max_documents"] = args.max_documents
+            config["expansion"]["max_documents_per_run"] = args.max_documents
         if getattr(args, "seeds", None) or getattr(args, "seed", None):
             names = args.seed or next(csv.reader([args.seeds], skipinitialspace=True))
             names = [name.strip() for name in names if name.strip()]

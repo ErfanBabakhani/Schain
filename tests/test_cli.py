@@ -72,6 +72,28 @@ def test_expansion_limits_are_exposed():
     assert args.max_tier == 2 and args.max_documents == 5
 
 
+def test_max_documents_flag_overrides_the_configured_per_run_limit(
+    tmp_path, expand_config, llms, monkeypatch,
+):
+    """A config's max_documents_per_run wins over max_documents, but not over the flag."""
+    from schain.expansion.budget import documents_per_run_limit
+
+    expand_config["seeds"] = {"ev_manufacturers": ["BMW"]}
+    expand_config["expansion"]["max_documents_per_run"] = 320
+    config_path = tmp_path / "expand.yaml"
+    config_path.write_text(yaml.safe_dump(expand_config), encoding="utf-8")
+    seen = {}
+
+    def fake_expand(config, *args, **kwargs):
+        seen["limit"] = documents_per_run_limit(config["expansion"])
+        return {}
+
+    monkeypatch.setattr("schain.__main__.run_expand", fake_expand)
+    assert run_cli("expand", "--config", str(config_path), "--no-save",
+                   "--max-documents", "3") == 0
+    assert seen["limit"] == 3
+
+
 # --- ingest ------------------------------------------------------------------------
 
 

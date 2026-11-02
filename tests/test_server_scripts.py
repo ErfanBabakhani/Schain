@@ -97,6 +97,20 @@ def test_default_mode_is_expand():
 def test_mode_maps_to_the_right_config_file():
     assert "--config config/expansion.yaml" in plan("expand")
     assert "--config config/ingest.yaml" in plan("ingest", "data/corpus")
+    assert "-m schain expand --config config/deep_discovery.yaml" in plan("deep")
+    assert "-m schain expand --config config/smoke.yaml" in plan("smoke")
+    # an EXPAND smoke test never shares the real experiment's checkpoint
+    assert "--config config/smoke.yaml" in plan("--smoke-test")
+
+
+def test_neo4j_is_left_alone_unless_the_run_saves():
+    output = plan("expand")
+    assert "Neo4j: not needed" in output
+    assert "would start Neo4j" not in output
+    assert "would install and start local Neo4j" not in output
+    saving = plan("expand", "--save")
+    assert "Neo4j: not needed" not in saving
+    assert "-m schain expand --config config/expansion.yaml --save" in saving
 
 
 def test_ingest_passes_its_input():
@@ -335,7 +349,7 @@ def test_already_running_services_are_reused_and_never_stopped(tmp_path):
     neo4j = start_closing_listener(neo4j_port)
     try:
         config = write_temp_config(tmp_path, llm_port)
-        result = run([str(RUN), "--dry-run", "--config", str(config)],
+        result = run([str(RUN), "--dry-run", "--save", "--config", str(config)],
                      env={"NEO4J_URI": f"bolt://127.0.0.1:{neo4j_port}",
                           "SCHAIN_NEO4J_SKIP_BOLT_CHECK": "1"})
         assert result.returncode == 0, result.stderr
@@ -396,7 +410,7 @@ def test_occupied_unverified_neo4j_port_never_starts_another_instance(tmp_path):
     try:
         config = write_temp_config(tmp_path, port)
         result = run(
-            [str(RUN), "--dry-run", "--config", str(config)],
+            [str(RUN), "--dry-run", "--save", "--config", str(config)],
             env={"NEO4J_URI": f"bolt://127.0.0.1:{port}",
                  "SCHAIN_NEO4J_SKIP_BOLT_CHECK": ""},
         )
@@ -450,9 +464,7 @@ def test_a_service_started_by_the_run_is_stopped_when_the_workload_finishes(tmp_
         # the run started vLLM itself...
         assert "starting vLLM" in output
         assert pid_file.exists(), "the fake vLLM never started"
-        # ...the pipeline then failed against the dummy Neo4j, which is fine here...
-        assert result.returncode != 0
-        # ...and cleanup stopped the vLLM it owned
+        # ...whatever the pipeline itself returned, cleanup stopped the vLLM it owned
         assert "stopping vLLM" in output
         vllm_pid = int(pid_file.read_text())
         for _ in range(40):
@@ -599,6 +611,35 @@ def test_inside_an_allocation_no_further_allocation_is_requested(tmp_path):
     assert "-m schain expand" in output
 
 
+def test_a_configured_partition_is_used_even_where_gpus_are_visible(tmp_path):
+    """On clusters whose login node is a GPU node, those GPUs belong to other jobs."""
+    env = cluster_env(tmp_path)
+    (tmp_path / "bin" / "nvidia-smi").write_text(
+        "#!/bin/sh\necho 'NVIDIA RTX A6000'\necho 'NVIDIA RTX A6000'\n", encoding="utf-8")
+    output = run([str(RUN), "--dry-run"], env=env).stdout
+    assert "would run: sbatch" in output and "--partition=ampere" in output
+
+
+def test_gpu_count_is_the_allocation_not_every_gpu_on_the_node(tmp_path):
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    smi = fake_bin / "nvidia-smi"
+    smi.write_text("#!/bin/sh\necho gpu0\necho gpu1\n", encoding="utf-8")
+    smi.chmod(0o755)
+    path = f"{fake_bin}:{os.environ['PATH']}"
+
+    def count(visible=None):
+        setup = "unset CUDA_VISIBLE_DEVICES" if visible is None else (
+            f"export CUDA_VISIBLE_DEVICES={shlex.quote(visible)}")
+        return run(["bash", "-c", f"{setup}; source {LIB}; gpu_count"],
+                   env={"PATH": path}).stdout.strip()
+
+    assert count() == "2"
+    assert count("0") == "1"
+    assert count("0,1") == "2"
+    assert count("") == "0"
+
+
 # --- Neo4j without Docker -------------------------------------------------------------
 
 
@@ -636,7 +677,7 @@ def test_without_docker_the_plan_is_a_local_neo4j(tmp_path):
         (bin_dir / tool).symlink_to(found)
     assert shutil.which("docker", path=str(bin_dir)) is None
 
-    result = run([str(RUN), "--dry-run"],
+    result = run([str(RUN), "--dry-run", "--save"],
                  env={"PATH": str(bin_dir),
                       "SCHAIN_RUNTIME_DIR": str(tmp_path / "runtime")})
     output = result.stdout + result.stderr
@@ -696,8 +737,10 @@ def test_vllm_is_installed_once_into_the_existing_venv():
     script = (REPO_ROOT / "scripts" / "server_run.sh").read_text(encoding="utf-8")
     # reuse first
     assert '[ -x "$REPO_ROOT/.venv/bin/vllm" ]' in script
-    # install into the same environment the runner checks, not a new one
-    assert '"$VENV_PY" -m pip install --quiet vllm' in script
+    # install into the same environment the runner checks, not a new one; the package
+    # defaults to the newest vllm and can be pinned for an older NVIDIA driver
+    assert '"$VENV_PY" -m pip install --quiet "$VLLM_PACKAGE"' in script
+    assert 'VLLM_PACKAGE="${SCHAIN_VLLM_PACKAGE:-vllm}"' in script
     # only when a GPU is actually present, and only when the endpoint is down
     assert '[ "$VLLM_AUTO_INSTALL" = "1" ] && [ "$(gpu_count)" -ge 1 ]' in script
 

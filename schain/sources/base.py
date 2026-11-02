@@ -16,7 +16,12 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-USER_AGENT = "schain-kg/0.1 (supply-chain knowledge graph research pipeline)"
+# Wikimedia's User-Agent policy requires contact information, and its API answers
+# 403 Forbidden to this client without it.
+USER_AGENT = (
+    "schain-kg/0.1 (https://github.com/ErfanBabakhani/Schain; "
+    "supply-chain knowledge graph research pipeline)"
+)
 
 # Values of SearchResult.content_source, recorded as document provenance.
 FULL_TEXT = "full_text"

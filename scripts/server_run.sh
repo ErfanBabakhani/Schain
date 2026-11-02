@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # One-command server runner for SChain.
 #
+#   ./scripts/server_run.sh smoke           # few-minute end-to-end check (config/smoke.yaml)
 #   ./scripts/server_run.sh                 # EXPAND (the main server experiment)
+#   ./scripts/server_run.sh deep            # EXPAND with the deep-discovery profile
 #   ./scripts/server_run.sh ingest <path>   # INGEST a file or directory
-#   ./scripts/server_run.sh --smoke-test    # tiny run against the real services
 #
 # It prepares services and launches the existing Python CLI. It contains no pipeline
 # logic: extraction, expansion, checkpointing, resume, deduplication and Neo4j writes
@@ -24,13 +25,22 @@ Usage: ./scripts/server_run.sh [mode] [options]
 
 Modes:
   expand                 discover suppliers from the configured seeds  (default)
+                         config/expansion.yaml
+  deep                   EXPAND with the high-recall profile
+                         config/deep_discovery.yaml
+  smoke                  few-minute end-to-end check, same as expand --smoke-test
+                         config/smoke.yaml (own data directory)
   ingest <path>          process documents already in hand
+                         config/ingest.yaml
 
 Options:
-  --smoke-test           tiny run against the real LLM and Neo4j, then stop.
-                         EXPAND: --max-tier 1 --max-documents 3.
+  --smoke-test           tiny run against the real services, then stop.
+                         EXPAND: config/smoke.yaml, --max-tier 1 --max-documents 3.
                          INGEST: one small document.
                          Runs in the foreground so you see the result immediately.
+  --save | --no-save     persist accepted facts to Neo4j, or not (default: the config's
+                         save.enabled, off unless the config turns it on). Neo4j is
+                         started or checked only when saving.
   --restart              clear checkpoint state and generated data first (destructive
                          to intermediate data; Neo4j content is left alone)
   --config <file>        override the config file for the chosen mode
@@ -39,8 +49,8 @@ Options:
   --dry-run              print the plan and the exact commands, change nothing
   -h, --help             show this help
 
-Defaults come from config/base.yaml, config/expansion.yaml and .env. Server-specific
-settings are SCHAIN_* variables in .env; see .env.example.
+Settings come from the mode's config file (see config/README.md) and .env.
+Server-specific settings are SCHAIN_* variables in .env; see .env.example.
 
 A full run detaches into a tmux session so it survives an SSH disconnect. The log path
 is printed when it starts; ./scripts/server_status.sh shows how it is doing.
@@ -49,44 +59,62 @@ USAGE
 
 # --- arguments ---------------------------------------------------------------------
 
-MODE="expand"
+MODE="expand"     # the CLI mode: python -m schain expand|ingest
+DEEP=0
 # Parsing shifts positional arguments; preserve exact argv for tmux / SLURM children.
 ORIGINAL_ARGS=("$@")
 INPUT=""
 CONFIG_FILE=""
 SMOKE=0
+SAVE=""           # "", 1 (--save) or 0 (--no-save); empty defers to the config
 RESTART=0
 FOREGROUND=0
 DRY_RUN=0
 
+select_mode() {
+    case "$1" in
+        expand|ingest) MODE="$1" ;;
+        deep)          MODE="expand"; DEEP=1 ;;
+        smoke)         MODE="expand"; SMOKE=1; FOREGROUND=1 ;;
+    esac
+}
+
 case "${1:-}" in
-    expand|ingest) MODE="$1"; shift ;;
+    expand|ingest|deep|smoke) select_mode "$1"; shift ;;
 esac
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --smoke-test) SMOKE=1; FOREGROUND=1; shift ;;
         --restart)    RESTART=1; shift ;;
+        --save)       SAVE=1; shift ;;
+        --no-save|--no-neo4j) SAVE=0; shift ;;
         --foreground|--no-tmux) FOREGROUND=1; shift ;;
         --dry-run)    DRY_RUN=1; FOREGROUND=1; shift ;;
         --config)     CONFIG_FILE="${2:-}"; shift 2 ;;
         --input)      INPUT="${2:-}"; shift 2 ;;
         -h|--help)    usage; exit 0 ;;
         -*)           die "unknown option $1 (see --help)" ;;
-        expand|ingest)
+        expand|ingest|deep|smoke)
             # A bare mode word is the mode wherever it appears, not an input path.
-            if [ -z "$INPUT" ]; then MODE="$1"; else die "unexpected argument $1"; fi
+            if [ -z "$INPUT" ]; then select_mode "$1"; else die "unexpected argument $1"; fi
             shift ;;
         *)            INPUT="$1"; shift ;;
     esac
 done
 
-# The config file names do not match the mode names, so map them explicitly.
+# The config file names do not match the mode names, so map them explicitly. An EXPAND
+# smoke test gets its own config, so it never touches a real experiment's checkpoint.
 if [ -z "$CONFIG_FILE" ]; then
-    case "$MODE" in
-        expand) CONFIG_FILE="config/expansion.yaml" ;;
-        ingest) CONFIG_FILE="config/ingest.yaml" ;;
-    esac
+    if [ "$MODE" = "ingest" ]; then
+        CONFIG_FILE="config/ingest.yaml"
+    elif [ "$SMOKE" -eq 1 ]; then
+        CONFIG_FILE="config/smoke.yaml"
+    elif [ "$DEEP" -eq 1 ]; then
+        CONFIG_FILE="config/deep_discovery.yaml"
+    else
+        CONFIG_FILE="config/expansion.yaml"
+    fi
 fi
 cd "$REPO_ROOT" || die "cannot enter $REPO_ROOT"
 load_env
@@ -107,6 +135,9 @@ RUNTIME_DIR="${SCHAIN_RUNTIME_DIR:-$REPO_ROOT/.runtime}"
 NEO4J_HOME="$RUNTIME_DIR/neo4j/neo4j-community-$NEO4J_VERSION"
 NEO4J_DIST_URL="${SCHAIN_NEO4J_DIST_URL:-https://dist.neo4j.org/neo4j-community-$NEO4J_VERSION-unix.tar.gz}"
 VLLM_AUTO_INSTALL="${SCHAIN_VLLM_AUTO_INSTALL:-1}"
+# What the auto-install installs. Pin a version when the newest release needs a newer
+# NVIDIA driver than the server has.
+VLLM_PACKAGE="${SCHAIN_VLLM_PACKAGE:-vllm}"
 SMOKE_INPUT="${SCHAIN_SMOKE_INPUT:-docs/SupplyChain_KG_V1_Architecture_Brief_Final.pdf}"
 
 # --- ownership, so cleanup only touches what this run started ----------------------
@@ -196,6 +227,8 @@ Install the project dependencies before running this configuration:
 $CONFIG_OUTPUT"
 fi
 eval "$CONFIG_OUTPUT"
+# Neo4j is needed only when this run saves to it.
+NEED_NEO4J="${SAVE:-$CFG_SAVE_ENABLED}"
 
 LOG_DIR="$REPO_ROOT/logs"
 mkdir -p "$LOG_DIR"
@@ -207,7 +240,10 @@ RUN_LOG="$LOG_DIR/${MODE}_${RUN_STAMP}.log"
 need_gpu=0
 if ! llm_healthy "$CFG_LLM_BASE_URL"; then need_gpu=1; fi
 
-if [ "$need_gpu" -eq 1 ] && slurm_available && ! in_slurm_allocation && [ "$(gpu_count)" -eq 0 ]; then
+# A configured partition means "schedule through SLURM", even when this node shows
+# GPUs: on clusters whose login node is itself a GPU node, those GPUs are not ours.
+if [ "$need_gpu" -eq 1 ] && slurm_available && ! in_slurm_allocation \
+   && { [ "$(gpu_count)" -eq 0 ] || [ -n "${SCHAIN_SLURM_PARTITION:-}" ]; }; then
     missing=""
     [ -z "${SCHAIN_SLURM_PARTITION:-}" ] && missing="$missing\n  SCHAIN_SLURM_PARTITION"
     if [ -n "$missing" ]; then
@@ -416,7 +452,11 @@ Start Neo4j there, or configure a reachable instance before running this script.
 Logs: ${OWNED_NEO4J:-neo4j} ($RUNTIME_DIR/neo4j/logs or docker logs $NEO4J_CONTAINER)"
 }
 
-ensure_neo4j
+if [ "$NEED_NEO4J" = "1" ]; then
+    ensure_neo4j
+else
+    log "Neo4j: not needed (saving is off; pass --save to persist to Neo4j)"
+fi
 
 # --- 6. vLLM: reuse if healthy, otherwise start it ---------------------------------
 
@@ -441,9 +481,9 @@ Start the endpoint there, or point llm.base_url / LLM_API_BASE_URL at a reachabl
     elif [ "$VLLM_AUTO_INSTALL" = "1" ] && [ "$(gpu_count)" -ge 1 ]; then
         # Installed once, into the environment the runner already looks in. Large
         # download, so it happens only when a GPU is present and the endpoint is down.
-        log "vLLM is not installed; installing it into .venv (one time, large download)"
-        "$VENV_PY" -m pip install --quiet vllm || die "vLLM installation failed.
-Install it manually:  .venv/bin/python -m pip install vllm"
+        log "vLLM is not installed; installing $VLLM_PACKAGE into .venv (one time, large download)"
+        "$VENV_PY" -m pip install --quiet "$VLLM_PACKAGE" || die "vLLM installation failed.
+Install it manually:  .venv/bin/python -m pip install $VLLM_PACKAGE"
         [ -x "$REPO_ROOT/.venv/bin/vllm" ] || die "vLLM installed but .venv/bin/vllm is missing"
         vllm_bin="$REPO_ROOT/.venv/bin/vllm"
     else
@@ -489,6 +529,15 @@ Automatic installation is skipped here (no GPU visible, or SCHAIN_VLLM_AUTO_INST
     for _ in $(seq 1 "$VLLM_STARTUP_TIMEOUT"); do
         if ! kill -0 "$OWNED_VLLM_PID" 2>/dev/null; then
             tail -20 "$vllm_log" >&2
+            if grep -q "driver on your system is too old" "$vllm_log"; then
+                die "the installed vLLM/PyTorch needs a newer NVIDIA driver than this node has
+($(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1)).
+Pin a vLLM release whose PyTorch is built for this driver's CUDA version in .env:
+  SCHAIN_VLLM_PACKAGE=vllm==<version>
+then uninstall the current one so the next run installs the pin:
+  .venv/bin/python -m pip uninstall -y vllm
+Full log: $vllm_log"
+            fi
             die "vLLM exited during startup. Full log: $vllm_log"
         fi
         llm_healthy "$CFG_LLM_BASE_URL" && { log "LLM endpoint is healthy"; return 0; }
@@ -502,6 +551,8 @@ Automatic installation is skipped here (no GPU visible, or SCHAIN_VLLM_AUTO_INST
 
 SCHAIN_CMD=("$VENV_PY" -m schain "$MODE" --config "$CONFIG_FILE")
 [ "$RESTART" -eq 1 ] && SCHAIN_CMD+=(--restart)
+[ "$SAVE" = "1" ] && SCHAIN_CMD+=(--save)
+[ "$SAVE" = "0" ] && SCHAIN_CMD+=(--no-save)
 
 if [ "$MODE" = "ingest" ]; then
     [ "$SMOKE" -eq 1 ] && [ -z "$INPUT" ] && INPUT="$SMOKE_INPUT"

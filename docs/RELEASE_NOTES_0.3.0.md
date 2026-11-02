@@ -1,4 +1,7 @@
-# SChain 0.3.0 — start here
+# SChain 0.3.0 — release and migration notes
+
+> Historical notes for the 0.3.0 release. Current setup and commands are in the
+> [README](../README.md); some budgets quoted below have changed since.
 
 This is an updated copy of `Schain-mirza1(1).zip`, reviewed against the main article and
 all 11 additional supplied papers. The backend audit and corrected experiment policy are in `docs/AUDIT_V0.3.0.md`.
