@@ -719,6 +719,21 @@ def load_resolution_cache(connection: sqlite3.Connection) -> dict[str, dict[str,
     return {row["mention_key"]: dict(row) for row in rows}
 
 
+def resolved_mentions(
+    connection: sqlite3.Connection, canonical_id: str, label: str
+) -> list[dict[str, Any]]:
+    """Cached mentions resolved to one canonical entity of one entity type.
+
+    Oldest first, so a newly resolved mention never displaces an earlier one.
+    """
+    rows = connection.execute(
+        "SELECT * FROM entity_resolution WHERE canonical_id = ? AND LOWER(label) = LOWER(?) "
+        "ORDER BY rowid",
+        (canonical_id, label),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def save_resolution(
     connection: sqlite3.Connection, entries: Iterable[dict[str, Any]]
 ) -> int:

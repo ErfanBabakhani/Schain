@@ -26,6 +26,7 @@ from ..checkpoint import atomic_write_parquet
 from ..documents import normalize_url
 from ..names import normalization_key
 from ..expansion.telemetry import classify_fetch_error
+from ..kg.resolve import identity_plausible
 from . import PROVIDERS, SOURCE_TYPES
 from . import manifest as mf
 from .base import TITLE_SNIPPET, SearchResult, build_client, fetch_article_text, request_error
@@ -49,6 +50,34 @@ def _company_aliases(config: dict[str, Any]) -> dict[str, str]:
     except Exception:  # noqa: BLE001
         return {}
     return dict((ontology.get("aliases") or {}).get("Company") or {})
+
+
+def _resolved_aliases(
+    connection, entity_name: str, entity_key: str, configured: dict[str, str],
+) -> list[str]:
+    """Mentions earlier entity disambiguation resolved to this entity, from the state cache.
+
+    Only mentions cached under this exact canonical id and entity type are used, and each
+    must pass the same identity check the resolver applies before reusing a cached
+    identity. A mention the ontology assigns to a different entity is skipped.
+    """
+    label = entity_key.split(":", 1)[0]
+    own = {normalization_key(name) for name in origin_name_variants(entity_name, configured)}
+    configured_owner: dict[str, str] = {}
+    for alias, canonical in configured.items():
+        configured_owner[normalization_key(alias)] = normalization_key(canonical)
+        configured_owner[normalization_key(canonical)] = normalization_key(canonical)
+    out: list[str] = []
+    for row in state.resolved_mentions(connection, entity_key, label):
+        mention = str(row["mention"] or "").strip()
+        key = normalization_key(mention)
+        owner = configured_owner.get(key)
+        if not key or key in own or (owner is not None and owner not in own):
+            continue
+        if identity_plausible(mention, str(row["canonical_name"])):
+            own.add(key)
+            out.append(mention)
+    return out
 
 
 def diversify_by_title(
@@ -558,6 +587,7 @@ async def retrieve_async(
     concurrency = config.get("concurrency", {})
     semaphore = asyncio.Semaphore(max(1, concurrency.get("retrieval", 8)))
     aliases = _company_aliases(config)
+    resolved_aliases = _resolved_aliases(connection, entity_name, entity_key, aliases)
     for alias in config.get("_distributed_entity_aliases") or []:
         aliases.setdefault(str(alias), entity_name)
     variants = origin_name_variants(entity_name, aliases)
@@ -569,6 +599,14 @@ async def retrieve_async(
         *(str(alias) for alias, canonical in aliases.items()
           if normalization_key(canonical) == normalization_key(entity_name)),
     ]))
+    # Appended last, so configured and distributed aliases keep their order and query slots.
+    for alias in resolved_aliases:
+        aliases.setdefault(alias, entity_name)
+        if normalization_key(alias) not in {normalization_key(name) for name in variants}:
+            variants.append(alias)
+            query_variants.append(alias)
+    if resolved_aliases:
+        logger.info("entity=%s resolved aliases from cache: %s", entity_name, resolved_aliases)
     evidence_cfg = (config.get("validation") or {}).get("evidence") or {}
     policy = load_relation_evidence(evidence_cfg.get("policy_file"))
 
