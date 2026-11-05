@@ -825,6 +825,10 @@ def process_document(
             )
             advance_stage("facts_persistence")
             persist_rejected(config, rejected)
+            if config.get("storage", {}).get("sqlite_graph"):
+                from .sqlite_graph import commit_document
+                commit_document(connection, document, accepted, resolution)
+                status = state.RESOLVED
             upsert_facts_parquet(accepted, storage_path(config, "extracted_facts"))
             refresh_edge_support(config)
             state.set_document_status(connection, doc_id, state.RESOLVED)

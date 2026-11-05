@@ -6,11 +6,32 @@ import pandas as pd
 import pytest
 
 from schain.kg.facts import FACT_COLUMNS
+from schain.validation.gold import evaluate_gold
 from schain.validation.sectivia import (
     compare_with_facts,
     find_reference_file,
     load_reference,
 )
+
+
+def test_evaluation_direction_negatives_and_document_scope():
+    edge = {"subject_id": "A", "relation": "suppliesTo", "object_id": "B"}
+    gold = {"documents": [
+        {"doc_id": "positive", "triples": [edge]},
+        {"doc_id": "negative", "triples": []},
+    ]}
+    predictions = [
+        {"doc_id": "positive", **edge}, {"doc_id": "positive", **edge},
+        {"doc_id": "negative", **edge}, {"doc_id": "outside", **edge},
+        {"doc_id": "positive", "subject_id": "B", "relation": "suppliesTo", "object_id": "A"},
+    ]
+    result = evaluate_gold(gold, predictions)
+    assert result["micro"] == {
+        "true_positive": 1, "false_positive": 2, "false_negative": 0,
+        "precision": 1 / 3, "recall": 1.0, "f1": .5,
+    }
+    assert result["excluded_prediction_documents"] == 1
+    assert evaluate_gold(gold, [])["micro"]["recall"] == 0
 
 
 @pytest.fixture

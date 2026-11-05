@@ -196,7 +196,7 @@ def build_llm(config: dict[str, Any]) -> LLMInterface:
         # Qwen instruct/non-thinking behaviour is requested through the chat template,
         # which vLLM exposes via extra_body. This is vLLM-specific, so it is not sent to
         # hosted APIs below.
-        if not llm_config.get("enable_thinking", False):
+        if llm_config.get("backend", "vllm") == "vllm" and not llm_config.get("enable_thinking", False):
             model_params["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
     elif provider == "api":
         base_url = llm_config.get("base_url") or os.environ.get("LLM_API_BASE_URL")

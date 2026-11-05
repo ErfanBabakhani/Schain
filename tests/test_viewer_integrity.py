@@ -38,7 +38,8 @@ def test_malformed_node_shapes_are_rejected(field, value):
 
 
 @pytest.mark.parametrize("field,value", [
-    ("source", []), ("quality", []), ("quality", "checked"),
+    ("source", []), ("source", "missing"), ("target", "missing"),
+    ("quality", []), ("quality", "checked"),
     ("evidence", {}), ("evidence", [None]), ("source_doc_ids", "doc"),
 ])
 def test_malformed_evidence_shapes_are_rejected(field, value):
@@ -55,7 +56,10 @@ def test_source_text_cannot_escape_embedded_json_script(tmp_path):
     output = write_viewer(data, tmp_path / "viewer.html")
     html = output.read_text()
     assert attack not in html
+    assert "__GRAPH_DATA__" not in html
+    assert 'src="https://' not in html
     payload = html.split('<script type="application/json" id="graphData">', 1)[1].split('</script>', 1)[0]
+    assert json.loads(payload) == validate_graph(data)
     assert json.loads(payload)["nodes"][0]["name"] == attack
 
 

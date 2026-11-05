@@ -1,0 +1,17 @@
+# Optional server preset. All project settings are copied into its SQLite database.
+include:
+  - config/expansion.yaml
+llm:
+  provider: local
+  backend: llamacpp
+  base_url: http://127.0.0.1:8000/v1
+  model: schain-qwen
+  request_timeout_seconds: 600
+  json_mode: true
+  structured_output: false
+  temperature: 0.0
+  max_tokens: 2048
+  client_max_retries: 0
+concurrency:
+  retrieval: 2
+  llm_max_concurrency: 1

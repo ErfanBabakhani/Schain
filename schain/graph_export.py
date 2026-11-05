@@ -12,6 +12,8 @@ import json
 import logging
 import math
 import sqlite3
+import time
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -19,9 +21,10 @@ from typing import Any, Optional
 import pandas as pd
 
 from . import __version__
-from .config import seed_entities, storage_path
+from .config import seed_entities, storage_dir, storage_path
 from .documents import normalize_url
 from .kg.facts import FACT_COLUMNS
+from .kg.support import aggregate_edge_support, contextualize_facts, load_document_origins
 from .ontology import load_ontology
 
 logger = logging.getLogger(__name__)
@@ -80,6 +83,22 @@ def _as_str(value: Any, default: str = "") -> str:
     return str(cleaned)
 
 
+def _optional_bool(value: Any) -> Optional[bool]:
+    """Preserve unknown legacy validation flags instead of treating NaN as true."""
+    cleaned = json_safe(value)
+    if isinstance(cleaned, bool):
+        return cleaned
+    if isinstance(cleaned, (int, float)) and cleaned in (0, 1):
+        return bool(cleaned)
+    return None
+
+
+def _any_flag(rows: list[dict[str, Any]], key: str) -> Optional[bool]:
+    flags = [_optional_bool(row.get(key)) for row in rows]
+    known = [flag for flag in flags if flag is not None]
+    return any(known) if known else None
+
+
 def _unique_sorted(values: list[Any]) -> list[str]:
     seen: set[str] = set()
     result: list[str] = []
@@ -121,6 +140,10 @@ def _read_parquet(path: Path) -> pd.DataFrame:
 
 
 def _load_facts(config: dict[str, Any]) -> pd.DataFrame:
+    if config.get("storage", {}).get("sqlite_graph"):
+        from .sqlite_graph import load_facts
+        with closing(sqlite3.connect(storage_path(config, "state_db"))) as connection:
+            return load_facts(connection)
     path = storage_path(config, "extracted_facts")
     if not path.exists():
         logger.warning("facts.parquet not found at %s; exporting an empty graph", path)
@@ -134,6 +157,10 @@ def _load_facts(config: dict[str, Any]) -> pd.DataFrame:
 
 
 def _load_documents(config: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    if config.get("storage", {}).get("sqlite_graph"):
+        from .sqlite_graph import load_documents
+        with closing(sqlite3.connect(storage_path(config, "state_db"))) as connection:
+            return load_documents(connection)
     frame = _read_parquet(storage_path(config, "normalized_documents"))
     if frame.empty or "doc_id" not in frame.columns:
         return {}
@@ -1240,7 +1267,8 @@ def build_graph_bundle(
             from .config import storage_path as _storage_path
             db = _storage_path(config, "state_db")
             if db.exists():
-                conn = state_mod.connect(db)
+                conn = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+                conn.row_factory = sqlite3.Row
                 try:
                     counts = state_mod.frontier_counts(conn)
                     tiers = state_mod.frontier_tier_counts(conn)

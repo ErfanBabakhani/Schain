@@ -174,13 +174,17 @@ def _json_default(value):
     raise TypeError(f"not JSON serializable: {type(value).__name__}")
 
 
-def connect(path: Path) -> sqlite3.Connection:
+def connect(path: Path, *, journal_mode: str = "WAL") -> sqlite3.Connection:
     """Open the state database, creating the schema if needed."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path)
+    if journal_mode not in ("WAL", "DELETE"):
+        raise ValueError("journal_mode must be WAL or DELETE")
+    connection = sqlite3.connect(path, timeout=30)
     connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA journal_mode=WAL")
+    connection.execute(f"PRAGMA journal_mode={journal_mode}")
+    connection.execute("PRAGMA foreign_keys=ON")
+    connection.execute("PRAGMA synchronous=FULL")
     connection.executescript(SCHEMA)
     # Additive migration: existing checkpoint and Parquet identities remain valid.
     columns = {row["name"] for row in connection.execute("PRAGMA table_info(frontier)")}
@@ -483,6 +487,7 @@ def enqueue_entity(
     priority: float = 0.0,
     priority_reason: Optional[dict] = None,
     stop_reason: Optional[str] = None,
+    commit: bool = True,
 ) -> bool:
     """Add a company to the frontier, or lower its tier when a shorter path is found.
 
@@ -506,7 +511,8 @@ def enqueue_entity(
             (key, entity_name, tier, PENDING if expandable else DONE, discovered_from, now, now,
              entity_type, int(expandable), priority, json.dumps(priority_reason or {}, default=_json_default), stop_reason),
         )
-        connection.commit()
+        if commit:
+            connection.commit()
         return True
 
     if int(existing["tier"]) <= int(tier):
@@ -515,7 +521,8 @@ def enqueue_entity(
                 "UPDATE frontier SET priority=?, priority_reason=? WHERE entity_key=?",
                 (priority, json.dumps(priority_reason or {}, default=_json_default), key),
             )
-            connection.commit()
+            if commit:
+                connection.commit()
         return False
 
     # Shorter valid path discovered: lower the tier. Re-queue if already DONE so the
@@ -529,7 +536,8 @@ def enqueue_entity(
         (tier, discovered_from or existing["discovered_from"], new_status, now,
          entity_name, int(expandable), stop_reason, key),
     )
-    connection.commit()
+    if commit:
+        connection.commit()
     logger.info(
         "frontier tier lowered entity=%s from=%s to=%s via=%s",
         entity_name, existing["tier"], tier, discovered_from,

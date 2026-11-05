@@ -15,6 +15,7 @@ import json
 import logging
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
@@ -392,6 +393,8 @@ def run_expand(
     checkpoint_manager=None, *, allowed_entity_keys: Optional[set[str]] = None,
     initialize_seeds: bool = True, retrieval_checkpoint=None,
     document_checkpoint_sink=None,
+    should_pause=None,
+    max_total_documents=None,
 ) -> dict[str, Any]:
     """Expand under persisted budgets; all accepted facts survive scheduling stops.
 
@@ -424,7 +427,8 @@ def run_expand(
     run_new_claims_by_tier: dict[int, int] = {}
     run_id = state.run_value(connection, "run_id") or datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S_%f")
     state.set_run_value(connection, "run_id", run_id)
-    manifest = mf.RetrievalManifest(REPO_ROOT / "logs" / f"retrieval_manifest_{run_id}.csv", run_id)
+    log_dir = Path(config.get("storage", {}).get("logs", REPO_ROOT / "logs"))
+    manifest = mf.RetrievalManifest(log_dir / f"retrieval_manifest_{run_id}.csv", run_id)
     requeued = state.requeue_stale_processing(connection)
     if requeued:
         logger.info("returned %d interrupted frontier entries to pending", requeued)
@@ -464,6 +468,8 @@ def run_expand(
         state.set_run_value(connection, "elapsed_seconds", elapsed())
 
     def time_reason(*, estimate=False):
+        if should_pause is not None and should_pause():
+            return "pause_requested"
         remaining = max_seconds - elapsed()
         if not max_seconds:
             return None
@@ -650,6 +656,11 @@ def run_expand(
                             prompt1_drops["entity_max_reached"] += 1
                         else:
                             prompt1_drops["target_reached"] += 1
+                        break
+                if max_total_documents is not None and known is None:
+                    total = connection.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+                    if total >= max_total_documents:
+                        summary["stop_reason"], reason = "total_document_budget", "total_document_budget"
                         break
                 # Reserve first; a crash/partial extraction cannot reset document spend.
                 state.reserve_document(connection, doc_id, entity_key)

@@ -33,7 +33,7 @@ Searches performed (August 2026), none returning a match:
 
 If you have the original reference (a paper, a Zenodo/figshare record, or a vendor page),
 add it here and place the files as described below. Replacing Sectivia with a different
-dataset should be an explicit decision, recorded in PROJECT_DECISIONS.md.
+dataset should be documented with its source and evaluation procedure.
 
 ### How to use it once obtained
 

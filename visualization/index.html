@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SChain · Projects</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#f5f7f8;color:#21303b;font:14px system-ui,sans-serif}
+header{padding:16px 24px;background:white;border-bottom:1px solid #dce3e7;display:flex;gap:16px;align-items:center}
+header strong{font-size:20px}input,select,button{font:inherit;padding:7px;border:1px solid #bbc8cf;border-radius:4px}
+button{cursor:pointer;background:white}button:hover{background:#e6f3f4}label{display:grid;gap:4px;margin-bottom:12px}
+.layout{display:grid;grid-template-columns:290px 1fr;height:calc(100vh - 76px)}aside{padding:20px;overflow:auto;border-right:1px solid #dce3e7}
+iframe{width:100%;height:100%;border:0}h2{font-size:16px;margin:20px 0 12px}.actions{display:flex;gap:5px;margin-bottom:16px}
+pre{white-space:pre-wrap;font:12px system-ui;overflow-wrap:anywhere}#message{color:#8c3030;max-width:36em}details{margin:12px 0}
+</style>
+<header><strong>SChain</strong><span>Research projects</span><span id="message" role="status"></span></header>
+<div class="layout"><aside>
+<form id="connection"><label>API endpoint<input id="endpoint" type="url" value="http://127.0.0.1:8001" required></label>
+<label>Access token<input id="token" type="password" autocomplete="off" required></label><button>Connect</button></form>
+<h2>Project</h2><label>Selected project<select id="projects"><option value="">Choose a project</option></select></label>
+<div class="actions"><button id="start">Start</button><button id="pause">Pause</button><button id="resume">Resume</button></div>
+<pre id="status">Connect through your SSH tunnel.</pre>
+<details><summary>Create / configure project</summary><form id="settings">
+<label>Name<input id="name" maxlength="200" required></label>
+<label>Tier-0 seeds (one per line)<textarea id="seeds" rows="3" required></textarea></label>
+<div id="limits"></div><button value="create">Create new</button> <button value="update">Save settings</button>
+</form></details>
+<h2>Documents</h2><form id="uploadForm"><label>Add while idle<input id="document" type="file" accept=".txt,.md,.pdf" required></label><button>Upload and process</button></form>
+<pre id="documents"></pre><details><summary>Recent runs and errors</summary><pre id="runs"></pre></details>
+</aside><main><iframe id="explorer" src="explorer.html" title="SChain graph explorer"></iframe></main></div>
+<script>
+'use strict';
+const el=id=>document.getElementById(id);
+const defaults={max_tier:3,max_documents_per_entity:5,max_documents_per_run:10,max_total_documents:100,llm_max_concurrency:1,retrieval_concurrency:2,max_minutes:30};
+for(const [key,value] of Object.entries(defaults)){
+ const label=document.createElement('label');label.textContent=key.replaceAll('_',' ');
+ const input=document.createElement('input');input.type='number';input.id=key;input.value=value;input.min=key==='max_tier'?0:1;input.required=true;label.append(input);el('limits').append(label);
+}
+let base='',token='',timer=null,busy=false,selected='',generation=0,lastGraph='';
+const showError=error=>{el('message').textContent=error.message;};
+async function api(path,options={}){
+ const response=await fetch(base+path,{...options,headers:{Authorization:'Bearer '+token,...options.headers}});
+ if(!response.ok){const body=await response.json().catch(()=>({detail:response.statusText}));throw Error(typeof body.detail==='string'?body.detail:JSON.stringify(body.detail));}
+ return response.json();
+}
+async function refreshProjects(wanted=selected){
+ const projects=await api('/projects');el('projects').replaceChildren(new Option('Choose a project',''));
+ for(const project of projects)el('projects').add(new Option(project.name,project.id));
+ el('projects').value=wanted;selectProject();
+}
+function selectProject(){selected=el('projects').value;generation++;lastGraph='';poll();}
+async function poll(){
+ if(busy||!selected)return;
+ busy=true;const id=selected,version=generation;
+ try{
+  const [project,documents]=await Promise.all([api('/projects/'+id),api('/projects/'+id+'/documents')]);
+  if(version!==generation)return;
+  el('status').textContent=project.status+'\n'+JSON.stringify(project.statistics,null,2);
+  el('runs').textContent=JSON.stringify({errors:project.errors,runs:project.runs},null,2);
+  el('documents').textContent=documents.map(d=>d.doc_id+' · '+d.status+(d.error?' · '+d.error:'')).join('\n')||'No documents yet.';
+  if(document.activeElement?.closest('#settings')===null){el('name').value=project.name;el('seeds').value=project.seeds.join('\n');for(const key of Object.keys(defaults))el(key).value=project.limits[key];}
+  if(project.graph_revision!==lastGraph){
+   const graph=await api('/projects/'+id+'/graph');if(version!==generation)return;
+   el('explorer').contentWindow.postMessage({type:'schain-graph',graph},location.origin);lastGraph=graph.revision;
+   el('message').textContent=graph.pagination.total_edges>graph.edges.length?'Showing the first '+graph.edges.length+' edges; the API supports pagination.':'';
+  }
+ }catch(error){showError(error);}finally{busy=false;}
+}
+el('connection').onsubmit=async event=>{
+ event.preventDefault();try{
+  const url=new URL(el('endpoint').value);if(!['127.0.0.1','localhost','[::1]'].includes(url.hostname))throw Error('Use the loopback endpoint of your SSH tunnel.');
+  base=url.href.replace(/\/$/,'');token=el('token').value;await refreshProjects();clearInterval(timer);timer=setInterval(poll,4000);
+ }catch(error){showError(error);}
+};
+el('projects').onchange=selectProject;
+for(const action of ['start','pause','resume'])el(action).onclick=async()=>{try{if(!selected)throw Error('Select a project first.');await api('/projects/'+selected+'/'+action,{method:'POST'});await poll();}catch(error){showError(error);}};
+el('settings').onsubmit=async event=>{
+ event.preventDefault();try{
+  const update=event.submitter.value==='update';if(update&&!selected)throw Error('Select a project first.');
+  const settings={name:el('name').value,seeds:el('seeds').value.split('\n').map(x=>x.trim()).filter(Boolean),limits:Object.fromEntries(Object.keys(defaults).map(k=>[k,Number(el(k).value)]))};
+  const project=await api('/projects'+(update?'/'+selected:''),{method:update?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(settings)});
+  await refreshProjects(project.id);
+ }catch(error){showError(error);}
+};
+el('uploadForm').onsubmit=async event=>{
+ event.preventDefault();try{
+  if(!selected)throw Error('Select a project first.');const file=el('document').files[0];if(file.size>10*1024*1024)throw Error('Maximum document size is 10 MiB.');
+  await api('/projects/'+selected+'/documents',{method:'POST',headers:{'Content-Type':'application/octet-stream','X-Filename':file.name},body:file});el('uploadForm').reset();await poll();
+ }catch(error){showError(error);}
+};
+el('explorer').onload=()=>{lastGraph='';poll();};
+if(location.protocol==='file:')showError(Error('Serve these files locally: python -m http.server 8080 --bind 127.0.0.1'));
+</script>
+</html>

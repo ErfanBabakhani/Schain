@@ -7,6 +7,12 @@ const svgEl=(tag,attrs={})=>{const el=document.createElementNS(NS,tag);Object.en
 const safeUrl=value=>{try{const u=new URL(value);return ['https:','http:'].includes(u.protocol)?u.href:null;}catch{return null;}};
 let bundle,byId,selected=null,focus=null,currentNodes=[],currentEdges=[],positions=new Map(),page=0,view=[0,0,1000,600],fullView=[0,0,1000,600],drag=null;
 const loaded=[];
+if(typeof window!=='undefined')window.addEventListener('message', event=>{
+ if(event.source!==window.parent||event.origin!==window.location.origin||event.origin==='null')return;
+ if(event.data?.type==='schain-graph'){
+  try{load(validate(event.data.graph),'Server project');}catch(error){$('banner').textContent=error.message;}
+ }
+});
 function validate(data){
  if(!data||!Array.isArray(data.nodes)||!Array.isArray(data.edges))throw Error('Expected a SChain JSON object with nodes and edges arrays.');
  const object=x=>x!==null&&typeof x==='object'&&!Array.isArray(x);

@@ -14,7 +14,7 @@ from ..names import canonical_id, mention_key
 logger = logging.getLogger(__name__)
 
 
-def seed_frontier(connection, config: dict[str, Any], ontology=None) -> int:
+def seed_frontier(connection, config: dict[str, Any], ontology=None, *, commit=True) -> int:
     """Configured seeds always enter at Tier 0, including on a shorter-path revisit."""
     aliases = ((ontology or {}).get("aliases") or {}).get("Company") or {}
     normalized_aliases = {mention_key("Company", key): value for key, value in aliases.items()}
@@ -26,6 +26,7 @@ def seed_frontier(connection, config: dict[str, Any], ontology=None) -> int:
             connection, name, tier=0, entity_id=canonical_id("Company", canonical_name),
             expandable=max_tier > 0, stop_reason="terminal_tier" if max_tier == 0 else None,
             priority=1000, priority_reason={"configured_seed": True},
+            commit=commit,
         )
     logger.info("seeded %d new Tier-0 entit(ies)", added)
     return added

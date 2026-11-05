@@ -32,6 +32,37 @@ from schain.sources.retrieve import document_kwargs_from_result
 from schain.verification import verify_supplies_to_edges
 
 
+def test_hallucinated_quote_rejected_before_llm(ingest_config, ontology, stub_llm):
+    facts = pd.DataFrame([_accepted_supply("CATL", "BMW", "d")])
+    accepted, rejected = validate_facts_frame(
+        facts, config=ingest_config, ontology=ontology, llm=stub_llm,
+        document_text="CATL does not supply BMW.",
+    )
+    assert accepted.empty
+    assert rejected.iloc[0].rejection_reason == "evidence_not_in_source"
+    assert not stub_llm.prompts
+
+
+def test_literal_quote_matches_normalized_whitespace(ingest_config, ontology, stub_llm):
+    facts = pd.DataFrame([_accepted_supply("CATL", "BMW", "d")])
+    accepted, rejected = validate_facts_frame(
+        facts, config=ingest_config, ontology=ontology, llm=stub_llm,
+        document_text="CATL\n supplies   to BMW.",
+    )
+    assert rejected.empty and len(accepted) == 1
+    assert bool(accepted.iloc[0].evidence_quote_grounded)
+
+
+def test_no_model_does_not_claim_validation(ingest_config, ontology):
+    facts = pd.DataFrame([_accepted_supply("CATL", "BMW", "d")])
+    accepted, _ = validate_facts_frame(
+        facts, config=ingest_config, ontology=ontology,
+        document_text="CATL supplies to BMW.",
+    )
+    assert not bool(accepted.iloc[0].evidence_validated)
+    assert accepted.iloc[0].validation_status == "unchecked"
+
+
 @pytest.fixture
 def reputation(ingest_config):
     return load_source_reputation(ingest_config)

@@ -25,6 +25,7 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+server = ["fastapi>=0.115,<1", "uvicorn>=0.30,<1"]
 postgres = ["psycopg[binary,pool]>=3.2,<4.0"]
 
 [project.scripts]
@@ -35,7 +36,7 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-include = ["schain*"]
+include = ["schain*", "backend*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
