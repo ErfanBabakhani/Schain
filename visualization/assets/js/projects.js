@@ -13,8 +13,9 @@
     ['retrieval_concurrency', 'Retrieval concurrency', 2, 1, 8],
     ['max_minutes', 'Session duration (minutes)', 30, 0.01, 1440, 'A new time allowance for each execution session.']
   ];
-  const session = { base: '', token: '', connected: false, projects: [], request: null };
+  const session = { base: '', token: '', connected: false, projects: [], request: null, localProxy: false, csrf: '', connecting: false };
   let current = null, timer = null, editing = false, saving = false;
+  let reconnectTimer = null, reconnectAttempt = 0;
 
   for (const [key, title, value, min, max, hint] of limits) {
     const label = document.createElement('label'); label.textContent = title;
@@ -36,6 +37,7 @@
     $('projectDialog').close();
   }
   function disconnected(text = 'Connect to your server to open a project.') {
+    clearTimeout(reconnectTimer);
     abortProject(); session.request?.abort(); session.connected = false; session.token = '';
     session.projects = []; $('projectSelect').replaceChildren(new Option('Select a project', ''));
     $('projectState').textContent = 'Disconnected'; $('apiToken').value = '';
@@ -47,9 +49,10 @@
     return fallback;
   }
   async function api(path, options = {}, signal = current?.controller.signal) {
+    const authentication = session.localProxy ? { 'X-SChain-CSRF': session.csrf } : { Authorization: 'Bearer ' + session.token };
     const response = await fetch(session.base + path, {
       ...options, signal, cache: 'no-store',
-      headers: { Authorization: 'Bearer ' + session.token, ...options.headers }
+      headers: { ...authentication, ...options.headers }
     });
     const body = await response.json().catch(() => null);
     if (!response.ok) {
@@ -60,6 +63,12 @@
   }
   function handleError(error, context = current) {
     if (error.name === 'AbortError' || context !== current) return;
+    if (session.localProxy && [401, 403].includes(error.status)) {
+      disconnected('The local proxy connection needs attention.');
+      message(error.message);
+      if (error.status === 403) scheduleReconnect(error);
+      return;
+    }
     if (error.status === 401) {
       disconnected('Authentication expired. Connect again with the server token.');
       $('connectionError').textContent = error.message; $('connectionDialog').showModal();
@@ -158,8 +167,9 @@
         explorer.setEmptyState('No graph entities yet', 'The graph will appear after initialized seeds or accepted document facts are published.');
       }
       message('');
-    } catch (error) { handleError(error, context); }
-    finally { context.polling = false; if (context === current) timer = setTimeout(() => poll(context), 4000); }
+      context.failures = 0;
+    } catch (error) { context.failures = (context.failures || 0) + 1; handleError(error, context); }
+    finally { context.polling = false; if (context === current) timer = setTimeout(() => poll(context), Math.min(30000, 4000 * 2 ** (context.failures || 0))); }
   }
   function selectProject(id) {
     abortProject(); message('');
@@ -181,23 +191,55 @@
     $('projectDialog').showModal();
   }
 
+  async function connectSession(base, token) {
+    disconnected(); session.base = base; session.token = token;
+    const request = new AbortController(); session.request = request;
+    const projects = await api('/projects', {}, request.signal);
+    if (session.request !== request) return;
+    session.projects = projects; session.connected = true; $('apiToken').value = '';
+    reconnectAttempt = 0; $('connectionDialog').close(); selectProject('');
+  }
+  function scheduleReconnect(error) {
+    if (!session.localProxy || reconnectAttempt >= 5 || (error.status && ![403, 502, 503, 504].includes(error.status))) return;
+    const delay = Math.min(30000, 2000 * 2 ** reconnectAttempt++);
+    clearTimeout(reconnectTimer);
+    message(`${error.message} Retrying in ${delay / 1000}s; you can also use Reconnect.`);
+    reconnectTimer = setTimeout(connectLocalProxy, delay);
+  }
+  async function connectLocalProxy() {
+    if (session.connecting) return;
+    session.connecting = true; $('connectButton').disabled = true;
+    try {
+      const response = await fetch('/schain-dev-config', { cache: 'no-store', credentials: 'omit', redirect: 'error' });
+      if (!response.ok && !session.localProxy) return;
+      if (!response.ok) throw Error('Local development server unavailable. Restart it and use Reconnect.');
+      const config = await response.json();
+      if (config.mode !== 'local-proxy' || config.api_prefix !== '/api' || !/^[A-Za-z0-9_-]{32,}$/.test(config.csrf_token)) return;
+      session.localProxy = true; session.csrf = config.csrf_token;
+      $('connectButton').textContent = 'Reconnect';
+      await connectSession('/api', '');
+    } catch (error) {
+      if (session.localProxy && error.name !== 'AbortError') {
+        disconnected('Cannot connect through the local proxy. Check the SSH tunnel and backend.');
+        message(error.message); scheduleReconnect(error);
+      }
+    } finally { session.connecting = false; $('connectButton').disabled = false; }
+  }
   $('connectionForm').onsubmit = async event => {
     event.preventDefault();
     try {
       const endpoint = new URL($('apiEndpoint').value);
       if (!['http:', 'https:'].includes(endpoint.protocol) || !['127.0.0.1', 'localhost', '[::1]'].includes(endpoint.hostname) || endpoint.username || endpoint.password || endpoint.search || endpoint.hash) throw Error('Use a loopback HTTP endpoint forwarded by SSH.');
-      const token = $('apiToken').value;
-      disconnected(); session.base = endpoint.href.replace(/\/$/, ''); session.token = token;
-      const request = new AbortController(); session.request = request; $('connectionError').textContent = '';
-      const projects = await api('/projects', {}, request.signal);
-      if (session.request !== request) return;
-      session.projects = projects; session.connected = true; $('apiToken').value = '';
-      $('connectionDialog').close(); selectProject('');
+      $('connectionError').textContent = '';
+      await connectSession(endpoint.href.replace(/\/$/, ''), $('apiToken').value);
     } catch (error) {
       if (error.name !== 'AbortError') $('connectionError').textContent = error.message;
     }
   };
-  $('connectButton').onclick = () => $('connectionDialog').showModal();
+  $('connectButton').onclick = () => {
+    if (session.localProxy) { clearTimeout(reconnectTimer); reconnectAttempt = 0; connectLocalProxy(); }
+    else $('connectionDialog').showModal();
+  };
   $('newProject').onclick = () => openProject(false);
   $('manageProject').onclick = () => openProject(true);
   $('projectSelect').onchange = event => selectProject(event.target.value);
@@ -246,4 +288,5 @@
   $('openJsonBtn').title = 'Use python -m schain view for a separate offline graph';
   disconnected();
   if (location.protocol === 'file:') message('Serve the generated directory locally with python -m http.server; file:// is unsupported.');
+  else connectLocalProxy();
 })();

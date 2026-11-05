@@ -35,6 +35,33 @@ Run both processes under an approved service manager or scheduler to survive SSH
 
 ## Local frontend
 
+For local development, keep these settings in a private root-level `.env.local` (safe placeholders are in `.env.example`). Create it only if absent; do not overwrite an existing file:
+
+```dotenv
+SCHAIN_API_URL=http://127.0.0.1:8001
+SCHAIN_API_TOKEN=replace-with-your-existing-backend-token
+SCHAIN_SSH_HOST=your-ssh-alias
+SCHAIN_FRONTEND_PORT=8080
+```
+
+In Windows PowerShell, establish your existing SSH tunnel in one terminal, then start the local frontend in another:
+
+```powershell
+ssh -N -o ExitOnForwardFailure=yes -L 8001:127.0.0.1:8001 your-ssh-alias
+```
+
+```powershell
+python -m backend.dev_frontend --env .env.local
+```
+
+The command builds the frontend, binds only to `127.0.0.1`, checks backend authentication and opens the browser. The page automatically loads projects through `/api`; Reconnect does not ask for credentials. Failed connections use bounded backoff. `--no-browser` leaves browser opening to you. Restart the command after editing `.env.local`. If the port is occupied, stop the identified old static server or change `SCHAIN_FRONTEND_PORT`.
+
+The Python process supplies the bearer token. The browser receives only a separate temporary anti-CSRF nonce. The local server checks Host/Origin, permits only the required API routes and methods, and serves only the generated frontend assets. It never starts SSH or reads SSH key files; the alias is just a reference for diagnostics. No backend update or CORS change is needed for this same-origin proxy, even if its local port changes.
+
+This proxy is development-only and trusts processes/users on the local machine. Keep `.env.local` private and Git-ignored, do not share its contents, and do not expose or forward the local frontend port. It is not production authentication infrastructure.
+
+For a static build with the existing direct authenticated connection instead, use the following commands. They do not read `.env.local`:
+
 From a matching checkout on your own computer:
 
 ```bash
@@ -57,7 +84,7 @@ If another interface appears, check the absolute directory printed by the build 
 
 Create a project, set its seeds and limits, then select Start. Pause and wait for `paused` before changing settings or uploading UTF-8 `.txt`, `.md`, or PDF documents up to 10 MiB. Resume continues expansion or retries a paused/failed ingestion job. Seeds and maximum tier cannot change after the first job; create a new project for a different experiment.
 
-The API stays on the server; frontend files stay local. Keep the default loopback binding. If the local frontend port changes, set `SCHAIN_CORS_ORIGINS` to its exact origin before starting the API.
+The API stays on the server; frontend files stay local. Keep the default loopback binding. For direct static connections only, changing the local frontend port requires matching `SCHAIN_CORS_ORIGINS` on the backend.
 
 ## Storage and limits
 
