@@ -877,6 +877,16 @@ def _inject_preview_helpers(document: str, base_url: str, target_text: str) -> s
 
 
 class QuietHandler(SimpleHTTPRequestHandler):
+    def translate_path(self, path):
+        shared = {
+            "/visualization/assets/js/explorer.js": "assets/js/explorer.js",
+            "/visualization/assets/css/styles.css": "assets/css/styles.css",
+        }
+        asset = shared.get(urllib.parse.urlsplit(path).path)
+        if asset:
+            return str(ROOT.parent.parent / "visualization" / asset)
+        return super().translate_path(path)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(ROOT), **kwargs)
 

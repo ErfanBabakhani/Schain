@@ -2,6 +2,8 @@
 
 Requires Python 3.10 or newer.
 
+Run from the repository checkout: the renderer and styles are shared with `visualization/`.
+
 ```bash
 python server.py --port 8080 --no-browser
 ```

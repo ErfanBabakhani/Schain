@@ -74,12 +74,17 @@ def validate_graph(data: Any) -> dict:
 def write_viewer(graph: dict, output: Path) -> Path:
     """Embed graph data safely: source text cannot close the JSON script element."""
     graph = validate_graph(graph)
-    assets = files("schain").joinpath("viewer_assets")
+    assets = files("visualization")
     payload = json.dumps(graph, ensure_ascii=False, allow_nan=False).replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
     html = assets.joinpath("index.html").read_text(encoding="utf-8")
     # Insert data last so strings in uploaded documents cannot become template code.
-    html = html.replace("/*__STYLE__*/", assets.joinpath("style.css").read_text(encoding="utf-8"))
-    html = html.replace("/*__SCRIPT__*/", assets.joinpath("app.js").read_text(encoding="utf-8"))
+    html = html.replace('data-mode="server"', 'data-mode="offline"')
+    for name in ("styles.css", "projects.css"):
+        html = html.replace(f'<link rel="stylesheet" href="assets/css/{name}" />',
+                            '<style>' + assets.joinpath(f"assets/css/{name}").read_text(encoding="utf-8") + '</style>')
+    html = html.replace('<script src="assets/js/explorer.js"></script>',
+                        '<script>' + assets.joinpath("assets/js/explorer.js").read_text(encoding="utf-8") + '</script>')
+    html = html.replace('<script src="assets/js/projects.js"></script>', '')
     html = html.replace("__GRAPH_DATA__", payload)
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)

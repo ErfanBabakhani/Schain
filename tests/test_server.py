@@ -319,9 +319,12 @@ def test_standalone_api_and_local_frontend(tmp_path):
     frontend = tmp_path / "frontend"
     build(frontend)
     assert (frontend / "index.html").is_file()
-    viewer = (frontend / "explorer.html").read_text(encoding="utf-8")
-    assert "__GRAPH_DATA__" not in viewer
-    assert "schain-graph" in viewer
+    page = (frontend / "index.html").read_text(encoding="utf-8")
+    assert 'data-mode="server"' in page
+    assert 'id="projectSelect"' in page
+    assert '<iframe' not in page
+    assert (frontend / "assets/js/explorer.js").is_file()
+    assert not (frontend / "explorer.html").exists()
 
 
 def test_additive_server_migration(tmp_path):
@@ -339,3 +342,32 @@ def test_additive_server_migration(tmp_path):
     with connect(path) as connection:
         assert connection.execute("SELECT MAX(version) FROM server_schema").fetchone()[0] == 2
         assert connection.execute("SELECT id FROM graph_nodes").fetchone()[0] == "legacy"
+
+
+def test_graph_pagination_includes_isolated_nodes_and_evidence(projects):
+    project_id = projects.create(settings())["id"]
+    bundle = {"nodes": [{"id": str(i)} for i in range(7)], "edges": [
+        {"id": "one", "source": "0", "target": "1", "relation": "suppliesTo",
+         "source_doc_ids": ["d"], "evidence": [{"doc_id": "d", "quote": "First witness"}]},
+        {"id": "two", "source": "1", "target": "2", "relation": "owns",
+         "source_doc_ids": ["d"], "evidence": [{"doc_id": "d", "quote": "Second witness"}]},
+    ], "documents": [{"doc_id": "d"}]}
+    with connect(projects.database(project_id)) as connection:
+        save_graph(connection, bundle)
+        offset = node_offset = 0
+        nodes, edges, documents, revisions = {}, {}, {}, set()
+        while True:
+            page = read_graph(connection, limit=1, offset=offset, node_limit=1, node_offset=node_offset)
+            validate_graph(page)
+            nodes.update((node["id"], node) for node in page["nodes"])
+            edges.update((edge["id"], edge) for edge in page["edges"])
+            documents.update((doc["doc_id"], doc) for doc in page["documents"])
+            revisions.add(page["revision"])
+            offset = page["pagination"]["next_edge_offset"]
+            node_offset = page["pagination"]["next_node_offset"]
+            if offset == 2 and node_offset == 7:
+                break
+        assert set(nodes) == {str(i) for i in range(7)}
+        assert list(edges.values()) == bundle["edges"]
+        assert list(documents.values()) == bundle["documents"]
+        assert len(revisions) == 1

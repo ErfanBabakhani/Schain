@@ -46,5 +46,5 @@ for i,(source,relation,target,quote) in enumerate(RELATIONS):
     documents.append({"doc_id":doc_id,"title":"Fictional interface fixture","text":quote})
 graph={"schema_version":"1.0","metadata":{"demo":True,"generated_at":"2026-09-08","description":"Entirely synthetic. No model calls. Not measured research results."},"nodes":nodes,"edges":edges,"documents":documents}
 path=ROOT/'examples/demo_graph.json';path.write_text(json.dumps(graph,indent=2)+'\n',encoding='utf-8')
-write_viewer(graph,ROOT/'examples/graph-explorer.html')
-print('Created examples/demo_graph.json and examples/graph-explorer.html (synthetic only)')
+write_viewer(graph,ROOT/'outputs/examples/graph-explorer.html')
+print('Created examples/demo_graph.json and outputs/examples/graph-explorer.html (synthetic only)')

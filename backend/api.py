@@ -3,6 +3,7 @@ import hmac
 import os
 import uuid
 from pathlib import Path
+from urllib.parse import unquote
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -78,9 +79,10 @@ def create_app(data_dir=None, token=None, config_path=None):
 
     @app.get("/projects/{project_id}/graph", dependencies=auth, response_model=GraphResponse)
     def graph(project_id: str, limit: int = Query(5000, ge=1, le=10000),
-              offset: int = Query(0, ge=0)):
+              offset: int = Query(0, ge=0), node_limit: int = Query(5000, ge=1, le=10000),
+              node_offset: int = Query(0, ge=0)):
         with connect(projects.database(project_id)) as connection:
-            return read_graph(connection, limit, offset)
+            return read_graph(connection, limit, offset, node_limit, node_offset)
 
     @app.get("/projects/{project_id}/documents", dependencies=auth, response_model=list[DocumentResponse])
     def documents(project_id: str, limit: int = Query(50, ge=1, le=200),
@@ -93,7 +95,11 @@ def create_app(data_dir=None, token=None, config_path=None):
 
     @app.post("/projects/{project_id}/documents", status_code=202, dependencies=auth, response_model=ProjectResponse)
     async def upload(project_id: str, request: Request, x_filename: str = Header()):
-        if len(x_filename) > 200 or "/" in x_filename or "\\" in x_filename:
+        try:
+            x_filename = unquote(x_filename, errors="strict")
+        except UnicodeError as error:
+            raise HTTPException(422, "Invalid filename encoding") from error
+        if len(x_filename) > 200 or "/" in x_filename or "\\" in x_filename or any(ord(char) < 32 for char in x_filename):
             raise HTTPException(422, "A plain filename is required")
         suffix = Path(x_filename).suffix.lower()
         if suffix not in (".txt", ".md", ".pdf"):

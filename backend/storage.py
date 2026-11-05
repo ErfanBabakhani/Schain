@@ -106,7 +106,7 @@ def save_graph(connection, bundle):
         connection.execute("INSERT OR REPLACE INTO graph_meta VALUES('revision',?)", (dumps(uuid.uuid4().hex),))
 
 
-def read_graph(connection, limit=5000, offset=0):
+def read_graph(connection, limit=5000, offset=0, node_limit=5000, node_offset=0):
     # A single read transaction keeps endpoints and evidence in the same generation.
     connection.execute("BEGIN")
     meta = {r[0]: json.loads(r[1]) for r in connection.execute("SELECT * FROM graph_meta")}
@@ -123,6 +123,9 @@ def read_graph(connection, limit=5000, offset=0):
     for edge in edges:
         edge["evidence"] = evidence[edge["id"]]
     ids = {e[key] for e in edges for key in ("source", "target")}
+    ids.update(row[0] for row in connection.execute(
+        "SELECT id FROM graph_nodes ORDER BY id LIMIT ? OFFSET ?", (node_limit, node_offset)
+    ))
     # json_each binds one parameter regardless of page size (older SQLite variable limits).
     nodes = [json.loads(r[0]) for r in connection.execute(
         "SELECT payload FROM graph_nodes WHERE id IN (SELECT value FROM json_each(?)) "
@@ -134,6 +137,11 @@ def read_graph(connection, limit=5000, offset=0):
         (dumps(sorted(doc_ids)),)
     )]
     total = connection.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
+    total_nodes = connection.execute("SELECT COUNT(*) FROM graph_nodes").fetchone()[0]
     connection.rollback()
     return {**meta, "nodes": nodes, "edges": edges, "documents": documents,
-            "pagination": {"offset": offset, "limit": limit, "total_edges": total}}
+            "pagination": {"offset": offset, "limit": limit, "total_edges": total,
+                           "node_offset": node_offset, "node_limit": node_limit,
+                           "total_nodes": total_nodes,
+                           "next_edge_offset": min(offset + limit, total),
+                           "next_node_offset": min(node_offset + node_limit, total_nodes)}}

@@ -1,5 +1,6 @@
 (() => {
   'use strict';
+  const demoMode = document.body.dataset.mode === 'demo';
   const ENTITY_COLORS = {
     Company: '#827cff',
     Product: '#55d2f2',
@@ -39,7 +40,7 @@
   const state = {
     datasets: new Map(),
     currentName: null,
-    data: null,
+    data: { nodes: [], edges: [], documents: [] },
     nodeMap: new Map(),
     docMap: new Map(),
     viewMode: 'tiered',
@@ -559,7 +560,20 @@
   function validateGraph(data) {
     if (!data || typeof data !== 'object') throw new Error('JSON root must be an object.');
     if (!Array.isArray(data.nodes) || !Array.isArray(data.edges)) throw new Error('Expected nodes[] and edges[] arrays.');
-    const ids = new Set(data.nodes.map(n => n.id)), bad = data.edges.filter(e => !ids.has(e.source) || !ids.has(e.target));
+    const ids = new Set();
+    for (const node of data.nodes) {
+      if (!node || typeof node.id !== 'string' || !node.id || ids.has(node.id)) throw Error('Node IDs must be unique non-empty strings.');
+      for (const key of ['name', 'type']) if (node[key] != null && typeof node[key] !== 'string') throw Error(`Node ${key} must be a string.`);
+      if (node.aliases != null && (!Array.isArray(node.aliases) || node.aliases.some(a => typeof a !== 'string'))) throw Error('Node aliases must be strings.');
+      if (node.discovery_tier != null && (!Number.isInteger(node.discovery_tier) || node.discovery_tier < 0)) throw Error('Invalid discovery tier.');
+      ids.add(node.id);
+    }
+    const edgeIds = new Set();
+    for (const edge of data.edges) {
+      if (!edge || typeof edge.id !== 'string' || !edge.id || edgeIds.has(edge.id)) throw Error('Edge IDs must be unique non-empty strings.');
+      edgeIds.add(edge.id);
+    }
+    const bad = data.edges.filter(e => !ids.has(e.source) || !ids.has(e.target));
     if (bad.length) throw new Error(`${bad.length} relationships reference missing entities.`);
     return true;
   }
@@ -621,10 +635,10 @@
   function selectionCount() {
     return state.selectedNodes.size + state.selectedEdges.size;
   }
-  function renderAll() {
+  function renderAll(fit = true) {
     renderHeader();
     renderGraphControls();
-    refreshGraph();
+    refreshGraph(fit);
     renderSelectionBar();
     renderSide();
   }
@@ -1042,7 +1056,7 @@
     return pos;
   }
 
-  function refreshGraph() {
+  function refreshGraph(fit = true) {
     if (!state.data) return;
     const g = getVisibleGraph(),
       focus = state.detailMode ? buildFocusGraph() : null,
@@ -1051,7 +1065,7 @@
     graphRenderer.setMode2D(state.dimension === '2d');
     graphRenderer.allLabels = state.labels || state.detailMode;
     graphRenderer.particles = state.dimension === '3d';
-    graphRenderer.setGraph(g.nodes, g.edges, computePositions(g), { tiered: state.viewMode === 'tiered', focusNodeIds: focusIds, focusEdgeIds: focusEdgeIds, contextMode: state.detailMode && state.showContext });
+    graphRenderer.setGraph(g.nodes, g.edges, computePositions(g), { fit, tiered: state.viewMode === 'tiered', focusNodeIds: focusIds, focusEdgeIds: focusEdgeIds, contextMode: state.detailMode && state.showContext });
     graphRenderer.setSelection(state.selectedNodes, state.selectedEdges);
     elementById('visibleNodeCount').textContent = formatCount(g.nodes.length);
     elementById('visibleEdgeCount').textContent = formatCount(g.edges.length);
@@ -1261,6 +1275,9 @@
   function renderEvidencePanel() {
     const root = elementById('sideContent'), rows = evidenceRows();
     root.innerHTML = rows.map((x, i) => evidenceCardHtml(x, i)).join('') || '<div class="side-empty">No evidence</div>';
+    root.querySelectorAll('[data-evidence-index]').forEach(button => {
+      button.onclick = () => { const item = rows[Number(button.dataset.evidenceIndex)]; openEvidenceModal(item.ev, item.doc); };
+    });
     hydrateSourceLinks(root);
   }
   function evidenceCardHtml(x, index) {
@@ -1275,8 +1292,10 @@
       href = url || '#';
     const headingMarkup = `<article class="evidence-card"><div class="fact-line"><b>${escapeHtml(s?.name || e.source)}</b><span class="arrow">→</span><span class="relation-pill" style="--c:${RELATION_COLORS[e.relation] || FALLBACK_COLOR}">${escapeHtml(getRelationLabel(e.relation))}</span><span class="arrow">→</span><b>${escapeHtml(t?.name || e.target)}</b></div>`;
     const quoteMarkup = `<div class="evidence-quote">“${escapeHtml(ev.quote || 'No quote stored')}”</div>`;
-    const metadataMarkup = `<div class="evidence-meta"><span class="source-pill">${escapeHtml(domain || ev.provider || 'source')}</span><span>${escapeHtml(getSourceTypeLabel(content))}</span>${x.score ? `<span class="score-badge">${escapeHtml(Math.round(x.score))}</span>` : ''}${url ? `<a class="evidence-source-link" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer" data-resolve-source="${escapeHtml(url)}">Source ↗</a>` : ''}</div></article>`;
-    return headingMarkup + quoteMarkup + metadataMarkup;
+    const grounding = ev.evidence_quote_grounded === false ? 'Quote did not match source' : ev.evidence_quote_grounded === true ? 'Source quote verified' : 'Quote grounding unknown';
+    const validation = ev.evidence_validated === true ? 'Model-checked' : ev.evidence_validated === false ? 'Not validated' : 'Validation unknown';
+    const metadataMarkup = `<div class="evidence-meta"><span class="source-pill">${escapeHtml(domain || ev.provider || 'source')}</span><span>${escapeHtml(getSourceTypeLabel(content))}</span><span>${grounding}</span><span>${validation}</span>${x.score ? `<span class="score-badge">${escapeHtml(Math.round(x.score))}</span>` : ''}${url ? `<a class="evidence-source-link" href="${escapeHtml(href)}" target="_blank" rel="noopener noreferrer" data-resolve-source="${escapeHtml(url)}">Source ↗</a>` : ''}</div></article>`;
+    return headingMarkup + quoteMarkup + `<button class="mini-action" data-evidence-index="${index}">Evidence context</button>` + metadataMarkup;
   }
   function renderSourcesPanel() {
     const root = elementById('sideContent'), q = state.panelSearch.trim().toLowerCase(), edges = getPanelEdges(), ids = new Set();
@@ -1290,7 +1309,7 @@
     if (q) docs = docs.filter(d => [d.title, d.publisher_name, d.source_domain, d.provider].join(' ').toLowerCase().includes(q));
     docs.sort((a, b) => Number(b.source_effective_score || 0) - Number(a.source_effective_score || 0));
     root.innerHTML = docs.map((d, i) => {
-      const url = d.canonical_source_url || d.source_url || d.retrieval_url || '',
+      const url = resolveEvidenceUrl(null, d),
         body = `<article class="source-row"><b>${escapeHtml(d.title || d.doc_id)}</b><span class="source-domain">${escapeHtml(d.publisher_name || d.source_domain || getDomainName(url))}</span><span>${escapeHtml(getSourceTypeLabel(d.content_source))}${Number(d.source_effective_score) ? ` · score ${escapeHtml(Math.round(Number(d.source_effective_score)))}` : ''}</span></article>`;
       return url ? `<a class="source-row-link" href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" data-resolve-source="${escapeHtml(url)}">${body}</a>` : body;
     }).join('') || '<div class="side-empty">No sources</div>';
@@ -1300,7 +1319,8 @@
   const resolvedSourceCache = new Map();
   let evidenceModalToken = 0;
   function resolveEvidenceUrl(ev, doc) {
-    return doc?.canonical_source_url || ev?.canonical_source_url || doc?.source_url || ev?.source_url || doc?.retrieval_url || ev?.retrieval_url || '';
+    const value = doc?.canonical_source_url || ev?.canonical_source_url || doc?.source_url || ev?.source_url || doc?.retrieval_url || ev?.retrieval_url || '';
+    try { const url = new URL(value); return ['http:', 'https:'].includes(url.protocol) ? url.href : ''; } catch { return ''; }
   }
   function isGoogleNewsUrl(url) {
     try {
@@ -1326,12 +1346,13 @@
   }
   function previewUrl(url, text) {
     const q = normalizeFragmentText(text);
-    if ((location.protocol === 'http:' || location.protocol === 'https:') && location.hostname) {
+    if (demoMode && (location.protocol === 'http:' || location.protocol === 'https:') && location.hostname) {
       return `/evidence-preview?url=${encodeURIComponent(url)}&text=${encodeURIComponent(q)}`;
     }
     return withTextFragment(url, q);
   }
   async function resolveSourceUrlRemote(url, ev, doc) {
+    if (!demoMode) return url;
     if (!url || !isGoogleNewsUrl(url)) return url;
     if (resolvedSourceCache.has(url)) return resolvedSourceCache.get(url);
     if (!((location.protocol === 'http:' || location.protocol === 'https:') && location.hostname)) return url;
@@ -1424,7 +1445,7 @@
       else elementById('evidenceContent').innerHTML = '<div class="content-error">No stored source text or source URL is available.</div>';
       return;
     }
-    if (!((location.protocol === 'http:' || location.protocol === 'https:') && location.hostname)) {
+    if (!demoMode || !((location.protocol === 'http:' || location.protocol === 'https:') && location.hostname)) {
       if (token !== evidenceModalToken) return;
       renderEvidenceContent(local || {
         ok: false,
@@ -1493,6 +1514,10 @@
     });
   }
   async function loadFiles(list) {
+    if (document.body.dataset.mode === 'server') {
+      toast('Offline import', 'Open a standalone JSON with python -m schain view. Server projects remain separate.');
+      return;
+    }
     const files = [...list].filter(f => f.name.toLowerCase().endsWith('.json'));
     if (!files.length) {
       toast('No JSON files');
@@ -1674,6 +1699,7 @@
     elementById('dropOverlay').classList.remove('show');
   }));
   window.addEventListener('keydown', e => {
+    if (document.querySelector('dialog[open]')) return;
     if (e.key === 'Escape' && !elementById('evidenceModal').hidden) {
       closeEvidenceModal();
       return;
@@ -1686,7 +1712,56 @@
     if (e.key.toLowerCase() === 'f') graphRenderer.fit();
   });
 
-  if (window.SCHAIN_DEMO_DATA) {
+  window.SChainExplorer = {
+    setGraph(data, { name = 'Supply chain graph', preserveView = false } = {}) {
+      validateGraph(data);
+      data = { ...data, nodes: data.nodes.map(n => ({ ...n, name: n.name || n.id, type: n.type || 'Unknown' })) };
+      const old = state.data;
+      if (!preserveView) {
+        state.datasets.clear();
+        const key = registerDataset(name, data, 'project');
+        closeEvidenceModal();
+        loadDataset(key);
+      } else {
+        state.data = data;
+        state.nodeMap = new Map(data.nodes.map(n => [n.id, n]));
+        state.docMap = new Map((data.documents || []).map(d => [d.doc_id, d]));
+        const edges = new Set(data.edges.map(e => e.id));
+        for (const key of ['selectedNodes', 'focusNodes']) state[key] = new Set([...state[key]].filter(id => state.nodeMap.has(id)));
+        for (const key of ['selectedEdges', 'focusEdges']) state[key] = new Set([...state[key]].filter(id => edges.has(id)));
+        for (const [key, values, previous] of [
+          ['entityFilters', data.nodes.map(n => n.type), old.nodes.map(n => n.type)],
+          ['relationFilters', data.edges.map(e => e.relation), old.edges.map(e => e.relation)],
+          ['tierFilters', data.nodes.filter(n => n.discovery_tier != null).map(n => String(n.discovery_tier)), old.nodes.filter(n => n.discovery_tier != null).map(n => String(n.discovery_tier))]
+        ]) for (const value of values) if (!previous.includes(value)) state[key].add(value);
+        if (!state.nodeMap.has(state.focalId)) state.focalId = data.nodes.find(n => n.is_seed)?.id || null;
+        if (!state.focusNodes.size && !state.focusEdges.size) state.detailMode = false;
+        state.datasets.set(state.currentName, { name: state.currentName, data, origin: 'project' });
+        renderAll(false);
+      }
+      elementById('datasetTitle').textContent = name;
+    },
+    clear(title = 'No project selected', description = '') {
+      this.setGraph({ nodes: [], edges: [], documents: [] }, { name: 'Project workspace' });
+      state.datasets.clear(); state.currentName = null; rebuildDatasetSelect();
+      this.setEmptyState(title, description);
+    },
+    setEmptyState(title, description = '', action = null) {
+      const root = elementById('graphEmptyState');
+      root.replaceChildren();
+      const heading = document.createElement('strong'); heading.textContent = title; root.append(heading);
+      const note = document.createElement('p'); note.textContent = description; root.append(note);
+      if (action) { const button = document.createElement('button'); button.className = 'primary-btn'; button.textContent = action.label; button.onclick = action.run; root.append(button); }
+      root.hidden = state.data.nodes.length > 0;
+    },
+    getViewState() { return { camera: { ...graphRenderer.camera }, selectedNodes: [...state.selectedNodes], selectedEdges: [...state.selectedEdges] }; }
+  };
+  const embedded = elementById('graphData')?.textContent.trim();
+  if (embedded?.startsWith('{')) {
+    try { const data = JSON.parse(embedded); window.SChainExplorer.setGraph(data, { name: data.metadata?.demo ? 'Synthetic offline demo' : 'Offline graph' }); }
+    catch (error) { toast('Cannot open graph', error.message); }
+  } else window.SChainExplorer.clear('No graph loaded');
+  if (demoMode && window.SCHAIN_DEMO_DATA) {
     try {
       const name = registerDataset(window.SCHAIN_DEMO_NAME || 'SChain graph.json', window.SCHAIN_DEMO_DATA, 'demo');
       loadDataset(name);
@@ -1695,5 +1770,5 @@
       toast('Could not load graph', err.message);
     }
   }
-  if (location.protocol === 'http:' || location.protocol === 'https:') loadLocalCatalog();
+  if (demoMode && (location.protocol === 'http:' || location.protocol === 'https:')) loadLocalCatalog();
 })();

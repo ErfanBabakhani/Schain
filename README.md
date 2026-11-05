@@ -49,7 +49,11 @@ Open an SSH tunnel in another local terminal:
 ssh -N -L 8001:127.0.0.1:8001 your-account@server
 ```
 
-Open **http://127.0.0.1:8080**, connect to **http://127.0.0.1:8001**, and enter the token. The two generated HTML files can also be copied to another computer and served with Python. Direct `file://` access is unsupported.
+Open **http://127.0.0.1:8080**, select Connect, and enter the API token. The address defaults to **http://127.0.0.1:8001**. Copy the entire generated directory, including `assets/`, if using another computer. It needs only a static server after building. Direct `file://` access is unsupported.
+
+The server interface is the dark Graph Explorer with a project selector and New Project action. It starts empty and never loads demo datasets. `visualization/` owns the shared renderer; the standalone demo and `python -m schain view` also use it. Offline JSON import stays separate from authenticated server projects.
+
+If another interface appears, check the absolute directory printed by the build command and restart the local static server with that exact `--directory`. Old servers can keep port 8080 occupied. On Linux/macOS use `lsof -nP -iTCP:8080 -sTCP:LISTEN`; on Windows use `Get-NetTCPConnection -LocalPort 8080 -State Listen`, then `Get-Process -Id <OwningProcess>`. Stop only the identified old static server, or choose port 8081 and set backend `SCHAIN_CORS_ORIGINS=http://127.0.0.1:8081`. Rebuild and hard-refresh the page; generated asset URLs carry a content revision to avoid stale JavaScript and CSS.
 
 Create a project, set its seeds and limits, then select Start. Pause and wait for `paused` before changing settings or uploading UTF-8 `.txt`, `.md`, or PDF documents up to 10 MiB. Resume continues expansion or retries a paused/failed ingestion job. Seeds and maximum tier cannot change after the first job; create a new project for a different experiment.
 
@@ -59,7 +63,27 @@ The API stays on the server; frontend files stay local. Keep the default loopbac
 
 Each project has its own SQLite database, documents, extraction checkpoints and run history. SQLite stores accepted facts, nodes, edges and evidence; Parquet files remain compatible with the research workflow and can be repaired from accepted checkpoints.
 
-Budget exhaustion pauses the run. An exhausted frontier completes without further searches. The frontend shows up to 5,000 edges; the graph API supports pagination. Graph publication currently rebuilds the semantic bundle after each document. Real model accuracy and deployment-specific resource limits must be checked on the target server.
+Budget exhaustion pauses the run. An exhausted frontier completes without further searches. The frontend loads all graph pages, including isolated nodes, and checks revisions between pages before replacing the displayed graph. Status polls do not download an unchanged graph. Graph publication currently rebuilds the semantic bundle after each document. Large graph layouts and real model accuracy need validation on the target workload.
+
+## Updating an existing server
+
+After the changes have been reviewed, committed and pushed, use the existing checkout:
+
+```bash
+git switch server_section
+git pull --ff-only origin server_section
+. .venv/bin/activate
+python -m pip install -e '.[server]'
+```
+
+Pause active projects and wait for `paused` before restarting the worker. Restart the API and worker through their existing service manager or scheduler with the same private environment and `SCHAIN_DATA_DIR`. For foreground processes, stop the API with Ctrl+C, send SIGTERM/Ctrl+C to the worker, wait for exit, then rerun the two commands in the Server section. If user systemd units are already named `schain-api` and `schain-worker`, use:
+
+```bash
+systemctl --user restart schain-api.service schain-worker.service
+systemctl --user status schain-api.service schain-worker.service
+```
+
+Use your actual unit/job names if different. Keep the existing token, uploads, model files and runtime directory. This frontend update requires no SQLite schema migration; existing projects remain compatible. Rebuild the local frontend from the matching updated checkout.
 
 For backup, pause projects, stop the worker and API, and copy the entire runtime directory. Restore with both services stopped. Do not run the CLI against an active server project's files.
 
@@ -77,6 +101,8 @@ python -m schain view --input outputs/supply_chain_graph.v1.json --output output
 python -m pip install -e '.[server,dev]'
 python -m pytest tests -q
 ```
+
+Browser tests: install `.[server,dev,browser]` and run `python -m pytest tests/test_frontend.py -q`. They use installed Edge on Windows or Playwright Chromium elsewhere; `SCHAIN_BROWSER_EXECUTABLE` can select an existing Chromium-compatible executable. Tests skip explicitly if browser tooling is unavailable.
 
 Shell deployment tests require Linux. Model, Neo4j and PostgreSQL integration tests require their respective services; ordinary unit tests use fixtures.
 
