@@ -2,6 +2,7 @@
 import logging
 import threading
 from dataclasses import replace
+from pathlib import Path
 
 import httpx
 import pytest
@@ -195,6 +196,44 @@ def test_port_conflict_fails_instead_of_sharing_listener(proxy):
         DevServer(Settings(server.settings.api_url, TOKEN, port=server.server_port), server.directory)
 
 
+def test_running_server_cannot_be_replaced_by_a_demo_build(proxy):
+    server, client, _, _ = proxy
+    original = client.get("/").content
+    script = client.get("/assets/js/projects.js").content
+    assert client.get("/index.html").content == original
+    (server.directory / "index.html").write_bytes(Path("demo/SChain_Graph_Explorer/index.html").read_bytes())
+    (server.directory / "assets/js/projects.js").write_text("window.SCHAIN_DEMO_DATA = {nodes:[],edges:[]};")
+    assert client.get("/").content == original
+    assert client.get("/index.html").content == original
+    assert client.get("/assets/js/projects.js").content == script
+
+
+def test_build_identity_headers_and_explicit_entry_point(proxy):
+    server, client, _, _ = proxy
+    root, index = client.get("/"), client.get(server.entry_url)
+    assert root.content == index.content
+    assert root.headers["cache-control"] == "no-store"
+    assert root.headers["x-schain-frontend"] == "projects-" + server.frontend_build
+    assert root.headers["x-schain-mode"] == "server"
+    config = client.get("/schain-dev-config").json()
+    assert config["frontend_build"] == server.frontend_build
+    assert config["application"] == "schain-projects"
+    assert server.entry_url.endswith(config["entry_point"])
+    assert client.get("/assets/js/projects.js?v=obsolete").status_code == 409
+    assert client.get("/index.html?build=obsolete").status_code == 409
+
+
+def test_listener_diagnostics_do_not_echo_untrusted_metadata():
+    def existing(request):
+        assert "authorization" not in request.headers
+        return httpx.Response(200, json={"mode": "local-proxy", "frontend_build": "abcdef123456", "csrf_token": TOKEN})
+    assert "abcdef123456" in dev_frontend.describe_listener(8080, transport=httpx.MockTransport(existing))
+    def unrelated(request):
+        return httpx.Response(200, json={"mode": "other", "detail": TOKEN})
+    message = dev_frontend.describe_listener(8080, transport=httpx.MockTransport(unrelated))
+    assert "Another listener" in message and TOKEN not in message
+
+
 @pytest.fixture
 def dev_workspace(tmp_path_factory, browser):
     pytest.importorskip("fastapi")
@@ -229,7 +268,9 @@ def dev_workspace(tmp_path_factory, browser):
 
 def test_browser_auto_connect_empty_create_reconnect_and_existing_projects(dev_workspace):
     server, page, client, state = dev_workspace
-    page.goto(server.origin)
+    response = page.goto(server.origin)
+    assert response.body() == server.assets["index.html"]
+    assert response.headers["x-schain-frontend"] == "projects-" + server.frontend_build
     page.wait_for_function("!document.getElementById('newProject').disabled")
     assert not page.locator("#connectionDialog").is_visible()
     assert "No projects yet" in page.locator("#graphEmptyState").inner_text()
@@ -254,6 +295,42 @@ def test_browser_auto_connect_empty_create_reconnect_and_existing_projects(dev_w
         assert "authorization" not in request.headers
         assert request.url.startswith(server.origin + "/")
     assert TOKEN not in page.content()
+
+
+def test_browser_with_old_http_and_cache_storage_opens_canonical_entry(dev_workspace, monkeypatch):
+    server, page, _, state = dev_workspace
+    original = dev_frontend.Handler.do_GET
+    legacy_mode = {"enabled": True}
+    demo = Path("demo/SChain_Graph_Explorer/index.html").read_bytes()
+
+    def legacy_page(handler):
+        if handler.server is server and handler.path == "/" and legacy_mode["enabled"]:
+            handler.send_response(200)
+            handler.send_header("Content-Type", "text/html; charset=utf-8")
+            handler.send_header("Cache-Control", "public, max-age=31536000")
+            handler.send_header("Content-Length", str(len(demo)))
+            handler.end_headers()
+            handler.wfile.write(demo)
+        else:
+            original(handler)
+
+    monkeypatch.setattr(dev_frontend.Handler, "do_GET", legacy_page)
+    page.goto(server.origin)
+    assert page.locator("body").get_attribute("data-mode") == "demo"
+    assert page.locator("#newProject").count() == 0
+    page.evaluate("""async html => { const cache = await caches.open('previous-demo'); await cache.put('/', new Response(html, {headers:{'Content-Type':'text/html'}})); }""", demo.decode("utf-8"))
+    legacy_mode["enabled"] = False
+    request_count = len(state["requests"])
+    response = page.goto(server.entry_url)
+    assert response.body() == server.assets["index.html"]
+    page.wait_for_function("!document.getElementById('newProject').disabled")
+    assert page.locator("body").get_attribute("data-mode") == "server"
+    assert page.locator("#visibleNodeCount").inner_text() == "0"
+    assert "No projects yet" in page.locator("#graphEmptyState").inner_text()
+    assert not any("demo-data" in request.url or "/data/catalog" in request.url for request in state["requests"][request_count:])
+    page.reload()
+    page.wait_for_function("!document.getElementById('newProject').disabled")
+    assert page.locator("body").get_attribute("data-mode") == "server"
 
 
 def test_browser_unavailable_tunnel_has_backoff_and_recovers(dev_workspace):
@@ -306,6 +383,7 @@ def test_command_reports_occupied_port_before_connecting(tmp_path, monkeypatch, 
     def unavailable(*args, **kwargs):
         raise OSError(TOKEN)
     monkeypatch.setattr(dev_frontend, "DevServer", unavailable)
+    monkeypatch.setattr(dev_frontend, "describe_listener", lambda port: "Existing fixture server; no process was terminated.")
     with pytest.raises(SystemExit) as error:
         dev_frontend.main(["--env", str(env), "--no-browser"])
     assert error.value.code == 2

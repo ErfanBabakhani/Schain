@@ -28,6 +28,20 @@ def test_build_uses_shared_dark_renderer_and_replaces_only_owned_artifact(tmp_pa
     assert not (tmp_path / "assets/js/demo-data.js").exists()
 
 
+def test_unchanged_build_preserves_files_and_repairs_only_changed_output(tmp_path):
+    build(tmp_path)
+    paths = [tmp_path / "index.html", tmp_path / "assets/js/explorer.js", tmp_path / "assets/js/projects.js"]
+    for path in paths:
+        os.utime(path, ns=(1000000000, 1000000000))
+    before = {path: path.stat().st_mtime_ns for path in paths}
+    build(tmp_path)
+    assert {path: path.stat().st_mtime_ns for path in paths} == before
+    paths[0].write_text('<body data-mode="demo">wrong frontend</body>')
+    build(tmp_path)
+    assert 'data-mode="server"' in paths[0].read_text(encoding="utf-8")
+    assert paths[1].stat().st_mtime_ns == before[paths[1]]
+
+
 @pytest.fixture(scope="module")
 def browser():
     playwright = pytest.importorskip("playwright.sync_api")

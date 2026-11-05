@@ -1,10 +1,32 @@
 """Build the local server-connected Graph Explorer."""
 import argparse
 import hashlib
-import shutil
 import socket
 from importlib.resources import files
 from pathlib import Path
+
+ASSET_FILES = (
+    "assets/css/styles.css", "assets/css/projects.css",
+    "assets/js/explorer.js", "assets/js/projects.js",
+)
+
+
+def render_frontend():
+    source = files("visualization")
+    html = source.joinpath("index.html").read_text(encoding="utf-8")
+    if 'data-mode="server"' not in html or 'id="projectSelect"' not in html or 'demo-data.js' in html:
+        raise ValueError("Frontend template must be the server project workspace")
+    assets = {name: source.joinpath(name).read_bytes() for name in ASSET_FILES}
+    digest = hashlib.sha256(html.encode("utf-8"))
+    for name, content in assets.items():
+        digest.update(name.encode("ascii") + b"\0" + content)
+    revision = digest.hexdigest()[:12]
+    html = html.replace("__GRAPH_DATA__", '{"nodes":[],"edges":[]}')
+    for name in assets:
+        html = html.replace(f'"{name}"', f'"{name}?v={revision}"')
+    html = html.replace('<title>', f'<meta name="schain-frontend" content="projects-{revision}">\n  <title>', 1)
+    return revision, {"index.html": html.encode("utf-8"), **assets}
+
 
 def build(output):
     output = Path(output).resolve()
@@ -12,17 +34,14 @@ def build(output):
     if output == source or output in source.parents or source in output.parents:
         raise ValueError("Build output must be separate from visualization source")
     output.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source / "assets", output / "assets", dirs_exist_ok=True)
-    html = (source / "index.html").read_text(encoding="utf-8")
-    content = html + ''.join(p.read_text(encoding="utf-8") for p in sorted((source / "assets").rglob("*")) if p.is_file())
-    revision = hashlib.sha256(content.encode()).hexdigest()[:12]
-    html = html.replace("__GRAPH_DATA__", '{"nodes":[],"edges":[]}')
-    for asset in (source / "assets").rglob("*"):
-        if asset.is_file():
-            relative = asset.relative_to(source).as_posix()
-            html = html.replace(f'"{relative}"', f'"{relative}?v={revision}"')
-    html = html.replace('<title>', f'<meta name="schain-frontend" content="projects-{revision}">\n  <title>', 1)
-    (output / "index.html").write_text(html, encoding="utf-8")
+    _, assets = render_frontend()
+    for name, content in assets.items():
+        target = output / name
+        if not target.resolve().is_relative_to(output):
+            raise ValueError("Build assets must stay inside the output directory")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if not target.is_file() or target.read_bytes() != content:
+            target.write_bytes(content)
     legacy = output / "explorer.html"
     if legacy.is_file() and 'Evidence explorer</title>' in legacy.read_text(encoding="utf-8")[:1000]:
         legacy.unlink()

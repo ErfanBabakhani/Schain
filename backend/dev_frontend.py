@@ -17,14 +17,11 @@ from urllib.parse import parse_qsl, urlencode, urlsplit
 import httpx
 from dotenv import dotenv_values
 
-from .frontend import build
+from .frontend import ASSET_FILES, build, render_frontend
 
 logger = logging.getLogger(__name__)
 ROOT = Path(__file__).resolve().parent.parent
-STATIC_FILES = frozenset({
-    "index.html", "assets/css/styles.css", "assets/css/projects.css",
-    "assets/js/explorer.js", "assets/js/projects.js",
-})
+STATIC_FILES = frozenset({"index.html", *ASSET_FILES})
 PROJECT = r"/projects/[0-9a-f]{32}"
 ROUTES = (
     (r"/health", {"GET"}), (r"/projects", {"GET", "POST"}),
@@ -137,10 +134,16 @@ class DevServer(ThreadingHTTPServer):
     def __init__(self, settings: Settings, directory: Path, *, transport=None):
         self.settings = settings
         self.directory = directory.resolve()
+        self.frontend_build, self.assets = render_frontend()
+        for name, content in self.assets.items():
+            path = (self.directory / name).resolve()
+            if not path.is_relative_to(self.directory) or not path.is_file() or path.read_bytes() != content:
+                raise ConfigError("Frontend directory is not the canonical server build; rebuild it before startup")
         self.csrf = secrets.token_urlsafe(32)
         self.transport = transport
         super().__init__(("127.0.0.1", settings.port), Handler)
         self.origin = f"http://127.0.0.1:{self.server_port}"
+        self.entry_url = f"{self.origin}/index.html?build={self.frontend_build}"
 
     def forward(self, method, path, query="", body=None, headers=None):
         outgoing = {**(headers or {}), "Authorization": "Bearer " + self.settings.token, "Accept": "application/json"}
@@ -190,6 +193,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(content)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-SChain-Frontend", f"projects-{self.server.frontend_build}")
+        self.send_header("X-SChain-Mode", "server")
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.send_header("Referrer-Policy", "no-referrer")
@@ -218,7 +223,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         parsed = urlsplit(self.path)
         if self.command == "GET" and self.path == "/schain-dev-config":
-            self.reply(200, {"mode": "local-proxy", "api_prefix": "/api", "csrf_token": self.server.csrf})
+            self.reply(200, {"mode": "local-proxy", "application": "schain-projects",
+                             "frontend_build": self.server.frontend_build,
+                             "entry_point": "/index.html?build=" + self.server.frontend_build,
+                             "api_prefix": "/api", "csrf_token": self.server.csrf})
             return
         if parsed.path.startswith("/api/"):
             self.proxy()
@@ -230,12 +238,16 @@ class Handler(BaseHTTPRequestHandler):
         if name not in STATIC_FILES or parsed.path.startswith("//"):
             self.reply(404, {"detail": "Not found"})
             return
-        path = (self.server.directory / name).resolve()
-        if not path.is_relative_to(self.server.directory) or not path.is_file():
-            self.reply(404, {"detail": "Not found"})
+        try:
+            query = dict(parse_qsl(parsed.query, strict_parsing=True))
+        except ValueError:
+            self.reply(400, {"detail": "Invalid frontend query"})
+            return
+        if any(query.get(key, self.server.frontend_build) != self.server.frontend_build for key in ("v", "build")):
+            self.reply(409, {"detail": "Frontend build changed; reopen the entry URL printed by the development server"})
             return
         content_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
-        self.reply(200, path.read_bytes(), content_type)
+        self.reply(200, self.server.assets[name], content_type)
 
     def proxy(self):
         if not hmac.compare_digest(self.headers.get("X-SChain-CSRF", "").encode("utf-8"), self.server.csrf.encode("ascii")):
@@ -293,6 +305,20 @@ class Handler(BaseHTTPRequestHandler):
     do_PATCH = serve
 
 
+def describe_listener(port, *, transport=None):
+    try:
+        with httpx.Client(transport=transport, trust_env=False, follow_redirects=False, timeout=1) as client:
+            response = client.get(f"http://127.0.0.1:{port}/schain-dev-config")
+            data = response.json()
+        if response.status_code == 200 and data.get("mode") == "local-proxy":
+            revision = data.get("frontend_build")
+            label = revision if isinstance(revision, str) and re.fullmatch(r"[a-f0-9]{12}", revision) else "unversioned"
+            return f"An existing SChain development server is listening (build {label}); stop it in its original terminal before restarting."
+    except (httpx.HTTPError, ValueError, AttributeError):
+        pass
+    return "Another listener owns this port; inspect its process before stopping it. No process was terminated."
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--env", type=Path, default=Path(".env.local"))
@@ -311,10 +337,13 @@ def main(argv=None):
     try:
         server = DevServer(settings, directory)
     except OSError:
-        parser.error(f"Local port {settings.port} is unavailable; stop the identified old static server or change SCHAIN_FRONTEND_PORT")
+        parser.error(f"Local port {settings.port} is unavailable. {describe_listener(settings.port)}")
+    except ConfigError as error:
+        parser.error(str(error))
     with server:
         status, _ = server.forward("GET", "/projects")
-        print(f"Development frontend: {server.origin}")
+        print(f"Development frontend: {server.entry_url}")
+        print(f"Server mode | build {server.frontend_build} | assets {server.directory}")
         if status != 200:
             if status in (401, 403):
                 print("Backend authentication failed; check .env.local and restart the local frontend.")
@@ -324,7 +353,7 @@ def main(argv=None):
                 print(f"Check the tunnel managed by your SSH client using alias {settings.ssh_host}.")
             print("The local page remains available; use Reconnect after restoring the connection.")
         if not args.no_browser:
-            webbrowser.open(server.origin)
+            webbrowser.open(server.entry_url)
         try:
             server.serve_forever()
         except KeyboardInterrupt:

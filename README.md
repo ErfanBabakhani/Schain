@@ -38,7 +38,7 @@ Run both processes under an approved service manager or scheduler to survive SSH
 For local development, keep these settings in a private root-level `.env.local` (safe placeholders are in `.env.example`). Create it only if absent; do not overwrite an existing file:
 
 ```dotenv
-SCHAIN_API_URL=http://127.0.0.1:8001
+SCHAIN_API_URL=http://127.0.0.1:18001
 SCHAIN_API_TOKEN=replace-with-your-existing-backend-token
 SCHAIN_SSH_HOST=your-ssh-alias
 SCHAIN_FRONTEND_PORT=8080
@@ -47,14 +47,16 @@ SCHAIN_FRONTEND_PORT=8080
 In Windows PowerShell, establish your existing SSH tunnel in one terminal, then start the local frontend in another:
 
 ```powershell
-ssh -N -o ExitOnForwardFailure=yes -L 8001:127.0.0.1:8001 your-ssh-alias
+ssh -N -o ExitOnForwardFailure=yes -L 18001:127.0.0.1:8001 your-ssh-alias
 ```
 
 ```powershell
 python -m backend.dev_frontend --env .env.local
 ```
 
-The command builds the frontend, binds only to `127.0.0.1`, checks backend authentication and opens the browser. The page automatically loads projects through `/api`; Reconnect does not ask for credentials. Failed connections use bounded backoff. `--no-browser` leaves browser opening to you. Restart the command after editing `.env.local`. If the port is occupied, stop the identified old static server or change `SCHAIN_FRONTEND_PORT`.
+The command builds only changed frontend files, binds only to `127.0.0.1`, checks backend authentication and opens the explicit `/index.html?build=...` entry point. The page automatically loads projects through `/api`; Reconnect does not ask for credentials. Failed connections use bounded backoff. `--no-browser` leaves browser opening to you. Match `SCHAIN_API_URL` to the local SSH forwarding port; do not replace an existing token when changing ports. Restart the command after editing `.env.local`. If the port is occupied, the command identifies an existing SChain development server where possible; stop it in its original terminal or change `SCHAIN_FRONTEND_PORT`. It never terminates processes.
+
+Development responses use `Cache-Control: no-store` and identify their mode/build in `X-SChain-Mode`, `X-SChain-Frontend` and the HTML `schain-frontend` meta tag. `/` and `/index.html` serve the same verified, immutable startup snapshot. Rebuilding or replacing files on disk cannot switch a running server to the demo. Restart after source changes to load a new snapshot. The demo remains a separate entry point under `demo/SChain_Graph_Explorer/`.
 
 The Python process supplies the bearer token. The browser receives only a separate temporary anti-CSRF nonce. The local server checks Host/Origin, permits only the required API routes and methods, and serves only the generated frontend assets. It never starts SSH or reads SSH key files; the alias is just a reference for diagnostics. No backend update or CORS change is needed for this same-origin proxy, even if its local port changes.
 
