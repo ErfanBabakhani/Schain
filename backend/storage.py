@@ -61,7 +61,28 @@ def initialize(path):
                         connection.execute(statement)
                 connection.execute("INSERT INTO server_schema VALUES(2)")
                 version = 2
-            if version != 2:
+            if version == 2:
+                for statement in """
+                    ALTER TABLE runs ADD COLUMN input_name TEXT;
+                    CREATE TABLE live_documents(doc_id TEXT PRIMARY KEY, run_id TEXT NOT NULL,
+                        title TEXT, source_url TEXT, stage TEXT NOT NULL, updated_at TEXT NOT NULL);
+                    CREATE TABLE live_events(id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        run_id TEXT NOT NULL, doc_id TEXT, stage TEXT NOT NULL,
+                        payload TEXT NOT NULL, created_at TEXT NOT NULL);
+                    CREATE INDEX live_documents_run ON live_documents(run_id);
+                    CREATE INDEX live_documents_active ON live_documents(updated_at DESC)
+                        WHERE stage NOT IN ('resolved','failed','paused','completed','interrupted');
+                    CREATE TABLE live_nodes(id TEXT PRIMARY KEY, doc_id TEXT NOT NULL, payload TEXT NOT NULL);
+                    CREATE TABLE live_edges(id TEXT PRIMARY KEY, doc_id TEXT NOT NULL,
+                        source TEXT NOT NULL, target TEXT NOT NULL, payload TEXT NOT NULL);
+                    CREATE INDEX live_nodes_document ON live_nodes(doc_id);
+                    CREATE INDEX live_edges_document ON live_edges(doc_id);
+                    INSERT INTO server_schema VALUES(3);
+                """.split(";"):
+                    if statement.strip():
+                        connection.execute(statement)
+                version = 3
+            if version != 3:
                 raise ValueError(f"Unsupported server schema version: {version}")
     finally:
         connection.close()
@@ -79,10 +100,13 @@ def connect(path):
         connection.close()
 
 
-def save_graph(connection, bundle):
+def save_graph(connection, bundle, *, resolved_document=None):
     """Publish a complete graph generation atomically, retaining canonical payloads."""
     validate_graph(bundle)
     with connection:
+        if resolved_document:
+            connection.execute("DELETE FROM live_edges WHERE doc_id=?", (resolved_document,))
+            connection.execute("DELETE FROM live_nodes WHERE doc_id=?", (resolved_document,))
         for table in ("graph_evidence", "graph_edges", "graph_documents", "graph_nodes", "graph_meta"):
             connection.execute(f"DELETE FROM {table}")
         connection.executemany("INSERT INTO graph_nodes VALUES(?,?)", [
@@ -110,8 +134,15 @@ def read_graph(connection, limit=5000, offset=0, node_limit=5000, node_offset=0)
     # A single read transaction keeps endpoints and evidence in the same generation.
     connection.execute("BEGIN")
     meta = {r[0]: json.loads(r[1]) for r in connection.execute("SELECT * FROM graph_meta")}
+    tables = """WITH nodes AS (
+        SELECT id,payload FROM graph_nodes UNION ALL
+        SELECT id,payload FROM live_nodes WHERE id NOT IN (SELECT id FROM graph_nodes)
+    ), edges AS (
+        SELECT id,source,target,payload FROM graph_edges UNION ALL
+        SELECT id,source,target,payload FROM live_edges
+    ) """
     edges = [json.loads(r[0]) for r in connection.execute(
-        "SELECT payload FROM graph_edges ORDER BY id LIMIT ? OFFSET ?", (limit, offset)
+        tables + "SELECT payload FROM edges ORDER BY id LIMIT ? OFFSET ?", (limit, offset)
     )]
     evidence = {edge["id"]: [] for edge in edges}
     for row in connection.execute(
@@ -121,14 +152,14 @@ def read_graph(connection, limit=5000, offset=0, node_limit=5000, node_offset=0)
     ):
         evidence[row[0]].append(json.loads(row[1]))
     for edge in edges:
-        edge["evidence"] = evidence[edge["id"]]
+        edge["evidence"] = evidence[edge["id"]] or edge.get("evidence", [])
     ids = {e[key] for e in edges for key in ("source", "target")}
     ids.update(row[0] for row in connection.execute(
-        "SELECT id FROM graph_nodes ORDER BY id LIMIT ? OFFSET ?", (node_limit, node_offset)
+        tables + "SELECT id FROM nodes ORDER BY id LIMIT ? OFFSET ?", (node_limit, node_offset)
     ))
     # json_each binds one parameter regardless of page size (older SQLite variable limits).
     nodes = [json.loads(r[0]) for r in connection.execute(
-        "SELECT payload FROM graph_nodes WHERE id IN (SELECT value FROM json_each(?)) "
+        tables + "SELECT payload FROM nodes WHERE id IN (SELECT value FROM json_each(?)) "
         "OR (?=0 AND json_extract(payload,'$.is_seed')=1) ORDER BY id", (dumps(sorted(ids)), offset)
     )]
     doc_ids = {d for e in edges for d in e.get("source_doc_ids", [])}
@@ -136,8 +167,13 @@ def read_graph(connection, limit=5000, offset=0, node_limit=5000, node_offset=0)
         "SELECT payload FROM graph_documents WHERE id IN (SELECT value FROM json_each(?)) ORDER BY id",
         (dumps(sorted(doc_ids)),)
     )]
-    total = connection.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0]
-    total_nodes = connection.execute("SELECT COUNT(*) FROM graph_nodes").fetchone()[0]
+    existing_docs = {d["doc_id"] for d in documents}
+    documents.extend(dict(r) for r in connection.execute(
+        "SELECT doc_id,title,source_url FROM live_documents WHERE doc_id IN (SELECT value FROM json_each(?))",
+        (dumps(sorted(doc_ids - existing_docs)),)
+    ))
+    total = connection.execute(tables + "SELECT COUNT(*) FROM edges").fetchone()[0]
+    total_nodes = connection.execute(tables + "SELECT COUNT(*) FROM nodes").fetchone()[0]
     connection.rollback()
     return {**meta, "nodes": nodes, "edges": edges, "documents": documents,
             "pagination": {"offset": offset, "limit": limit, "total_edges": total,

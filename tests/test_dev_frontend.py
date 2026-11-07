@@ -86,6 +86,10 @@ def test_company_backend_prefix_is_fixed_configuration(tmp_path):
     (f"/api/projects/{PROJECT_ID}/graph?limit=0", "GET"),
     (f"/api/projects/{PROJECT_ID}/graph?limit=2&limit=3", "GET"),
     (f"/api/projects/{PROJECT_ID}/documents?offset=-1", "GET"),
+    (f"/api/projects/{PROJECT_ID}/activity?after=-1", "GET"),
+    (f"/api/projects/{PROJECT_ID}/activity?limit=201", "GET"),
+    (f"/api/projects/{PROJECT_ID}/activity?url=http://elsewhere", "GET"),
+    (f"/api/projects/{PROJECT_ID}/activity", "POST"),
     ("/api/openapi.json", "GET"), ("/api/projects", "DELETE"),
     (f"/api/projects/{PROJECT_ID}/start", "GET"),
 ])
@@ -295,6 +299,91 @@ def test_browser_auto_connect_empty_create_reconnect_and_existing_projects(dev_w
         assert "authorization" not in request.headers
         assert request.url.startswith(server.origin + "/")
     assert TOKEN not in page.content()
+
+
+def test_browser_live_provisional_graph_through_proxy(dev_workspace, stub_llm, monkeypatch):
+    from backend.projects import Projects
+    from backend.storage import connect
+    from backend.worker import Worker, worker_lock
+    from schain import pipeline
+    from tests.conftest import DOCUMENT_TEXT
+
+    server, page, client, state = dev_workspace
+    auth = {"Authorization": "Bearer " + TOKEN}
+    project = client.post("/projects", headers=auth, json={"name": "Live research", "seeds": ["BMW"]}).json()
+    project_id = project["id"]
+    projects = Projects(server.directory.parent / "runtime")
+    ready, release = threading.Event(), threading.Event()
+    failures = []
+    original = pipeline.validate_facts_frame
+
+    def gated_validation(*args, **kwargs):
+        ready.set()
+        if not release.wait(45):
+            raise TimeoutError("Browser did not release validation")
+        return original(*args, **kwargs)
+
+    def work():
+        try:
+            with worker_lock(projects.root):
+                Worker(projects, lambda config: stub_llm).tick()
+        except BaseException as error:
+            failures.append(error)
+
+    monkeypatch.setattr(pipeline, "validate_facts_frame", gated_validation)
+    page.add_init_script("""(() => {
+      const stroke = CanvasRenderingContext2D.prototype.stroke;
+      CanvasRenderingContext2D.prototype.stroke = function(...args) {
+        if (this.getLineDash().length && this.globalAlpha < 0.2) window.pendingStrokeSeen = true;
+        return stroke.apply(this, args);
+      };
+    })();""")
+    page.goto(server.entry_url)
+    page.wait_for_function("!document.getElementById('projectSelect').disabled")
+    page.locator("#projectSelect").select_option(project_id)
+    page.wait_for_function("document.getElementById('projectState').textContent === 'ready'")
+    page.locator("#manageProject").click()
+    page.locator("#documentInput").set_input_files({"name": "Supplier report.txt", "mimeType": "text/plain", "buffer": DOCUMENT_TEXT.encode()})
+    page.locator("#uploadDocument").click()
+    page.wait_for_function("document.getElementById('projectState').textContent === 'queued'")
+    page.locator("#projectDialog [data-close-dialog]").click()
+    worker = threading.Thread(target=work, daemon=True)
+    worker.start()
+    try:
+        assert ready.wait(15)
+        page.wait_for_function("document.getElementById('liveDocuments').textContent.includes('Validating relationships')")
+        assert "Supplier report.txt" in page.locator("#liveDocuments").inner_text()
+        page.wait_for_function("window.pendingStrokeSeen === true")
+        assert int(page.locator("#visibleEdgeCount").inner_text()) > 0
+        assert "Chunk extracted" in page.locator("#liveEvents").inner_text()
+        page.screenshot(path=str(server.directory.parent / "live-pending.png"))
+        graph = client.get(f"/projects/{project_id}/graph", headers=auth).json()
+        assert graph["edges"] and all(e["validation_status"] == "pending" for e in graph["edges"])
+        with connect(projects.database(project_id)) as connection:
+            assert connection.execute("SELECT COUNT(*) FROM accepted_facts").fetchone()[0] == 0
+        # A page refresh rebuilds live progress from SQLite, not just browser memory.
+        page.reload()
+        page.wait_for_function("!document.getElementById('projectSelect').disabled")
+        page.locator("#projectSelect").select_option(project_id)
+        page.wait_for_function("document.getElementById('liveDocuments').textContent.includes('Validating relationships')")
+        page.wait_for_function("window.pendingStrokeSeen === true")
+        camera = page.evaluate("SChainExplorer.getViewState()")
+    finally:
+        release.set()
+        worker.join(timeout=15)
+    assert not worker.is_alive() and not failures
+    page.wait_for_function("document.getElementById('projectState').textContent === 'completed'")
+    page.wait_for_function("document.getElementById('pendingCount').textContent === '0 pending relationships'")
+    assert "Validation completed" in page.locator("#liveEvents").inner_text()
+    assert "accepted" in page.locator("#liveEvents").inner_text()
+    assert "No documents being processed" in page.locator("#liveDocuments").inner_text()
+    assert page.evaluate("SChainExplorer.getViewState()") == camera
+    graph = client.get(f"/projects/{project_id}/graph", headers=auth).json()
+    assert graph["edges"] and all(e.get("validation_status") != "pending" for e in graph["edges"])
+    for request in state["requests"]:
+        assert "authorization" not in request.headers
+        assert TOKEN not in (request.post_data or "")
+    page.screenshot(path=str(server.directory.parent / "live-expansion.png"))
 
 
 def test_browser_with_old_http_and_cache_storage_opens_canonical_entry(dev_workspace, monkeypatch):

@@ -28,6 +28,7 @@ ROUTES = (
     (PROJECT, {"GET", "PUT"}),
     (PROJECT + r"/(start|pause|resume)", {"POST"}),
     (PROJECT + r"/documents", {"GET", "POST"}),
+    (PROJECT + r"/activity", {"GET"}),
     (PROJECT + r"/graph", {"GET"}),
 )
 MAX_UPLOAD = 10 * 1024 * 1024
@@ -109,6 +110,8 @@ def proxy_path(raw: str, method: str) -> tuple[str, str]:
         allowed = {"limit": 10000, "offset": 2**31 - 1, "node_limit": 10000, "node_offset": 2**31 - 1}
     elif method == "GET" and path.endswith("/documents"):
         allowed = {"limit": 200, "offset": 2**31 - 1}
+    elif method == "GET" and path.endswith("/activity"):
+        allowed = {"limit": 200, "after": 2**63 - 1}
     seen = set()
     for key, value in pairs:
         if key in seen or key not in allowed or not re.fullmatch(r"[0-9]{1,10}", value):

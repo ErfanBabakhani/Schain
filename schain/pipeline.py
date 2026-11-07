@@ -355,6 +355,7 @@ def process_document(
     document_index: Optional[int] = None,
     document_budget: Optional[int] = None,
     checkpoint_sink: Optional[Callable[[str, dict[str, Any], dict[str, Any]], None]] = None,
+    progress_sink: Optional[Callable[[str, dict[str, Any], dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
     """Run one document through the pipeline, resuming from wherever it stopped."""
     started = time.monotonic()
@@ -487,6 +488,10 @@ def process_document(
         ).fetchone()
         origin_name = origin_row["entity_name"] if origin_row else None
 
+    def progress(name, payload=None):
+        if progress_sink is not None:
+            progress_sink(name, document, payload or {})
+
     def advance_stage(name: str) -> None:
         nonlocal stage, stage_started
         now = time.monotonic()
@@ -494,9 +499,11 @@ def process_document(
         stage, stage_started = name, now
         if measured_llm is not None:
             measured_llm.stage = name
+        progress(name)
 
     try:
         document = _persist_document(document, config, is_new=is_new, status=status)
+        progress("retrieved")
         if checkpoint_sink is not None and status in (state.PENDING, state.PROCESSING, state.FAILED):
             checkpoint_sink("retrieved", document, {})
         # --- Prompt 1 ---
@@ -519,6 +526,7 @@ def process_document(
                                       .get("policy_file")),
                 integrity_failures=integrity_failures,
                 audit=audit,
+                progress_sink=progress if progress_sink is not None else None,
             )
             summary.update(extraction_metrics)
             save_extraction(
@@ -544,6 +552,9 @@ def process_document(
             advance_stage("resolution")
             if graph is None:
                 graph, chunk_index = load_extraction(config, doc_id)
+                if progress_sink is not None:
+                    progress("chunk_extracted", {"graph": graph.model_dump(), "cached": True})
+                    progress("resolution")
                 logger.info("doc %s: reusing stored Prompt 1 output", doc_id)
                 parsed_graph = graph
                 for chunk_id, index in chunk_index.items():
@@ -846,6 +857,7 @@ def process_document(
                         "rejected_facts": rejected.to_dict(orient="records"),
                     },
                 )
+            progress("resolved", {"accepted": len(accepted), "rejected": len(rejected)})
             audit.emit(
                 "validation_completed",
                 stage="validation",
@@ -946,6 +958,7 @@ def process_document(
         # before Prompt 1 completed is FAILED.
         keep = status if status in (state.EXTRACTED, state.RESOLVED) else state.FAILED
         state.set_document_status(connection, doc_id, keep, error=str(error))
+        progress("failed", {"error": str(error)[:1000]})
         logger.error("doc %s failed after %s (kept as %s): %s", doc_id, status, keep, error)
         summary.update(status=keep, error=str(error))
         # Keep the live object attached: the finally block below adds extraction,

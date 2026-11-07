@@ -33,6 +33,8 @@
     clearTimeout(timer);
     current?.controller.abort(); current = null;
     $('projectActivity').hidden = true;
+    $('liveActivity').hidden = true;
+    $('liveDocuments').replaceChildren(); $('liveEvents').replaceChildren();
     $('projectSummary').textContent = 'Select a project to inspect its graph.';
     $('projectDialog').close();
   }
@@ -107,16 +109,55 @@
     const element = document.createElement('div'); element.className = 'activity-row';
     const heading = document.createElement('strong'); heading.textContent = title;
     const note = document.createElement('span'); note.textContent = detail;
-    element.append(heading, note); root.append(element);
+    element.append(heading, note); root.append(element); return element;
   }
   function renderActivity(context) {
     $('documentList').replaceChildren(); $('runList').replaceChildren();
-    for (const doc of context.documents) row($('documentList'), `${doc.doc_id} · ${doc.status}`, doc.error || doc.source_url || doc.created_at);
+    for (const doc of context.documents) row($('documentList'), `${doc.title || doc.doc_id} · ${doc.status}${doc.stage ? ' · ' + (stageLabels[doc.stage] || doc.stage) : ''}`, [doc.error, doc.source_url, doc.origin_entity, doc.updated_at].filter(Boolean).join(' · '));
     if (!context.documents.length) $('documentList').textContent = 'No processed documents yet.';
     for (const run of context.project.runs) row($('runList'), `${run.kind} · ${run.status}`, [run.created_at, run.error, run.summary?.stop_reason].filter(Boolean).join(' · '));
     for (const error of context.project.errors) row($('runList'), error.doc_id || error.entity_key, error.error);
     if (!context.project.runs.length) $('runList').textContent = 'No runs yet.';
     $('moreDocuments').hidden = context.documentLimit >= 200 || context.documents.length < context.documentLimit;
+  }
+  const stageLabels = {
+    retrieved: 'Document received', extraction: 'Extracting relationships', resolution: 'Resolving entities',
+    validation: 'Validating relationships', facts_persistence: 'Saving validated facts',
+    resolved: 'Validation completed', commit: 'Graph commit', failed: 'Document failed', chunk_started: 'Processing chunk',
+    chunk_extracted: 'Chunk extracted', run_running: 'Run started', run_completed: 'Run completed',
+    run_paused: 'Run paused', run_failed: 'Run failed', run_interrupted: 'Worker interrupted'
+  };
+  function showLive(context, activity) {
+    context.cursor = activity.cursor; context.moreActivity = activity.has_more;
+    $('liveActivity').hidden = false;
+    $('liveStatus').textContent = `${activeStates.has(context.project.status) ? 'Live' : 'Up to date'} · ${new Date().toLocaleTimeString()}`;
+    $('pendingCount').textContent = `${activity.pending_relationships} pending relationships`;
+    const activeSignature = JSON.stringify([activity.active_documents, activity.entities]);
+    if (context.activeSignature !== activeSignature) {
+      context.activeSignature = activeSignature; $('liveDocuments').replaceChildren();
+      for (const doc of activity.active_documents) row($('liveDocuments'), doc.title || doc.doc_id, `${stageLabels[doc.stage] || doc.stage} · ${doc.source_url || doc.doc_id}`);
+      if (!activity.active_documents.length) {
+        for (const entity of activity.entities) row($('liveDocuments'), entity.entity_name, `Expanding Tier ${entity.tier} · retrieving or processing documents`);
+        if (!activity.entities.length) $('liveDocuments').textContent = activeStates.has(context.project.status) ? 'Waiting for the next document or worker update.' : 'No documents being processed.';
+      }
+    }
+    if (activity.events.length) {
+      const events = new Map(context.events.map(event => [event.id, event]));
+      const root = $('liveEvents'), previousHeight = root.scrollHeight, previousScroll = root.scrollTop;
+      if (!context.events.length) root.replaceChildren();
+      for (const event of activity.events) {
+        if (events.has(event.id)) continue;
+        events.set(event.id, event);
+        const p = event.payload;
+        const details = [p.title, Number.isInteger(p.chunk_index) ? `chunk ${p.chunk_index + 1}${p.chunk_total ? '/' + p.chunk_total : ''}` : '',
+          p.relationships != null ? `${p.relationships} extracted relationships` : '',
+          p.accepted != null ? `${p.accepted} accepted, ${p.rejected} rejected` : '', p.cached ? 'cached' : '', p.error].filter(Boolean);
+        root.prepend(row(root, `${new Date(event.created_at).toLocaleTimeString()} · ${stageLabels[event.stage] || event.stage}`, details.join(' · ')));
+      }
+      while (root.children.length > 100) root.lastElementChild.remove();
+      if (previousScroll > 0) root.scrollTop = previousScroll + root.scrollHeight - previousHeight;
+      context.events = [...events.values()].slice(-100);
+    } else if (!context.events.length) $('liveEvents').textContent = 'No activity recorded yet.';
   }
   function populateProjects() {
     $('projectSelect').replaceChildren(new Option('Select a project', ''));
@@ -153,9 +194,10 @@
     if (!context || context !== current || context.polling) return;
     clearTimeout(timer); context.polling = true;
     try {
-      const [project, documents] = await Promise.all([
+      const [project, documents, activity] = await Promise.all([
         api(projectPath(context), {}, context.controller.signal),
-        api(`${projectPath(context)}/documents?limit=${context.documentLimit}`, {}, context.controller.signal)
+        api(`${projectPath(context)}/documents?limit=${context.documentLimit}`, {}, context.controller.signal),
+        api(`${projectPath(context)}/activity?limit=100${context.cursor == null ? '' : '&after=' + context.cursor}`, {}, context.controller.signal)
       ]);
       if (context !== current) return;
       context.project = project; context.documents = documents; showProject(context);
@@ -164,19 +206,26 @@
         if (!graph || context !== current) return;
         explorer.setGraph(graph, { name: project.name, preserveView: !!context.revision });
         context.revision = graph.revision;
-        explorer.setEmptyState('No graph entities yet', 'The graph will appear after initialized seeds or accepted document facts are published.');
+        explorer.setEmptyState('No graph entities yet', 'The graph will appear as seeds and extracted relationships are published.');
       }
+      showLive(context, activity);
       message('');
       context.failures = 0;
-    } catch (error) { context.failures = (context.failures || 0) + 1; handleError(error, context); }
-    finally { context.polling = false; if (context === current) timer = setTimeout(() => poll(context), Math.min(30000, 4000 * 2 ** (context.failures || 0))); }
+    } catch (error) { context.failures = (context.failures || 0) + 1; $('liveStatus').textContent = 'Updates interrupted; retrying'; handleError(error, context); }
+    finally {
+      context.polling = false;
+      if (context === current) {
+        const interval = document.hidden ? 15000 : context.moreActivity ? 100 : activeStates.has(context.project.status) ? 1000 : 5000;
+        timer = setTimeout(() => poll(context), Math.min(30000, interval * 2 ** Math.min(context.failures || 0, 5)));
+      }
+    }
   }
   function selectProject(id) {
     abortProject(); message('');
     explorer.clear(id ? 'Loading project…' : 'Select a project', id ? 'Reading the latest committed graph from SQLite.' : 'Choose a server project from the selector.');
     const project = session.projects.find(p => p.id === id);
     if (project) {
-      current = { id, project, controller: new AbortController(), documents: [], documentLimit: 50, revision: '', polling: false, busy: false };
+      current = { id, project, controller: new AbortController(), documents: [], documentLimit: 50, revision: '', polling: false, busy: false, cursor: null, events: [] };
       showProject(current); poll(current);
     } else { $('projectState').textContent = session.connected ? 'Connected' : 'Disconnected'; updateControls(); populateProjects(); }
   }
@@ -284,6 +333,7 @@
     finally { context.busy = false; if (context === current) updateControls(); }
   };
   $('moreDocuments').onclick = () => { if (current) { current.documentLimit = Math.min(200, current.documentLimit + 50); poll(current); } };
+  document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
   $('openJsonBtn').disabled = true;
   $('openJsonBtn').title = 'Use python -m schain view for a separate offline graph';
   disconnected();

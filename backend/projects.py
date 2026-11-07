@@ -150,15 +150,15 @@ class Projects:
                     save_graph(connection, build_graph_bundle(config))
         return self.detail(project_id)
 
-    def submit(self, project_id, kind="expand", input_path=None):
+    def submit(self, project_id, kind="expand", input_path=None, input_name=None):
         with connect(self.database(project_id)) as connection:
             with connection:
                 connection.execute("BEGIN IMMEDIATE")
                 self.require_idle(connection)
                 run_id = uuid.uuid4().hex
                 connection.execute(
-                    "INSERT INTO runs(id,kind,status,input_path,created_at) VALUES(?,?,'queued',?,?)",
-                    (run_id, kind, str(input_path) if input_path else None, _now())
+                    "INSERT INTO runs(id,kind,status,input_path,created_at,input_name) VALUES(?,?,'queued',?,?,?)",
+                    (run_id, kind, str(input_path) if input_path else None, _now(), input_name)
                 )
         return self.detail(project_id)
 
@@ -173,5 +173,5 @@ class Projects:
         with connect(self.database(project_id)) as connection:
             last = connection.execute("SELECT * FROM runs ORDER BY rowid DESC LIMIT 1").fetchone()
         if last and last["kind"] == "ingest" and last["status"] in ("failed", "paused"):
-            return self.submit(project_id, "ingest", last["input_path"])
+            return self.submit(project_id, "ingest", last["input_path"], last["input_name"])
         return self.submit(project_id)

@@ -12,6 +12,7 @@ from fastapi.responses import JSONResponse
 from .models import DocumentResponse, GraphResponse, ProjectResponse, ProjectSettings
 from .projects import Conflict, ProjectNotFound, Projects
 from .storage import connect, read_graph
+from .activity import read_activity
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 
@@ -89,9 +90,18 @@ def create_app(data_dir=None, token=None, config_path=None):
                   offset: int = Query(0, ge=0)):
         with connect(projects.database(project_id)) as connection:
             return [dict(row) for row in connection.execute(
-                "SELECT doc_id,source_url,status,error,created_at FROM documents "
-                "ORDER BY created_at DESC LIMIT ? OFFSET ?", (limit, offset)
+                "SELECT d.doc_id,d.source_url,d.status,d.error,d.created_at,d.updated_at,"
+                "d.origin_entity,d.tier,l.title,l.stage,l.run_id FROM documents d "
+                "LEFT JOIN live_documents l ON l.doc_id=d.doc_id "
+                "ORDER BY CASE WHEN d.status IN ('PROCESSING','EXTRACTED') AND d.error IS NULL "
+                "THEN 0 ELSE 1 END,d.updated_at DESC,d.doc_id LIMIT ? OFFSET ?", (limit, offset)
             )]
+
+    @app.get("/projects/{project_id}/activity", dependencies=auth)
+    def activity(project_id: str, after: int | None = Query(None, ge=0, le=2**63 - 1),
+                 limit: int = Query(100, ge=1, le=200)):
+        with connect(projects.database(project_id)) as connection:
+            return read_activity(connection, after, limit)
 
     @app.post("/projects/{project_id}/documents", status_code=202, dependencies=auth, response_model=ProjectResponse)
     async def upload(project_id: str, request: Request, x_filename: str = Header()):
@@ -128,7 +138,7 @@ def create_app(data_dir=None, token=None, config_path=None):
                     raise HTTPException(422, "Document must be UTF-8") from error
                 if not content.strip() or "\x00" in content:
                     raise HTTPException(422, "Document must contain text")
-            return projects.submit(project_id, "ingest", target)
+            return projects.submit(project_id, "ingest", target, x_filename)
         except BaseException:
             target.unlink(missing_ok=True)
             raise

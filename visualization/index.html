@@ -51,6 +51,13 @@
           <button id="resumeRun" class="tool-btn" disabled>Resume</button>
         </div>
         <div id="appMessage" class="app-message server-only" role="status" aria-live="polite" hidden></div>
+        <details id="liveActivity" class="live-activity server-only" open hidden>
+          <summary>Live activity <span id="liveStatus" class="status-label">Connecting</span><span id="pendingCount"></span><span class="pending-key">Dashed, faint relationships await validation</span></summary>
+          <div class="live-columns">
+            <section><h3>Processing documents</h3><div id="liveDocuments" class="activity-list"></div></section>
+            <section><h3>Recent activity</h3><div id="liveEvents" class="activity-list" role="log" aria-label="Expansion activity"></div></section>
+          </div>
+        </details>
         <header class="graph-toolbar">
           <div class="toolbar-cluster view-cluster">
             <div class="segmented view-mode" id="viewMode" aria-label="Graph mode">

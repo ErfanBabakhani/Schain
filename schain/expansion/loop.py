@@ -395,6 +395,7 @@ def run_expand(
     document_checkpoint_sink=None,
     should_pause=None,
     max_total_documents=None,
+    progress_sink=None,
 ) -> dict[str, Any]:
     """Expand under persisted budgets; all accepted facts survive scheduling stops.
 
@@ -674,7 +675,7 @@ def run_expand(
                     document_summary = process_document(document, config, connection, llm, ontology, driver,
                         origin_entity=entity_key, tier=tier,
                         document_index=state.document_usage_count(connection), document_budget=max_documents or None,
-                        checkpoint_sink=document_checkpoint_sink)
+                        checkpoint_sink=document_checkpoint_sink, progress_sink=progress_sink)
                 except Exception as error:
                     doc_elapsed = time.monotonic() - doc_started
                     state.finish_document_usage(connection, doc_id, entity_key, completed=False, elapsed_seconds=doc_elapsed)

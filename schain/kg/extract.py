@@ -90,6 +90,7 @@ def extract_graph(
     evidence_policy_file: str | None = None,
     integrity_failures: list[dict[str, Any]] | None = None,
     audit=None,
+    progress_sink=None,
 ) -> tuple[Neo4jGraph, dict[str, int]]:
     """Extract a graph from one normalized document record.
 
@@ -184,6 +185,11 @@ def extract_graph(
         semaphore = asyncio.Semaphore(max_concurrency)
 
         async def extract_chunk(chunk) -> Neo4jGraph:
+            def progress(stage, **payload):
+                if progress_sink is not None:
+                    progress_sink(stage, {"chunk_index": chunk.index,
+                                          "chunk_total": len(chunks.chunks), **payload})
+
             cache_file = None
             if checkpoint_dir is not None:
                 signature = {
@@ -229,9 +235,12 @@ def extract_graph(
                                 historical_prompt="unavailable_from_chunk_checkpoint",
                                 historical_model_response="unavailable_from_chunk_checkpoint",
                             )
+                        if progress_sink is not None:
+                            progress("chunk_extracted", graph=cached.model_dump(), cached=True)
                         return cached
 
             async with semaphore:
+                progress("chunk_started")
                 for attempt in range(max_retries + 1):
                     attempt_id = (
                         f"extract-{str(document['doc_id'])[:12]}-"
@@ -313,6 +322,8 @@ def extract_graph(
                         await asyncio.sleep(1.5)
                 if cache_file is not None:
                     atomic_write_json(cache_file, result.model_dump())
+                if progress_sink is not None:
+                    progress("chunk_extracted", graph=result.model_dump(), cached=False)
                 return result
 
         # Await every started chunk so completed work is saved even if a sibling fails.

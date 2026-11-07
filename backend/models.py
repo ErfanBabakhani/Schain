@@ -66,3 +66,9 @@ class DocumentResponse(BaseModel):
     status: Literal["PENDING", "PROCESSING", "EXTRACTED", "RESOLVED", "COMMITTED", "FAILED"]
     error: str | None
     created_at: str
+    updated_at: str
+    origin_entity: str | None
+    tier: int | None
+    title: str | None
+    stage: str | None
+    run_id: str | None

@@ -47,12 +47,16 @@ def chunk_document():
 
 def test_resume_reuses_successful_chunks_and_preserves_their_ids(tmp_path, ontology):
     document = chunk_document()
-    options = dict(chunk_size=120, chunk_overlap=0, on_error="RAISE", checkpoint_dir=tmp_path)
+    events = []
+    options = dict(chunk_size=120, chunk_overlap=0, on_error="RAISE", checkpoint_dir=tmp_path,
+                   progress_sink=lambda stage, payload: events.append((stage, payload)))
     failing = ChunkLLM(fail_bravo=True)
     with pytest.raises(RuntimeError, match="deliberate chunk failure"):
         extract_graph(failing, document, ontology, **options)
     completed = list(tmp_path.glob("*.json"))
     assert len(completed) == len(failing.inputs) - 1
+    assert len([e for e in events if e[0] == "chunk_extracted"]) == len(completed)
+    assert all(e[1]["graph"]["relationships"] for e in events if e[0] == "chunk_extracted")
 
     resumed = ChunkLLM()
     graph, index = extract_graph(resumed, document, ontology, **options)
@@ -61,9 +65,12 @@ def test_resume_reuses_successful_chunks_and_preserves_their_ids(tmp_path, ontol
     assert {node.id.split(":", 1)[0] for node in graph.nodes} == set(index)
 
     cached = ChunkLLM()
+    events.clear()
     again, again_index = extract_graph(cached, document, ontology, **options)
     assert cached.inputs == []
     assert again.model_dump() == graph.model_dump() and again_index == index
+    assert len(events) == len(index)
+    assert all(stage == "chunk_extracted" and payload["cached"] for stage, payload in events)
 
 
 def test_transient_error_retries_only_its_own_chunk(tmp_path, ontology):

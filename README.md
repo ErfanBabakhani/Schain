@@ -86,6 +86,8 @@ If another interface appears, check the absolute directory printed by the build 
 
 Create a project, set its seeds and limits, then select Start. Pause and wait for `paused` before changing settings or uploading UTF-8 `.txt`, `.md`, or PDF documents up to 10 MiB. Resume continues expansion or retries a paused/failed ingestion job. Seeds and maximum tier cannot change after the first job; create a new project for a different experiment.
 
+Live activity shows the current document, extraction chunks, resolution, validation and recent results. Extracted relationships appear faint and dashed until validation finishes; rejected relationships disappear. Active projects refresh every second, idle projects every five seconds, with slower polling in background tabs and on errors. Progress survives page reloads; unchanged graphs are not downloaded again. A relationship becomes visible when its extraction chunk returns, not while the model is still generating that chunk.
+
 The API stays on the server; frontend files stay local. Keep the default loopback binding. For direct static connections only, changing the local frontend port requires matching `SCHAIN_CORS_ORIGINS` on the backend.
 
 ## Storage and limits
@@ -112,7 +114,7 @@ systemctl --user restart schain-api.service schain-worker.service
 systemctl --user status schain-api.service schain-worker.service
 ```
 
-Use your actual unit/job names if different. Keep the existing token, uploads, model files and runtime directory. This frontend update requires no SQLite schema migration; existing projects remain compatible. Rebuild the local frontend from the matching updated checkout.
+Use your actual unit/job names if different. Keep the existing token, uploads, model files and runtime directory. Update both the API and worker for live activity, then restart the local frontend from the matching checkout. Startup automatically adds progress tables to existing SQLite databases; accepted research data remains intact. Back up the runtime directory with both processes stopped before updating.
 
 For backup, pause projects, stop the worker and API, and copy the entire runtime directory. Restore with both services stopped. Do not run the CLI against an active server project's files.
 

@@ -399,6 +399,10 @@
       const c = isContext ? '#7a8492' : (RELATION_COLORS[e.relation] || FALLBACK_COLOR);
       ctx.save();
       ctx.globalAlpha = isContext ? .11 : (selected ? 1 : related ? .82 : .38);
+      if (e.validation_status === 'pending') {
+        ctx.globalAlpha *= .4;
+        ctx.setLineDash([4 * this.dpr, 4 * this.dpr]);
+      }
       ctx.lineWidth = (selected ? 3 : related ? 1.8 : 1) * this.dpr;
       ctx.strokeStyle = c;
       ctx.beginPath();
@@ -421,7 +425,7 @@
         ctx.lineTo(px - ux * arrow * this.dpr + uy * arrow * .6 * this.dpr, py - uy * arrow * this.dpr - ux * arrow * .6 * this.dpr);
         ctx.closePath();
         ctx.fill();
-        if (this.particles && !this.mode2D && e.relation === 'suppliesTo' && !selected) {
+        if (this.particles && !this.mode2D && e.relation === 'suppliesTo' && !selected && e.validation_status !== 'pending') {
           const phase = (t * .00012 + stableFraction(e.id, 'p')) % 1, x = a.x + (b.x - a.x) * phase, y = a.y + (b.y - a.y) * phase;
           ctx.globalAlpha = .45;
           ctx.fillStyle = c;
@@ -1224,7 +1228,8 @@
   function factRowHtml(e) {
     const s = state.nodeMap.get(e.source), t = state.nodeMap.get(e.target), c = RELATION_COLORS[e.relation] || FALLBACK_COLOR;
     const factMarkup = `<div class="fact-row" data-select-edge="${escapeHtml(e.id)}"><div class="fact-line"><b>${escapeHtml(s?.name || e.source)}</b><span class="arrow">→</span><span class="relation-pill" style="--c:${c}">${escapeHtml(getRelationLabel(e.relation))}</span><span class="arrow">→</span><b>${escapeHtml(t?.name || e.target)}</b></div>`;
-    const factMetadataMarkup = `<div class="fact-meta"><span>${formatCount(e.support_count || e.source_doc_ids?.length || 0)} sources</span><span>${formatCount(e.evidence?.length || e.evidence_count || 0)} evidence</span></div></div>`;
+    const validation = e.validation_status === 'pending' ? '<span>Pending validation</span>' : '';
+    const factMetadataMarkup = `<div class="fact-meta">${validation}<span>${formatCount(e.support_count || e.source_doc_ids?.length || 0)} sources</span><span>${formatCount(e.evidence?.length || e.evidence_count || 0)} evidence</span></div></div>`;
     return factMarkup + factMetadataMarkup;
   }
   function bindSideSelections(root) {

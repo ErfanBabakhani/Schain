@@ -340,8 +340,138 @@ def test_additive_server_migration(tmp_path):
     initialize(path)
     initialize(path)
     with connect(path) as connection:
-        assert connection.execute("SELECT MAX(version) FROM server_schema").fetchone()[0] == 2
+        assert connection.execute("SELECT MAX(version) FROM server_schema").fetchone()[0] == 3
         assert connection.execute("SELECT id FROM graph_nodes").fetchone()[0] == "legacy"
+
+
+def test_live_candidates_pagination_events_and_cleanup(projects):
+    from backend.activity import finish, read_activity, record
+    from schain import state
+
+    project_id = projects.create(settings())["id"]
+    path = projects.database(project_id)
+    projects.submit(project_id)
+    run_id = projects.detail(project_id)["runs"][0]["id"]
+    document = {"doc_id": "live-doc", "content_hash": "hash", "title": "Supplier report",
+                "source_url": "https://example.org/report", "text": "private document text"}
+    with connect(path) as connection:
+        state.register_document(connection, document)
+        with connection:
+            connection.execute("UPDATE runs SET status='running' WHERE id=?", (run_id,))
+        before = read_graph(connection)["revision"]
+    graph = {"nodes": [{"id": "a", "label": "Company", "properties": {"name": "CATL"}},
+                       {"id": "b", "label": "Company", "properties": {"name": "BMW"}}],
+             "relationships": [{"start_node_id": "a", "end_node_id": "b", "type": "suppliesTo"},
+                               {"start_node_id": "missing", "end_node_id": "b", "type": "owns"}]}
+    record(path, run_id, "retrieved", document)
+    record(path, run_id, "chunk_started", document, {"chunk_index": 0, "chunk_total": 1})
+    record(path, run_id, "chunk_extracted", document, {"graph": graph, "chunk_index": 0, "chunk_total": 1})
+    record(path, run_id, "validation", document)
+    with connect(path) as connection:
+        bundle = validate_graph(read_graph(connection, limit=1, node_limit=1))
+        assert bundle["revision"] != before
+        assert len(bundle["nodes"]) == 2  # Endpoints are included despite node pagination.
+        assert len(bundle["edges"]) == 1
+        assert bundle["edges"][0]["validation_status"] == "pending"
+        assert bundle["documents"][0]["title"] == "Supplier report"
+        assert connection.execute("SELECT COUNT(*) FROM graph_edges").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM accepted_facts").fetchone()[0] == 0
+        first = read_activity(connection, after=0, limit=2)
+        second = read_activity(connection, after=first["cursor"], limit=2)
+        assert first["has_more"] and not second["has_more"]
+        assert [e["stage"] for e in first["events"] + second["events"]] == [
+            "retrieved", "chunk_started", "chunk_extracted", "validation"]
+        assert second["active_documents"][0]["stage"] == "validation"
+        assert "private document text" not in str(second)
+    # Resolving removes the preview in the same transaction as the accepted graph.
+    with connect(path) as connection:
+        save_graph(connection, {"nodes": [{"id": "accepted"}], "edges": []}, resolved_document="live-doc")
+        assert not read_graph(connection)["edges"]
+    finish(path, run_id, "completed")
+    with connect(path) as connection:
+        assert not read_activity(connection)["active_documents"]
+        assert connection.execute("SELECT COUNT(*) FROM live_nodes").fetchone()[0] == 0
+
+
+def test_worker_live_stages_failure_and_resume(projects, stub_llm, monkeypatch):
+    from backend.activity import read_activity
+    from schain import pipeline
+
+    project_id = projects.create(settings())["id"]
+    path = projects.database(project_id)
+    source = projects.directory(project_id) / "supplier-report.txt"
+    source.write_text(DOCUMENT_TEXT, encoding="utf-8")
+    original = pipeline.validate_facts_frame
+    observed = []
+
+    def fail_validation(*args, **kwargs):
+        with connect(path) as connection:
+            graph = read_graph(connection)
+            activity = read_activity(connection)
+            assert any(e.get("validation_status") == "pending" for e in graph["edges"])
+            assert activity["active_documents"][0]["stage"] == "validation"
+            assert connection.execute("SELECT COUNT(*) FROM accepted_facts").fetchone()[0] == 0
+            observed.extend(e["stage"] for e in activity["events"])
+        raise RuntimeError("Validation temporarily unavailable")
+
+    monkeypatch.setattr(pipeline, "validate_facts_frame", fail_validation)
+    projects.submit(project_id, "ingest", source)
+    worker = Worker(projects, lambda config: stub_llm)
+    with worker_lock(projects.root):
+        assert worker.tick()
+        assert projects.detail(project_id)["status"] == "failed"
+        with connect(path) as connection:
+            assert not read_graph(connection)["edges"]
+            assert not read_activity(connection)["active_documents"]
+        assert "chunk_extracted" in observed and "resolution" in observed
+        calls = stub_llm.extraction_calls
+        monkeypatch.setattr(pipeline, "validate_facts_frame", original)
+        projects.resume(project_id)
+        assert worker.tick()
+        assert projects.detail(project_id)["status"] == "completed"
+        assert stub_llm.extraction_calls == calls
+    with connect(path) as connection:
+        graph = read_graph(connection)
+        assert graph["edges"] and not any(e.get("validation_status") == "pending" for e in graph["edges"])
+        activity = read_activity(connection)
+        assert activity["pending_relationships"] == 0
+        assert any(e["stage"] == "resolved" and e["payload"]["accepted"] > 0 for e in activity["events"])
+
+
+def test_activity_auth_and_query_validation(tmp_path):
+    client = TestClient(create_app(tmp_path / "runtime", TOKEN))
+    client.headers["Authorization"] = "Bearer " + TOKEN
+    project_id = client.post("/projects", json=settings().model_dump()).json()["id"]
+    url = f"/projects/{project_id}/activity"
+    assert client.get(url + "?after=0&limit=1").json()["events"] == []
+    assert client.get(url + "?after=-1").status_code == 422
+    assert client.get(url + "?after=9223372036854775808").status_code == 422
+    assert client.get(url + "?limit=201").status_code == 422
+    client.headers.pop("Authorization")
+    assert client.get(url).status_code == 401
+
+
+@pytest.mark.parametrize("status", ["running", "completed"])
+def test_recovery_removes_interrupted_previews(projects, status):
+    from backend.activity import read_activity, record
+
+    project_id = projects.create(settings())["id"]
+    path = projects.database(project_id)
+    projects.submit(project_id)
+    run_id = projects.detail(project_id)["runs"][0]["id"]
+    graph = {"nodes": [{"id": "a", "label": "Company"}, {"id": "b", "label": "Company"}],
+             "relationships": [{"start_node_id": "a", "end_node_id": "b", "type": "suppliesTo"}]}
+    record(path, run_id, "chunk_extracted", {"doc_id": "unfinished"}, {"graph": graph})
+    with connect(path) as connection, connection:
+        connection.execute("UPDATE runs SET status=? WHERE id=?", (status, run_id))
+    with worker_lock(projects.root):
+        Worker(projects).recover()
+    with connect(path) as connection:
+        assert not read_graph(connection)["edges"]
+        activity = read_activity(connection)
+        assert not activity["active_documents"]
+        assert activity["pending_relationships"] == 0
+    assert projects.detail(project_id)["status"] == ("queued" if status == "running" else status)
 
 
 def test_graph_pagination_includes_isolated_nodes_and_evidence(projects):
