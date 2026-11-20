@@ -10,9 +10,9 @@ from __future__ import annotations
 
 import logging
 import json
-import math
 import os
 import time
+from functools import lru_cache
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit
 
@@ -29,52 +29,94 @@ class RuntimeDeadlineExceeded(TimeoutError):
 
 
 class InputTokenBudgetExceeded(RuntimeError):
-    """The next LLM request would exceed the configured estimated input budget."""
+    """The next LLM request would exceed the configured tokenizer-counted budget."""
 
     stop_reason = "token_budget"
 
 
 class InputBudgetLLM:
-    """LLM proxy that accounts for every run-level prompt before invoking the provider.
-
-    The configured model tokenizer is not exposed by neo4j-graphrag's LLM interface,
-    so request sizes use a deliberately conservative serialized-character estimate.
-    """
+    """LLM proxy that counts configured-model input tokens before each request."""
 
     _schain_input_budget = True
 
-    def __init__(self, llm, reserve_input_tokens, *, characters_per_token: float = 1.0):
+    def __init__(self, llm, reserve_input_tokens, *, tokenizer, tokenizer_model: str):
         self._schain_wrapped_llm = llm
         self.reserve_input_tokens = reserve_input_tokens
-        if characters_per_token <= 0:
-            raise ValueError("characters_per_token must be positive")
-        self.characters_per_token = characters_per_token
+        self.tokenizer = tokenizer
+        self.tokenizer_model = tokenizer_model
 
     def __getattr__(self, name):
         return getattr(self._schain_wrapped_llm, name)
 
     @staticmethod
-    def estimate_input_tokens(args, kwargs, *, characters_per_token: float = 1.0) -> int:
-        request = {
-            "args": args[:3],
-            "input": kwargs.get("input"),
-            "message_history": kwargs.get("message_history"),
-            "system_instruction": kwargs.get("system_instruction"),
-        }
-        serialized = json.dumps(request, ensure_ascii=False, default=str)
-        return max(1, math.ceil(len(serialized) / characters_per_token))
+    def estimate_input_tokens(args, kwargs, *, tokenizer, chat_template_kwargs=None) -> int:
+        prompt = args[0] if args else kwargs.get("input", "")
+        history = args[1] if len(args) > 1 else kwargs.get("message_history")
+        system = args[2] if len(args) > 2 else kwargs.get("system_instruction")
+
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": str(system)})
+        if isinstance(history, dict):
+            history = [history]
+        for message in history or ():
+            if isinstance(message, dict):
+                role = message.get("role", "user")
+                content = message.get("content", "")
+            else:
+                role = getattr(message, "role", "user")
+                content = getattr(message, "content", str(message))
+            role = getattr(role, "value", role)
+            messages.append({"role": str(role), "content": str(content)})
+        messages.append({"role": "user", "content": str(prompt)})
+
+        if getattr(tokenizer, "chat_template", None):
+            try:
+                return len(tokenizer.apply_chat_template(
+                    messages, tokenize=True, add_generation_prompt=True,
+                    **(chat_template_kwargs or {}),
+                ))
+            except Exception as error:  # fall back to the same tokenizer's serialized request
+                logger.warning("model chat-template tokenization failed; using serialized prompt tokens: %s", error)
+        serialized = json.dumps(messages, ensure_ascii=False, default=str)
+        return len(tokenizer.encode(serialized, add_special_tokens=True))
+
+    def count_text_tokens(self, text: str) -> int:
+        return len(self.tokenizer.encode(text, add_special_tokens=False))
+
+    def count_request_tokens(self, args, kwargs) -> int:
+        parameters = getattr(self._schain_wrapped_llm, "model_params", {}) or {}
+        extra_body = parameters.get("extra_body") or {}
+        template_kwargs = extra_body.get("chat_template_kwargs") or {}
+        return self.estimate_input_tokens(
+            args, kwargs, tokenizer=self.tokenizer,
+            chat_template_kwargs=template_kwargs,
+        )
 
     def invoke(self, *args, **kwargs):
-        self.reserve_input_tokens(self.estimate_input_tokens(
-            args, kwargs, characters_per_token=self.characters_per_token,
-        ))
+        self.reserve_input_tokens(self.count_request_tokens(args, kwargs))
         return self._schain_wrapped_llm.invoke(*args, **kwargs)
 
     async def ainvoke(self, *args, **kwargs):
-        self.reserve_input_tokens(self.estimate_input_tokens(
-            args, kwargs, characters_per_token=self.characters_per_token,
-        ))
+        self.reserve_input_tokens(self.count_request_tokens(args, kwargs))
         return await self._schain_wrapped_llm.ainvoke(*args, **kwargs)
+
+
+@lru_cache(maxsize=4)
+def load_tokenizer(model_name: str):
+    """Load the tokenizer that matches the model configured for the EXPAND run."""
+    try:
+        from transformers import AutoTokenizer
+    except ImportError as error:
+        raise RuntimeError(
+            "token-budgeted EXPAND requires transformers; install the adaptive extra"
+        ) from error
+    try:
+        return AutoTokenizer.from_pretrained(model_name)
+    except (OSError, ValueError) as error:
+        raise RuntimeError(
+            f"could not load the configured model tokenizer {model_name!r}"
+        ) from error
 
 
 def _public_endpoint(url: str | None) -> str | None:

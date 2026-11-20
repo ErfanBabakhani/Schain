@@ -1,12 +1,14 @@
 # Run with: schain expand --config config/adaptive_expand.yaml
 # Uses the same seed set, query plan, extraction model and validator as expansion.yaml.
-# Install optional dependencies, then install the configured spaCy model before running:
+# The tokenizer is loaded from llm.model; install optional dependencies and the spaCy model:
 #   pip install -e .[adaptive]
 #   python -m spacy download en_core_web_sm
 include:
   - config/expansion.yaml
 
 expansion:
+  # Adaptive arm has no processed-document cap; the shared input-token budget is its
+  # hard stop. The legacy comparison intentionally retains expansion.yaml's doc limits.
   max_documents: null
   max_documents_per_run: null
   retrieval:
@@ -21,7 +23,9 @@ expansion:
     policy: adaptive_linucb
     candidate_pool_policy: title_snippet
     total_input_tokens: 200000
-    input_token_metric: estimated_input_tokens
+    input_token_metric: tokenizer_input_tokens
+    # Explicit pacing heuristic: 200k / 1k is a 200-decision budget window.
+    # The global hard budget still applies if the actual project horizon differs.
     target_tokens_per_candidate: 1000
     cost_reference_tokens: 1000
     primal_reward_weight_V: 1.0
@@ -31,8 +35,11 @@ expansion:
     initial_action_prior:
       skip: 0.30
       snippet: 0.60
+      # Full retrieval is 10% combined; these are preferences, not quotas.
       full_text: 0.05
       both: 0.05
+    # Batch up to 10 snippets; request tokens are still charged exactly by the Qwen tokenizer.
+    snippet_batch_size: 10
     random_seed: 42
     linucb_alpha: 0.5
     ridge_lambda: 1.0
@@ -55,7 +62,6 @@ expansion:
       - nvidia.com
     prompt_overhead_tokens_estimate: 2000
     full_text_tokens_estimate: 4000
-    input_token_chars_per_estimate: 1.0
 
 storage:
   raw_documents: data/experiments/adaptive/documents.jsonl

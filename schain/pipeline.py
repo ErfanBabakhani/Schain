@@ -356,6 +356,7 @@ def process_document(
     document_budget: Optional[int] = None,
     checkpoint_sink: Optional[Callable[[str, dict[str, Any], dict[str, Any]], None]] = None,
     progress_sink: Optional[Callable[[str, dict[str, Any], dict[str, Any]], None]] = None,
+    precomputed_extraction: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Run one document through the pipeline, resuming from wherever it stopped."""
     started = time.monotonic()
@@ -510,25 +511,47 @@ def process_document(
         if status in (state.PENDING, state.PROCESSING, state.FAILED):
             advance_stage("extraction")
             state.set_document_status(connection, doc_id, state.PROCESSING, increment_attempts=True)
-            graph, chunk_index = extract_graph(
-                measured_llm, document, ontology,
-                chunk_size=ingest_config.get("chunk_size", 2000),
-                chunk_overlap=ingest_config.get("chunk_overlap", 200),
-                on_error=ingest_config.get("on_error", "RAISE"),
-                max_concurrency=config.get("concurrency", {}).get("llm_max_concurrency", 4),
-                structured_output=config.get("llm", {}).get("structured_output", False),
-                checkpoint_dir=storage_dir(config, "extractions") / f"{doc_id}.chunks",
-                metrics=extraction_metrics,
-                max_chunks_per_document=ingest_config.get("max_chunks_per_document"),
-                max_retries=int(config.get("llm", {}).get("extraction_max_retries", 1)),
-                origin_name=origin_name,
-                evidence_policy_file=(config.get("validation", {}).get("evidence", {})
-                                      .get("policy_file")),
-                integrity_failures=integrity_failures,
-                audit=audit,
-                progress_sink=progress if progress_sink is not None else None,
-            )
+            if precomputed_extraction is not None:
+                graph = precomputed_extraction["graph"]
+                chunk_index = precomputed_extraction["chunk_index"]
+                extraction_metrics.update(precomputed_extraction["metrics"])
+                integrity_failures.extend(precomputed_extraction["integrity_failures"])
+            else:
+                graph, chunk_index = extract_graph(
+                    measured_llm, document, ontology,
+                    chunk_size=ingest_config.get("chunk_size", 2000),
+                    chunk_overlap=ingest_config.get("chunk_overlap", 200),
+                    on_error=ingest_config.get("on_error", "RAISE"),
+                    max_concurrency=config.get("concurrency", {}).get("llm_max_concurrency", 4),
+                    structured_output=config.get("llm", {}).get("structured_output", False),
+                    checkpoint_dir=storage_dir(config, "extractions") / f"{doc_id}.chunks",
+                    metrics=extraction_metrics,
+                    max_chunks_per_document=ingest_config.get("max_chunks_per_document"),
+                    max_retries=int(config.get("llm", {}).get("extraction_max_retries", 1)),
+                    origin_name=origin_name,
+                    evidence_policy_file=(config.get("validation", {}).get("evidence", {})
+                                          .get("policy_file")),
+                    integrity_failures=integrity_failures,
+                    audit=audit,
+                    progress_sink=progress if progress_sink is not None else None,
+                )
             summary.update(extraction_metrics)
+            if precomputed_extraction is not None:
+                if extraction_metrics.get("llm_calls"):
+                    summary["llm_calls_by_stage"]["extraction"] = int(
+                        extraction_metrics["llm_calls"]
+                    )
+                audit.emit(
+                    "parsed_extraction_graph", stage="extraction", source="snippet_batch",
+                    batch_size=extraction_metrics.get("extraction_batch_size"),
+                    node_count=len(graph.nodes), relationship_count=len(graph.relationships),
+                    graph=(graph.model_dump(mode="json") if audit.capture_content else None),
+                )
+                audit.emit(
+                    "structural_integrity_checked", stage="extraction_integrity",
+                    source="snippet_batch", valid=not integrity_failures,
+                    failure_count=len(integrity_failures),
+                )
             save_extraction(
                 config,
                 doc_id,

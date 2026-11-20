@@ -50,6 +50,7 @@ from .telemetry import (
 from ..documents import make_document
 from ..kg.facts import FACT_COLUMNS
 from ..kg.support import load_edge_support, refresh_edge_support
+from ..kg.extract import build_snippet_batch_prompt, extract_snippet_batch
 from ..pipeline import process_document
 from ..sources import manifest as mf
 from ..sources.retrieve import document_kwargs_from_result, retrieve_for_entity
@@ -57,7 +58,7 @@ from ..sources.retrieve import fetch_selected_full_text
 from ..sources.ranking import discovery_candidate_is_meaningful
 from ..sources.origin import origin_name_variants
 from .adaptive import LinUCB, build_document_contexts, choose_action, normalize_reward
-from ..llm.provider import InputBudgetLLM, InputTokenBudgetExceeded
+from ..llm.provider import InputBudgetLLM, InputTokenBudgetExceeded, load_tokenizer
 from .frontier import discover_upstream, seed_frontier
 
 logger = logging.getLogger(__name__)
@@ -89,15 +90,17 @@ def _record_adaptive_decision(config, run_id, record) -> None:
         handle.write(json.dumps(record, ensure_ascii=False, default=float) + "\n")
 
 
-def _settle_adaptive_cost(connection, run_id, decision_data, selection_cfg, *, charge=True) -> None:
+def _settle_adaptive_cost(connection, run_id, decision_data, selection_cfg, *, charge=True,
+                          actual_cost=None) -> None:
     """Release the action reservation and pace using measured proxy request cost."""
-    cost = int(decision_data["estimated_cost"])
+    cost = int(decision_data.get("reserved_cost", decision_data["estimated_cost"]))
     budget_key = f"input_budget:{run_id}"
     budget = state.run_value(connection, budget_key)
     budget["reserved_estimate"] = max(0, int(budget["reserved_estimate"]) - cost)
     queue_spent_key = f"adaptive_queue_spent:{run_id}"
     previous_spend = int(state.run_value(connection, queue_spent_key, 0))
-    spent_delta = max(0, int(budget["spent_estimate"]) - previous_spend) if charge else 0
+    spent_delta = (max(0, int(budget["spent_estimate"]) - previous_spend)
+                   if actual_cost is None and charge else int(actual_cost or 0))
     state.set_run_value(connection, budget_key, budget)
     queue_key = f"adaptive_virtual_price:{run_id}"
     price = float(state.run_value(connection, queue_key, decision_data["decision"]["queue_before"]))
@@ -479,16 +482,24 @@ def run_expand(
     adaptive_state_key = f"adaptive_model:{run_id}"
     input_budget_key = f"input_budget:{run_id}"
     budget_limit = selection_cfg.get("total_input_tokens")
+    tokenizer_model = str((config.get("llm") or {}).get("model") or "")
+    if adaptive and llm is None:
+        raise ValueError("adaptive selection requires a configured LLM")
+    budget_tokenizer = load_tokenizer(tokenizer_model) if budget_limit is not None and llm is not None else None
     if adaptive and budget_limit is None:
         raise ValueError("adaptive selection requires expansion.selection.total_input_tokens")
     if budget_limit is not None:
         if state.run_value(connection, input_budget_key) is None:
             state.set_run_value(connection, input_budget_key, {
                 "spent_estimate": 0, "reserved_estimate": 0, "limit": int(budget_limit),
-                "requests": 0,
+                "requests": 0, "accounting_version": "qwen_tokenizer_v1",
             })
-        elif int(state.run_value(connection, input_budget_key)["limit"]) != int(budget_limit):
-            raise ValueError("input-token budget changed; start a fresh EXPAND state")
+        else:
+            budget_state = state.run_value(connection, input_budget_key)
+            if budget_state.get("accounting_version") != "qwen_tokenizer_v1":
+                raise ValueError("input-token ledger uses character estimates; start a fresh EXPAND state")
+            if int(budget_state["limit"]) != int(budget_limit):
+                raise ValueError("input-token budget changed; start a fresh EXPAND state")
         if llm is not None and not getattr(llm, "_schain_input_budget", False):
             def reserve_input_tokens(estimate):
                 budget = state.run_value(connection, input_budget_key)
@@ -500,12 +511,13 @@ def run_expand(
                     with (request_log / f"input_token_requests_{run_id}.jsonl").open("a", encoding="utf-8") as handle:
                         handle.write(json.dumps({
                             "run_id": run_id, "request_index": budget.get("requests", 0) + 1,
-                            "estimated_input_tokens": int(estimate), "spent_before": budget["spent_estimate"],
+                            "input_tokens": int(estimate), "spent_before": budget["spent_estimate"],
                             "status": "rejected_by_budget",
-                            "accounting_source": "serialized characters divided by configured chars-per-token estimate",
+                            "accounting_source": "configured Qwen tokenizer chat-template token count",
+                            "tokenizer_model": tokenizer_model,
                         }) + "\n")
                     raise InputTokenBudgetExceeded(
-                        f"estimated input-token budget exhausted: "
+                        f"input-token budget exhausted: "
                         f"{budget['spent_estimate']} + {estimate} > {budget['limit']}"
                     )
                 before = int(budget["spent_estimate"])
@@ -517,14 +529,17 @@ def run_expand(
                 with (request_log / f"input_token_requests_{run_id}.jsonl").open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps({
                         "run_id": run_id, "request_index": budget["requests"],
-                        "estimated_input_tokens": int(estimate), "spent_before": before,
+                        "input_tokens": int(estimate), "spent_before": before,
                         "spent_after": budget["spent_estimate"],
-                        "accounting_source": "serialized characters divided by configured chars-per-token estimate",
+                        "accounting_source": "configured Qwen tokenizer chat-template token count",
+                        "tokenizer_model": tokenizer_model,
                     }) + "\n")
             llm = InputBudgetLLM(
-                llm, reserve_input_tokens,
-                characters_per_token=float(selection_cfg.get("input_token_chars_per_estimate", 1.0)),
+                llm, reserve_input_tokens, tokenizer=budget_tokenizer,
+                tokenizer_model=tokenizer_model,
             )
+    if adaptive and not isinstance(llm, InputBudgetLLM):
+        raise ValueError("adaptive selection requires tokenizer-based InputBudgetLLM accounting")
     if adaptive:
         model_data = state.run_value(connection, adaptive_state_key)
         adaptive_model = LinUCB.from_dict(model_data) if model_data else LinUCB(
@@ -805,7 +820,13 @@ def run_expand(
                     ))
                     warmup_limit = int(selection_cfg.get("warmup_candidates", 200))
                     warmup = decision_count < warmup_limit
-                    candidate_indices = [0] if warmup else list(range(len(candidates)))
+                    snippet_batch_size = max(1, min(10, int(selection_cfg.get("snippet_batch_size", 10))))
+                    if warmup:
+                        candidate_indices = list(range(min(
+                            len(candidates), snippet_batch_size, warmup_limit - decision_count,
+                        )))
+                    else:
+                        candidate_indices = list(range(len(candidates)))
                     choices = {}
                     choice_details = {}
                     for index in candidate_indices:
@@ -813,11 +834,23 @@ def run_expand(
                         candidate = item[1]
                         snippet = "\n".join(part for part in (candidate.title, candidate.snippet) if part)
                         overhead = int(selection_cfg.get("prompt_overhead_tokens_estimate", 2000))
-                        chars_per_token = float(selection_cfg.get("input_token_chars_per_estimate", 1.0))
-                        snippet_cost = math.ceil(len(snippet) / chars_per_token) + overhead
+                        snippet_tokens = llm.count_text_tokens(snippet)
+                        batch_size = max(1, int(selection_cfg.get("snippet_batch_size", 10)))
+                        if warmup:
+                            batch_size = min(batch_size, len(candidate_indices))
+                        snippet_prior = float((selection_cfg.get("initial_action_prior") or {}).get(
+                            "snippet", 0.60,
+                        ))
+                        if warmup and snippet_prior < 1:
+                            expected_batch_size = min(
+                                batch_size, 1 / max(1 - snippet_prior, 1e-9),
+                            )
+                        else:
+                            expected_batch_size = batch_size
+                        snippet_cost = snippet_tokens + math.ceil(overhead / expected_batch_size)
                         full_cost = int(selection_cfg.get("full_text_tokens_estimate", 4000)) + overhead
                         costs = {"snippet": snippet_cost, "full_text": full_cost,
-                                 "both": full_cost + math.ceil(len(snippet) / chars_per_token)}
+                                 "both": full_cost + snippet_tokens}
                         feasible_costs = {action: cost for action, cost in costs.items()
                                           if cost <= remaining_tokens}
                         action, details = choose_action(
@@ -828,12 +861,12 @@ def run_expand(
                             priors=selection_cfg.get("initial_action_prior"),
                             warmup=decision_count < int(selection_cfg.get("warmup_candidates", 200)),
                             temperature=float(selection_cfg.get("warmup_temperature", 1.0)),
-                            rng=np.random.default_rng(int(selection_cfg.get("random_seed", 42)) + decision_count),
+                            rng=np.random.default_rng(
+                                int(selection_cfg.get("random_seed", 42)) + decision_count + index,
+                            ),
                         )
                         choices[index] = action
                         choice_details[index] = (details, costs)
-                    # Warm-up finalizes one candidate in retrieval order. Greedy selects
-                    # the best feasible document/action pair from the unresolved pool.
                     if warmup:
                         selected_index = 0
                     else:
@@ -843,6 +876,29 @@ def run_expand(
                         )
                     action = choices[selected_index]
                     pool_exhausted = not warmup and choice_details[selected_index][0]["scores"].get(action, 0.0) <= 0
+                    selected_indices = [selected_index]
+                    if not pool_exhausted and action == "snippet":
+                        if warmup:
+                            for index in candidate_indices[1:]:
+                                if choices[index] != "snippet":
+                                    break
+                                selected_indices.append(index)
+                        else:
+                            highest_other_score = max((
+                                choice_details[index][0]["scores"].get(other, float("-inf"))
+                                for index in candidate_indices
+                                for other in ("full_text", "both")
+                            ), default=float("-inf"))
+                            snippet_indices = [
+                                index for index in candidate_indices
+                                if choices[index] == "snippet"
+                                and choice_details[index][0]["scores"].get("snippet", 0.0) > 0
+                                and choice_details[index][0]["scores"].get("snippet", 0.0) >= highest_other_score
+                            ]
+                            snippet_indices.sort(key=lambda index: (
+                                -choice_details[index][0]["scores"]["snippet"], index,
+                            ))
+                            selected_indices = snippet_indices[:snippet_batch_size]
                     if pool_exhausted:
                         for skipped_index in candidate_indices:
                             skipped = candidates[skipped_index][1]
@@ -860,7 +916,7 @@ def run_expand(
                         reason = "adaptive_pool_exhausted"
                         prepared = []
                         action = "skip"
-                    decision_count += len(candidate_indices) if pool_exhausted else 1
+                    decision_count += len(candidate_indices) if pool_exhausted else len(selected_indices)
                     state.set_run_value(connection, decision_count_key, decision_count)
                     action_counts_key = f"adaptive_action_counts:{run_id}"
                     action_counts = state.run_value(connection, action_counts_key,
@@ -868,91 +924,96 @@ def run_expand(
                     if pool_exhausted:
                         action_counts["skip"] += len(candidates)
                     else:
-                        action_counts[action] += 1
+                        for selected in selected_indices:
+                            action_counts[choices[selected]] += 1
                     state.set_run_value(connection, action_counts_key, action_counts)
-                    item = candidates[selected_index]
-                    candidate = item[1]
-                    decision = {
-                        "run_id": run_id, "entity_id": entity_key, "entity": entity_name,
-                        "tier": tier, "document_id": item[-1],
-                        "url": candidate.canonical_source_url or candidate.url,
-                        "policy": "adaptive_linucb", "feature_version": "schain-adaptive-v1",
-                        "context": contexts[selected_index].tolist(), "action": action,
-                        "scores": choice_details[selected_index][0]["scores"],
-                        "probabilities": choice_details[selected_index][0]["probabilities"],
-                        "estimated_cost_tokens": (0 if action == "skip" else
-                            choice_details[selected_index][1].get(action)),
-                        "cost_source": "configured conservative estimate",
-                        "phase": "warmup" if warmup else "greedy",
-                        "queue_before": virtual_price,
-                    }
-                    if not pool_exhausted:
-                        _record_adaptive_decision(config, run_id, decision)
-                    if action == "skip":
-                        if warmup:
-                            seen_urls.add(candidate.canonical_source_url or candidate.url)
-                            state.set_run_value(connection, seen_key, sorted(seen_urls))
-                            _settle_adaptive_skips(connection, run_id, 1, selection_cfg)
-                            reason = "adaptive_next_candidate"
-                        else:
-                            reason = "adaptive_pool_exhausted"
+                    if pool_exhausted:
                         prepared = []
                     else:
-                        url = candidate.canonical_source_url or candidate.url
-                        if action in ("full_text", "both"):
-                            had_full_text = bool(candidate.cached_full_text)
-                            fetch_selected_full_text(candidate, config, manifest)
-                            if not had_full_text and candidate.full_text_attempted:
-                                attempt_key = f"adaptive_full_fetch_attempts:{run_id}"
-                                state.set_run_value(connection, attempt_key,
-                                    int(state.run_value(connection, attempt_key, 0)) + 1)
-                            elif had_full_text:
-                                reuse_key = f"adaptive_full_text_reuses:{run_id}"
-                                state.set_run_value(connection, reuse_key,
-                                    int(state.run_value(connection, reuse_key, 0)) + 1)
-                            if not candidate.text:
-                                decision["failure_reason"] = candidate.fetch_error or "full_text_unavailable"
-                                _record_adaptive_decision(config, run_id, decision)
+                        prepared = []
+                        skipped_count = 0
+                        for selected_index in selected_indices:
+                            item = candidates[selected_index]
+                            candidate = item[1]
+                            action = choices[selected_index]
+                            url = candidate.canonical_source_url or candidate.url
+                            decision = {
+                                "run_id": run_id, "entity_id": entity_key, "entity": entity_name,
+                                "tier": tier, "document_id": item[-1], "url": url,
+                                "policy": "adaptive_linucb", "feature_version": "schain-adaptive-v1",
+                                "context": contexts[selected_index].tolist(), "action": action,
+                                "scores": choice_details[selected_index][0]["scores"],
+                                "probabilities": choice_details[selected_index][0]["probabilities"],
+                                "estimated_cost_tokens": choice_details[selected_index][1].get(action),
+                                "cost_source": ("tokenizer count with shared snippet overhead"
+                                                if action == "snippet" else "configured conservative estimate"),
+                                "phase": "warmup" if warmup else "greedy",
+                                "queue_before": virtual_price,
+                            }
+                            _record_adaptive_decision(config, run_id, decision)
+                            if action == "skip":
                                 seen_urls.add(url)
-                                state.set_run_value(connection, seen_key, sorted(seen_urls))
-                                _settle_adaptive_skips(connection, run_id, 1, selection_cfg)
+                                skipped_count += 1
                                 reason = "adaptive_next_candidate"
-                                prepared = []
-                            else:
+                                continue
+                            if action in ("full_text", "both"):
+                                had_full_text = bool(candidate.cached_full_text)
+                                fetch_selected_full_text(candidate, config, manifest)
+                                if not had_full_text and candidate.full_text_attempted:
+                                    attempt_key = f"adaptive_full_fetch_attempts:{run_id}"
+                                    state.set_run_value(connection, attempt_key,
+                                        int(state.run_value(connection, attempt_key, 0)) + 1)
+                                elif had_full_text:
+                                    reuse_key = f"adaptive_full_text_reuses:{run_id}"
+                                    state.set_run_value(connection, reuse_key,
+                                        int(state.run_value(connection, reuse_key, 0)) + 1)
+                                if not candidate.text:
+                                    decision["failure_reason"] = candidate.fetch_error or "full_text_unavailable"
+                                    _record_adaptive_decision(config, run_id, decision)
+                                    seen_urls.add(url)
+                                    skipped_count += 1
+                                    reason = "adaptive_next_candidate"
+                                    continue
                                 download_counts_key = f"adaptive_full_downloads:{run_id}"
                                 if not had_full_text and candidate.full_text_attempted:
                                     state.set_run_value(connection, download_counts_key,
                                         int(state.run_value(connection, download_counts_key, 0)) + 1)
-                                evidence = candidate.text
                                 if action == "both":
-                                    evidence = (f"Search title and snippets:\n{candidate.title}\n"
-                                                f"{candidate.snippet}\n\nFull document:\n{candidate.text}")
-                                candidate.text = evidence
-                        else:
-                            candidate.text = None
-                        if action == "snippet" or candidate.text:
-                            try:
-                                document = make_document(candidate.document_text(), **document_kwargs_from_result(candidate))
-                            except ValueError:
-                                reason = "adaptive_candidate_unusable"
-                                prepared = []
+                                    candidate.text = (f"Search title and snippets:\n{candidate.title}\n"
+                                                      f"{candidate.snippet}\n\nFull document:\n{candidate.text}")
                             else:
-                                document["processing_action"] = action
-                                known = state.find_document(connection, document["content_hash"], document.get("source_url"))
-                                doc_id = known["doc_id"] if known else document["doc_id"]
-                                usage = state.document_usage(connection, doc_id, entity_key)
-                                remaining_budget = state.run_value(connection, budget_key)
-                                adaptive_decisions[doc_id] = {
-                                    "context": contexts[selected_index].tolist(),
-                                    "embedding": embeddings[selected_index].tolist(),
-                                    "action": action,
-                                    "estimated_cost": choice_details[selected_index][1][action],
-                                    "decision": decision,
-                                }
-                                prepared = [(item[0], candidate, item[2], document, known, usage, doc_id)]
-                                remaining_budget["reserved_estimate"] += choice_details[selected_index][1][action]
-                                state.set_run_value(connection, budget_key, remaining_budget)
+                                candidate.text = None
+                            try:
+                                document = make_document(
+                                    candidate.document_text(), **document_kwargs_from_result(candidate),
+                                )
+                            except ValueError:
+                                decision["failure_reason"] = "candidate_unusable"
+                                _record_adaptive_decision(config, run_id, decision)
+                                seen_urls.add(url)
+                                skipped_count += 1
                                 reason = "adaptive_next_candidate"
+                                continue
+                            document["processing_action"] = action
+                            known = state.find_document(connection, document["content_hash"], document.get("source_url"))
+                            doc_id = known["doc_id"] if known else document["doc_id"]
+                            usage = state.document_usage(connection, doc_id, entity_key)
+                            estimated_cost = choice_details[selected_index][1][action]
+                            adaptive_decisions[doc_id] = {
+                                "context": contexts[selected_index].tolist(),
+                                "embedding": embeddings[selected_index].tolist(),
+                                "action": action, "estimated_cost": estimated_cost,
+                                "reserved_cost": estimated_cost,
+                                "batch_input_tokens": 0, "decision": decision,
+                            }
+                            prepared.append((item[0], candidate, item[2], document, known, usage, doc_id))
+                            remaining_budget = state.run_value(connection, budget_key)
+                            remaining_budget["reserved_estimate"] += estimated_cost
+                            state.set_run_value(connection, budget_key, remaining_budget)
+                            reason = "adaptive_next_candidate"
+                        if skipped_count:
+                            state.set_run_value(connection, seen_key, sorted(seen_urls))
+                            _settle_adaptive_skips(connection, run_id, skipped_count, selection_cfg)
                 else:
                     reason = "adaptive_pool_exhausted"
             source_domains = len({
@@ -964,6 +1025,82 @@ def run_expand(
                 str(getattr(result, "escalation_stage", "") or "primary")
                 for _, result, *_ in prepared
             })
+            precomputed_extractions = {}
+            snippet_jobs = [
+                item for item in prepared
+                if item[3].get("processing_action") == "snippet"
+                and (not item[4] or item[4]["status"] in (
+                    state.PENDING, state.PROCESSING, state.FAILED,
+                ))
+            ]
+            if len(snippet_jobs) > 1 and isinstance(llm, InputBudgetLLM):
+                batch_limit = max(1, min(10, int(selection_cfg.get("snippet_batch_size", 10))))
+                batch_jobs = []
+                batch_documents = []
+                batch_tokens = 0
+                for size in range(min(batch_limit, len(snippet_jobs)), 1, -1):
+                    possible = snippet_jobs[:size]
+                    if len({item[-1] for item in possible}) != size:
+                        continue
+                    possible_documents = [
+                        {**item[3], "snippet": item[1].snippet} for item in possible
+                    ]
+                    prompt = build_snippet_batch_prompt(possible_documents, ontology)
+                    request_tokens = llm.count_request_tokens((prompt,), {})
+                    budget_state = state.run_value(connection, input_budget_key)
+                    reserved_here = sum(
+                        int(adaptive_decisions[item[-1]]["reserved_cost"]) for item in possible
+                    )
+                    available_tokens = (
+                        int(budget_state["limit"]) - int(budget_state["spent_estimate"])
+                        - max(0, int(budget_state["reserved_estimate"]) - reserved_here)
+                    )
+                    if request_tokens <= available_tokens:
+                        batch_jobs, batch_documents, batch_tokens = possible, possible_documents, request_tokens
+                        break
+                if batch_jobs:
+                    budget_before_batch = int(state.run_value(
+                        connection, input_budget_key)["spent_estimate"])
+                    try:
+                        precomputed_extractions = extract_snippet_batch(llm, batch_documents, ontology)
+                        batch_outcome = "mapped"
+                    except Exception as error:
+                        logger.warning("snippet batch failed; retrying through per-document extraction: %s", error)
+                        batch_outcome = f"fallback:{type(error).__name__}"
+                    budget_after_batch = int(state.run_value(
+                        connection, input_budget_key)["spent_estimate"])
+                    batch_input_tokens = max(0, budget_after_batch - budget_before_batch)
+                    batch_call_key = f"adaptive_snippet_batch_calls:{run_id}"
+                    state.set_run_value(connection, batch_call_key,
+                        int(state.run_value(connection, batch_call_key, 0)) + 1)
+                    batch_sizes_key = f"adaptive_snippet_batch_sizes:{run_id}"
+                    batch_sizes = state.run_value(connection, batch_sizes_key, [])
+                    batch_sizes.append(len(batch_jobs))
+                    state.set_run_value(connection, batch_sizes_key, batch_sizes)
+                    batch_budget = state.run_value(connection, input_budget_key)
+                    released = sum(int(adaptive_decisions[item[-1]]["reserved_cost"])
+                                   for item in batch_jobs)
+                    batch_budget["reserved_estimate"] = max(
+                        0, int(batch_budget["reserved_estimate"]) - released,
+                    )
+                    state.set_run_value(connection, input_budget_key, batch_budget)
+                    shares = [batch_input_tokens // len(batch_jobs)] * len(batch_jobs)
+                    for index in range(batch_input_tokens % len(batch_jobs)):
+                        shares[index] += 1
+                    for item, share in zip(batch_jobs, shares):
+                        decision_data = adaptive_decisions[item[-1]]
+                        decision_data["reserved_cost"] = 0
+                        decision_data["estimated_cost"] = share
+                        decision_data["batch_input_tokens"] = share
+                        decision_data["batch_id"] = f"{run_id}:{entity_key}:{len(batch_sizes)}"
+                    _record_adaptive_decision(config, run_id, {
+                        "run_id": run_id, "entity_id": entity_key,
+                        "batch_id": f"{run_id}:{entity_key}:{len(batch_sizes)}",
+                        "document_ids": [item[3]["doc_id"] for item in batch_jobs],
+                        "batch_size": len(batch_jobs), "input_tokens": batch_input_tokens,
+                        "tokenizer_count_before_call": batch_tokens,
+                        "outcome": batch_outcome,
+                    })
             rescue_active = bool(int(row["rescue_mode"] or 0)) if "rescue_mode" in row.keys() else False
             for _, result, direction, document, known, usage, doc_id in prepared:
                 # Another result in this same batch may just have persisted identical
@@ -1038,6 +1175,9 @@ def run_expand(
                         break
                 # Reserve first; a crash/partial extraction cannot reset document spend.
                 state.reserve_document(connection, doc_id, entity_key)
+                spent_before_document = int(state.run_value(
+                    connection, input_budget_key, {"spent_estimate": 0},
+                )["spent_estimate"]) if budget_limit is not None else 0
                 if max_seconds:
                     config["_runtime_deadline_monotonic"] = time.monotonic() + max(0, max_seconds - elapsed())
                 else:
@@ -1048,11 +1188,20 @@ def run_expand(
                     document_summary = process_document(document, config, connection, llm, ontology, driver,
                         origin_entity=entity_key, tier=tier,
                         document_index=state.document_usage_count(connection), document_budget=max_documents or None,
-                        checkpoint_sink=document_checkpoint_sink, progress_sink=progress_sink)
+                        checkpoint_sink=document_checkpoint_sink, progress_sink=progress_sink,
+                        precomputed_extraction=precomputed_extractions.get(document["doc_id"]))
                 except Exception as error:
                     doc_elapsed = time.monotonic() - doc_started
                     if adaptive and doc_id in adaptive_decisions:
-                        _settle_adaptive_cost(connection, run_id, adaptive_decisions[doc_id], selection_cfg)
+                        current_spent = int(state.run_value(connection, input_budget_key,
+                            {"spent_estimate": spent_before_document})["spent_estimate"])
+                        decision_data = adaptive_decisions[doc_id]
+                        batch_share = int(decision_data.get("batch_input_tokens", 0))
+                        _settle_adaptive_cost(
+                            connection, run_id, decision_data, selection_cfg,
+                            actual_cost=batch_share + max(0, current_spent - spent_before_document)
+                            if batch_share else None,
+                        )
                     state.finish_document_usage(connection, doc_id, entity_key, completed=False, elapsed_seconds=doc_elapsed)
                     checkpoint_time()
                     if checkpoint_manager is not None:
@@ -1096,8 +1245,14 @@ def run_expand(
                     )
                 if document_summary.get("skipped"):
                     if adaptive and doc_id in adaptive_decisions:
-                        _settle_adaptive_cost(connection, run_id, adaptive_decisions[doc_id],
-                                              selection_cfg, charge=False)
+                        decision_data = adaptive_decisions[doc_id]
+                        current_spent = int(state.run_value(connection, input_budget_key)["spent_estimate"])
+                        batch_share = int(decision_data.get("batch_input_tokens", 0))
+                        _settle_adaptive_cost(
+                            connection, run_id, decision_data, selection_cfg, charge=False,
+                            actual_cost=batch_share + max(0, current_spent - spent_before_document)
+                            if batch_share else None,
+                        )
                     summary["documents_skipped"] += 1
                     manifest.record_document(result, doc_id, mf.SKIPPED)
                     manifest.update_by_url(result.url, dedup_status=mf.DUPLICATE_CONTENT)
@@ -1133,7 +1288,13 @@ def run_expand(
                     history = state.run_value(connection, history_key, [])
                     history.append(decision_data["embedding"])
                     state.set_run_value(connection, history_key, history)
-                    _settle_adaptive_cost(connection, run_id, decision_data, selection_cfg)
+                    current_spent = int(state.run_value(connection, input_budget_key)["spent_estimate"])
+                    batch_share = int(decision_data.get("batch_input_tokens", 0))
+                    _settle_adaptive_cost(
+                        connection, run_id, decision_data, selection_cfg,
+                        actual_cost=batch_share + max(0, current_spent - spent_before_document)
+                        if batch_share else None,
+                    )
                     _record_adaptive_decision(config, run_id, {
                         **decision_data["decision"], "outcome": "processed",
                         "marginal_new_supply_edges": gained,
@@ -1236,13 +1397,14 @@ def run_expand(
     if budget_limit is not None:
         budget_summary = state.run_value(connection, input_budget_key)
         summary["input_token_budget"] = {
-            "limit_estimate": int(budget_summary["limit"]),
-            "spent_estimate": int(budget_summary["spent_estimate"]),
-            "remaining_estimate": max(0, int(budget_summary["limit"]) -
-                                      int(budget_summary["spent_estimate"])),
+            "limit_tokens": int(budget_summary["limit"]),
+            "spent_tokens": int(budget_summary["spent_estimate"]),
+            "remaining_tokens": max(0, int(budget_summary["limit"]) -
+                                     int(budget_summary["spent_estimate"])),
             "llm_requests": int(budget_summary.get("requests", 0)),
             "rejected_requests": int(budget_summary.get("rejected_requests", 0)),
-            "accounting_source": "serialized request characters divided by configured chars-per-token estimate; model tokenizer usage unavailable",
+            "accounting_source": "configured model tokenizer chat-template token count",
+            "tokenizer_model": tokenizer_model,
             "request_log": str(log_dir / f"input_token_requests_{run_id}.jsonl"),
         }
     if adaptive:
@@ -1262,10 +1424,14 @@ def run_expand(
                 connection, f"adaptive_full_fetch_attempts:{run_id}", 0)),
             "full_text_cache_reuses": int(state.run_value(
                 connection, f"adaptive_full_text_reuses:{run_id}", 0)),
-            "input_tokens_spent_estimate": int(adaptive_budget["spent_estimate"]) if adaptive_budget else None,
-            "input_tokens_remaining_estimate": max(0, int(adaptive_budget["limit"])
+            "input_tokens_spent": int(adaptive_budget["spent_estimate"]) if adaptive_budget else None,
+            "input_tokens_remaining": max(0, int(adaptive_budget["limit"])
                 - int(adaptive_budget["spent_estimate"])),
-            "input_token_accounting": "serialized request characters divided by configured chars-per-token estimate; provider tokenizer/usage unavailable",
+            "input_token_accounting": "configured model tokenizer chat-template token count",
+            "snippet_batch_calls": int(state.run_value(
+                connection, f"adaptive_snippet_batch_calls:{run_id}", 0)),
+            "snippet_batch_sizes": state.run_value(
+                connection, f"adaptive_snippet_batch_sizes:{run_id}", []),
             "decision_log": str(log_dir / f"adaptive_decisions_{run_id}.jsonl"),
             "stop_reason": summary.get("stop_reason"),
         }

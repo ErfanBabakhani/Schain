@@ -311,8 +311,6 @@ def validate_expansion_config(config: dict[str, Any]) -> None:
     if (selection.get("total_input_tokens") is not None and
             int(selection["total_input_tokens"]) <= 0):
         raise ValueError("expansion.selection.total_input_tokens must be positive")
-    if float(selection.get("input_token_chars_per_estimate", 1.0)) <= 0:
-        raise ValueError("expansion.selection.input_token_chars_per_estimate must be positive")
     if selection.get("policy") == "adaptive_linucb":
         if int(retrieval.get("max_candidates_per_entity", 0) or 0) != 200:
             raise ValueError("adaptive_linucb requires max_candidates_per_entity: 200")
@@ -322,6 +320,8 @@ def validate_expansion_config(config: dict[str, Any]) -> None:
             raise ValueError("adaptive_linucb requires expansion.selection.target_tokens_per_candidate")
         if int(selection["total_input_tokens"]) <= 0 or int(selection["target_tokens_per_candidate"]) <= 0:
             raise ValueError("adaptive token budget and target must be positive")
+        if not 1 <= int(selection.get("snippet_batch_size", 10)) <= 10:
+            raise ValueError("adaptive snippet_batch_size must be between 1 and 10")
         priors = selection.get("initial_action_prior") or {}
         if priors and (float(priors.get("skip", 0)) <= 0 or
                        any(float(value) < 0 for value in priors.values())):

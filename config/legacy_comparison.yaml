@@ -1,4 +1,8 @@
-# Controlled legacy arm with the adaptive experiment's candidate and input budget caps.
+# Controlled legacy arm with the adaptive experiment's candidate pool and tokenizer budget.
+# It intentionally retains expansion.yaml's 320-document run cap, tier document limits,
+# and legacy target/diminishing-return stops. Adaptive selection removes those limits and
+# stops on its token budget; compare actual tokens consumed as well as edge yield.
+# Install the adaptive extra for the shared Qwen tokenizer accounting: pip install -e .[adaptive]
 # Run with: schain expand --config config/legacy_comparison.yaml
 include:
   - config/expansion.yaml
@@ -12,8 +16,7 @@ expansion:
     policy: legacy
     candidate_pool_policy: title_snippet
     total_input_tokens: 200000
-    input_token_metric: estimated_input_tokens
-    input_token_chars_per_estimate: 1.0
+    input_token_metric: tokenizer_input_tokens
 
 storage:
   raw_documents: data/experiments/legacy/documents.jsonl
