@@ -26,7 +26,7 @@
         <select id="projectSelect" class="field server-only" aria-label="Project" disabled><option value="">Select a project</option></select>
         <span id="projectState" class="server-only status-label">Disconnected</span>
         <button id="newProject" class="tool-btn server-only" disabled>New Project</button>
-        <button id="manageProject" class="tool-btn server-only" disabled>Project</button>
+        <button id="manageProject" class="tool-btn server-only" disabled>Settings</button>
         <button id="connectButton" class="tool-btn server-only">Connect</button>
         <details class="dataset-menu" id="datasetMenu">
           <summary class="dataset-trigger"><span class="dataset-dot"></span><span>Graph</span><span class="chevron">⌄</span></summary>
@@ -46,18 +46,13 @@
         <div id="projectBar" class="project-bar server-only">
           <span id="projectSummary">Connect to your server to open a project.</span>
           <span class="toolbar-spacer"></span>
+          <span id="pendingCount" class="pending-count" title="Faint, dashed relationships are awaiting validation." hidden></span>
+          <button id="showActivity" class="tool-btn" disabled>Activity</button>
           <button id="startRun" class="tool-btn" disabled>Start</button>
           <button id="pauseRun" class="tool-btn" disabled>Pause</button>
           <button id="resumeRun" class="tool-btn" disabled>Resume</button>
         </div>
         <div id="appMessage" class="app-message server-only" role="status" aria-live="polite" hidden></div>
-        <details id="liveActivity" class="live-activity server-only" open hidden>
-          <summary>Live activity <span id="liveStatus" class="status-label">Connecting</span><span id="pendingCount"></span><span class="pending-key">Dashed, faint relationships await validation</span></summary>
-          <div class="live-columns">
-            <section><h3>Processing documents</h3><div id="liveDocuments" class="activity-list"></div></section>
-            <section><h3>Recent activity</h3><div id="liveEvents" class="activity-list" role="log" aria-label="Expansion activity"></div></section>
-          </div>
-        </details>
         <header class="graph-toolbar">
           <div class="toolbar-cluster view-cluster">
             <div class="segmented view-mode" id="viewMode" aria-label="Graph mode">
@@ -72,14 +67,6 @@
           <div class="toolbar-spacer"></div>
 
           <div class="toolbar-cluster">
-            <div class="segmented entity-scope-mode" id="entityScopeMode" aria-label="Entity scope">
-              <button class="active" data-entity-scope="all">All entities</button>
-              <button data-entity-scope="companies">Companies</button>
-            </div>
-            <div class="segmented dimension-mode" id="dimensionMode" aria-label="Dimension">
-              <button class="active" data-dimension="3d">3D</button>
-              <button data-dimension="2d">2D</button>
-            </div>
             <div class="search-box">
               <span class="search-icon">⌕</span>
               <input id="entitySearch" type="search" placeholder="Search" autocomplete="off" />
@@ -88,6 +75,20 @@
             <div class="popover-wrap">
               <button id="filterBtn" class="tool-btn">Filters</button>
               <div id="filterPopover" class="filter-popover" hidden>
+                <div class="filter-group">
+                  <div class="filter-head">Entities</div>
+                  <div class="segmented entity-scope-mode" id="entityScopeMode" aria-label="Entity scope">
+                    <button class="active" data-entity-scope="all">All entities</button>
+                    <button data-entity-scope="companies">Companies</button>
+                  </div>
+                </div>
+                <div class="filter-group">
+                  <div class="filter-head">Dimension</div>
+                  <div class="segmented dimension-mode" id="dimensionMode" aria-label="Dimension">
+                    <button class="active" data-dimension="3d">3D</button>
+                    <button data-dimension="2d">2D</button>
+                  </div>
+                </div>
                 <div class="filter-group">
                   <div class="filter-head"><span>Relation</span><button id="relationAll" class="mini-action">All</button></div>
                   <div id="relationFilters" class="filter-list"></div>
@@ -199,22 +200,34 @@
     </form>
   </dialog>
   <dialog id="projectDialog" class="project-dialog server-only" aria-labelledby="projectDialogTitle">
+    <header><h2 id="projectDialogTitle">New project</h2><button type="button" data-close-dialog aria-label="Close">×</button></header>
+    <nav id="projectTabs" class="project-tabs" aria-label="Project sections" hidden>
+      <button type="button" data-project-tab="settings" aria-pressed="true">Settings</button>
+      <button type="button" data-project-tab="documents" aria-pressed="false">Documents</button>
+      <button type="button" data-project-tab="activity" aria-pressed="false">Activity</button>
+    </nav>
     <form id="projectForm">
-      <header><h2 id="projectDialogTitle">New project</h2><button type="button" data-close-dialog aria-label="Close">×</button></header>
       <label>Project name<input id="projectName" class="field" maxlength="200" required></label>
-      <label>Tier-0 companies <small>One company per line</small><textarea id="projectSeeds" class="field" rows="3" required></textarea></label>
-      <p id="identityNote" class="form-note" hidden>Seeds and maximum tier are fixed after the first job.</p>
+      <label>Starting companies <small>One per line</small><textarea id="projectSeeds" class="field" rows="3" required></textarea></label>
+      <p id="identityNote" class="form-note" hidden>Starting companies and depth are fixed after the first run.</p>
+      <label class="run-mode"><span><input id="runUntilPaused" type="checkbox"> Run until paused</span><small>No time or document budget.</small></label>
       <div id="projectLimits" class="limits-grid"></div>
+      <details id="advancedSettings" class="advanced-settings"><summary>Advanced settings</summary><div id="advancedLimits" class="limits-grid"></div></details>
       <p id="projectError" class="form-error" role="alert"></p>
-      <footer><button id="saveProject" class="primary-btn">Create project</button></footer>
+      <footer><span id="settingsNote" class="form-note" hidden>Pause the project to edit.</span><button id="saveProject" class="primary-btn">Create project</button></footer>
     </form>
     <section id="projectActivity" hidden>
       <h3>Recent documents</h3>
-      <form id="documentForm"><label>Add document <small>UTF-8 text, Markdown or PDF · up to 10 MiB</small><input id="documentInput" class="field" type="file" accept=".txt,.md,.pdf" required></label><button id="uploadDocument" class="tool-btn">Upload and process</button></form>
+      <form id="documentForm"><label>Add document <small>TXT, Markdown or PDF · up to 10 MB</small><input id="documentInput" class="field" type="file" accept=".txt,.md,.pdf" required></label><button id="uploadDocument" class="tool-btn">Upload</button></form>
       <p id="uploadMessage" role="status"></p>
       <div id="documentList" class="activity-list"></div>
       <button id="moreDocuments" type="button" class="tool-btn" hidden>More documents</button>
-      <h3>Recent runs and errors</h3><div id="runList" class="activity-list"></div>
+      <details class="run-history"><summary>Runs and errors</summary><div id="runList" class="activity-list"></div></details>
+    </section>
+    <section id="liveActivity" hidden>
+      <span id="liveStatus" class="form-note">Connecting</span>
+      <h3>Processing documents</h3><div id="liveDocuments" class="activity-list"></div>
+      <h3>Recent activity</h3><div id="liveEvents" class="activity-list" role="log" aria-label="Expansion activity"></div>
     </section>
   </dialog>
   <script type="application/json" id="graphData">__GRAPH_DATA__</script>

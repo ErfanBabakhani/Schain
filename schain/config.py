@@ -292,14 +292,46 @@ def validate_expansion_config(config: dict[str, Any]) -> None:
     """Catch invalid ceilings before a restart can clear any checkpoint files."""
     expansion = config.get("expansion", {})
     for key in ("max_tier", "max_documents"):
-        if int(expansion.get(key, 0)) < 0:
+        if expansion.get(key) is not None and int(expansion.get(key, 0)) < 0:
             raise ValueError(f"expansion.{key} must be nonnegative")
     if float(config.get("runtime", {}).get("max_minutes", 110)) < 0:
         raise ValueError("runtime.max_minutes must be nonnegative")
     retrieval = expansion.get("retrieval", {})
     for key in ("target_documents_per_entity", "max_documents_per_entity"):
-        if key in retrieval and int(retrieval[key]) < 0:
+        if key in retrieval and retrieval[key] is not None and int(retrieval[key]) < 0:
             raise ValueError(f"expansion.retrieval.{key} must be nonnegative")
     for key in ("target_documents_by_tier", "max_documents_by_tier"):
         if any(int(v) < 0 for v in (retrieval.get(key) or {}).values()):
             raise ValueError(f"expansion.retrieval.{key} values must be nonnegative")
+    selection = expansion.get("selection") or {}
+    if selection.get("policy", "legacy") not in {"legacy", "adaptive_linucb"}:
+        raise ValueError("expansion.selection.policy must be legacy or adaptive_linucb")
+    if selection.get("candidate_pool_policy") not in (None, "title_snippet"):
+        raise ValueError("expansion.selection.candidate_pool_policy must be title_snippet when set")
+    if (selection.get("total_input_tokens") is not None and
+            int(selection["total_input_tokens"]) <= 0):
+        raise ValueError("expansion.selection.total_input_tokens must be positive")
+    if float(selection.get("input_token_chars_per_estimate", 1.0)) <= 0:
+        raise ValueError("expansion.selection.input_token_chars_per_estimate must be positive")
+    if selection.get("policy") == "adaptive_linucb":
+        if int(retrieval.get("max_candidates_per_entity", 0) or 0) != 200:
+            raise ValueError("adaptive_linucb requires max_candidates_per_entity: 200")
+        if selection.get("total_input_tokens") is None:
+            raise ValueError("adaptive_linucb requires expansion.selection.total_input_tokens")
+        if selection.get("target_tokens_per_candidate") is None:
+            raise ValueError("adaptive_linucb requires expansion.selection.target_tokens_per_candidate")
+        if int(selection["total_input_tokens"]) <= 0 or int(selection["target_tokens_per_candidate"]) <= 0:
+            raise ValueError("adaptive token budget and target must be positive")
+        priors = selection.get("initial_action_prior") or {}
+        if priors and (float(priors.get("skip", 0)) <= 0 or
+                       any(float(value) < 0 for value in priors.values())):
+            raise ValueError("adaptive action priors must be nonnegative and skip must be positive")
+        if float(selection.get("cost_reference_tokens", 1000)) <= 0:
+            raise ValueError("expansion.selection.cost_reference_tokens must be positive")
+        if float(selection.get("warmup_temperature", 1.0)) <= 0:
+            raise ValueError("expansion.selection.warmup_temperature must be positive")
+        if float(selection.get("ridge_lambda", 1.0)) <= 0 or float(selection.get("linucb_alpha", .5)) < 0:
+            raise ValueError("adaptive ridge_lambda must be positive and linucb_alpha nonnegative")
+        rewards = selection.get("reward_weights") or {}
+        if float(rewards.get("clip_max", 5.0)) <= 0 or float(rewards.get("new_supply_edge", 1.0)) < 0:
+            raise ValueError("adaptive new_supply_edge reward must be nonnegative and clip_max positive")

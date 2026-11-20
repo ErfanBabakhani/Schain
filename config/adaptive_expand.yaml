@@ -1,0 +1,73 @@
+# Run with: schain expand --config config/adaptive_expand.yaml
+# Uses the same seed set, query plan, extraction model and validator as expansion.yaml.
+# Install optional dependencies, then install the configured spaCy model before running:
+#   pip install -e .[adaptive]
+#   python -m spacy download en_core_web_sm
+include:
+  - config/expansion.yaml
+
+expansion:
+  max_documents: null
+  max_documents_per_run: null
+  retrieval:
+    target_documents_per_entity: 0
+    max_documents_per_entity: null
+    target_documents_by_tier: {}
+    max_documents_by_tier: {}
+    max_candidates_per_entity: 200
+    max_candidates_per_domain: null
+    max_full_text_fetches_per_domain: null
+  selection:
+    policy: adaptive_linucb
+    candidate_pool_policy: title_snippet
+    total_input_tokens: 200000
+    input_token_metric: estimated_input_tokens
+    target_tokens_per_candidate: 1000
+    cost_reference_tokens: 1000
+    primal_reward_weight_V: 1.0
+    initial_virtual_queue: 0.0
+    warmup_candidates: 200
+    warmup_temperature: 1.0
+    initial_action_prior:
+      skip: 0.30
+      snippet: 0.60
+      full_text: 0.05
+      both: 0.05
+    random_seed: 42
+    linucb_alpha: 0.5
+    ridge_lambda: 1.0
+    reward_weights:
+      new_supply_edge: 1.0
+      clip_max: 5.0
+    embedding_model: BAAI/bge-small-en-v1.5
+    embedding_batch_size: 32
+    ner_model: en_core_web_sm
+    official_domains:
+      - bmwgroup.com
+      - toyota.com
+      - tesla.com
+      - byd.com
+      - catl.com
+      - panasonic.com
+      - lgensol.com
+      - samsungsdi.com
+      - tsmc.com
+      - nvidia.com
+    prompt_overhead_tokens_estimate: 2000
+    full_text_tokens_estimate: 4000
+    input_token_chars_per_estimate: 1.0
+
+storage:
+  raw_documents: data/experiments/adaptive/documents.jsonl
+  normalized_documents: data/experiments/adaptive/documents.parquet
+  extracted_facts: data/experiments/adaptive/facts.parquet
+  extractions: data/experiments/adaptive/extractions
+  search_results: data/experiments/shared/search_results.parquet
+  entity_resolution: data/experiments/adaptive/entity_resolution.parquet
+  rejected_facts: data/experiments/adaptive/rejected_facts.parquet
+  edge_support: data/experiments/adaptive/edge_support.parquet
+  verification_evidence: data/experiments/adaptive/verification_evidence.parquet
+  extraction_integrity: data/experiments/adaptive/extraction_integrity.json
+  state_db: data/experiments/adaptive/state.db
+  graph_export: outputs/experiments/adaptive_graph.json
+  logs: logs/experiments/adaptive

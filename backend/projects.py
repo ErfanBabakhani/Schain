@@ -79,7 +79,8 @@ class Projects:
         config["seeds"] = settings.seeds
         expansion = config["expansion"]
         expansion.pop("max_documents", None)
-        expansion.update(max_tier=limits.max_tier, max_documents_per_run=limits.max_documents_per_run)
+        expansion.update(max_tier=limits.max_tier,
+                         max_documents_per_run=0 if settings.run_until_paused else limits.max_documents_per_run)
         retrieval = expansion.setdefault("retrieval", {})
         retrieval.update(max_documents_per_entity=limits.max_documents_per_entity,
                          target_documents_per_entity=limits.max_documents_per_entity)
@@ -87,7 +88,7 @@ class Projects:
         retrieval.pop("target_documents_by_tier", None)
         config["concurrency"].update(retrieval=limits.retrieval_concurrency,
                                      llm_max_concurrency=limits.llm_max_concurrency)
-        config["runtime"]["max_minutes"] = limits.max_minutes
+        config["runtime"]["max_minutes"] = 0 if settings.run_until_paused else limits.max_minutes
         return config
 
     def identifiers(self):
@@ -136,6 +137,8 @@ class Projects:
                 self.require_idle(connection)
                 row = connection.execute("SELECT * FROM project").fetchone()
                 old = ProjectSettings.model_validate_json(row["settings"])
+                if "run_until_paused" not in settings.model_fields_set:
+                    settings = settings.model_copy(update={"run_until_paused": old.run_until_paused})
                 if connection.execute("SELECT 1 FROM runs LIMIT 1").fetchone() and (
                     old.seeds != settings.seeds or old.limits.max_tier != settings.limits.max_tier
                 ):

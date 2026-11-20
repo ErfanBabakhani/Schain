@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+from copy import deepcopy
 import logging
+from pathlib import Path
 
 import pandas as pd
 import pytest
@@ -15,6 +18,74 @@ ARTICLE = (
     "BMW has named CATL as a battery supplier for its European electric vehicle "
     "plants, under a multi-year sourcing agreement signed this year."
 )
+
+
+def test_adaptive_retrieval_resolution_path_does_not_fetch_document_body(monkeypatch):
+    result = SearchResult(provider="gdelt", query="BMW suppliers", title="BMW suppliers",
+                          url="https://example.test/article", snippet="BMW supplier agreement")
+
+    async def unexpected_fetch(*args, **kwargs):
+        raise AssertionError("candidate body must wait until adaptive selection")
+
+    monkeypatch.setattr(retrieve, "fetch_article_text", unexpected_fetch)
+    asyncio.run(retrieve._add_full_text(
+        object(), asyncio.Semaphore(1), [result], {"gdelt": {"fetch_full_text": True}},
+        fetch_body=False,
+    ))
+    assert result.text is None
+    assert result.full_text_attempted is False
+
+
+def test_legacy_and_adaptive_comparison_reuse_the_same_title_snippet_pool(
+    two_provider_config, connection, monkeypatch,
+):
+    async def search(client, query, max_results, options):
+        return [SearchResult(
+            provider="wikipedia", query=query, title="BMW supplier agreement",
+            url="https://example.test/article", snippet="BMW names a battery supplier.",
+            text=ARTICLE,
+        )]
+
+    monkeypatch.setitem(retrieve.PROVIDERS, "wikipedia", search)
+    two_provider_config["expansion"]["sources"]["gdelt"]["enabled"] = False
+    adaptive = deepcopy(two_provider_config)
+    adaptive["expansion"]["selection"] = {
+        "policy": "adaptive_linucb", "candidate_pool_policy": "title_snippet",
+    }
+    legacy = deepcopy(two_provider_config)
+    legacy["expansion"]["selection"] = {
+        "policy": "legacy", "candidate_pool_policy": "title_snippet",
+    }
+
+    adaptive_pool = retrieve.retrieve_for_entity(
+        adaptive, "BMW", "company:bmw", 0, connection,
+    )
+    legacy_pool = retrieve.retrieve_for_entity(
+        legacy, "BMW", "company:bmw", 0, connection,
+    )
+
+    assert [result.url for result in adaptive_pool] == [result.url for result in legacy_pool]
+    assert adaptive_pool[0].text is None and legacy_pool[0].text is None
+    assert adaptive_pool[0].cached_full_text == legacy_pool[0].cached_full_text == ARTICLE
+
+
+def test_selected_full_text_reuses_cached_body_and_enriches_provenance(monkeypatch):
+    result = SearchResult(
+        provider="gdelt", query="BMW suppliers", title="BMW supplier agreement",
+        url="https://example.test/article", snippet="BMW supplier agreement",
+        cached_full_text=ARTICLE,
+    )
+    enriched = []
+
+    async def enrich(results, config):
+        enriched.extend(results)
+
+    monkeypatch.setattr(retrieve, "enrich_search_results", enrich)
+    returned = retrieve.fetch_selected_full_text(result, {}, manifest=None)
+
+    assert returned is result
+    assert result.text == ARTICLE
+    assert enriched == [result]
 
 
 @pytest.fixture(autouse=True)
@@ -79,6 +150,60 @@ def test_results_are_persisted_and_the_query_is_not_reissued(
     )
     assert calls == []
     assert {result.url for result in second} == {result.url for result in first}
+
+
+def test_candidate_snapshot_is_reused_with_a_fresh_experiment_state(
+    two_provider_config, connection, monkeypatch, tmp_path,
+):
+    calls: list[str] = []
+    for name, host in (("wikipedia", "a"), ("gdelt", "b")):
+        monkeypatch.setitem(retrieve.PROVIDERS, name,
+                            provider_returning(f"https://{host}.test/1", calls, name))
+    first = retrieve.retrieve_for_entity(
+        two_provider_config, "BMW", "company:bmw", 0, connection,
+    )
+    assert len(first) == 2
+
+    calls.clear()
+    second_connection = state.connect(Path(two_provider_config["storage"]["state_db"]).parent / "second.db")
+    try:
+        second = retrieve.retrieve_for_entity(
+            two_provider_config, "BMW", "company:bmw", 0, second_connection,
+        )
+    finally:
+        second_connection.close()
+    assert calls == []
+    assert {result.url for result in second} == {result.url for result in first}
+
+
+def test_adaptive_pool_caps_at_200_without_a_domain_quota(two_provider_config, connection, monkeypatch):
+    alphabet = "abcdefghijklmnopqrstuvwxyz"
+
+    def label(number):
+        chars = []
+        while number:
+            number, rem = divmod(number, len(alphabet))
+            chars.append(alphabet[rem])
+        return "".join(reversed(chars)) or "a"
+
+    async def search(client, query, max_results, options):
+        return [SearchResult(
+            provider="gdelt", query=query, title=f"BMW supplier agreement {label(i)} components",
+            url=f"https://single.test/{i}", snippet=f"BMW supplier agreement for component {label(i)}",
+            text=ARTICLE + f" Source contract identifier {label(i)}.",
+        ) for i in range(205)]
+
+    monkeypatch.setitem(retrieve.PROVIDERS, "gdelt", search)
+    two_provider_config["expansion"]["sources"]["wikipedia"]["enabled"] = False
+    two_provider_config["expansion"]["selection"] = {"policy": "adaptive_linucb"}
+    retrieval_cfg = two_provider_config["expansion"]["retrieval"]
+    retrieval_cfg["max_candidates_per_entity"] = 200
+    retrieval_cfg["max_candidates_per_domain"] = 1
+    candidates = retrieve.retrieve_for_entity(
+        two_provider_config, "BMW", "company:bmw", 0, connection,
+    )
+    assert len(candidates) == 200
+    assert len({result.source_domain for result in candidates}) == 1
 
 
 def test_the_same_article_from_two_providers_is_deduplicated(

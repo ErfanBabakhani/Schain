@@ -61,6 +61,8 @@ class SearchResult:
     selection_reason: Optional[str] = None
     document_type: Optional[str] = None
     escalation_stage: Optional[str] = None
+    cached_full_text: Optional[str] = None  # body snapshot held back until adaptive selection
+    provider_rank: Optional[int] = None
 
     @property
     def content_source(self) -> str:

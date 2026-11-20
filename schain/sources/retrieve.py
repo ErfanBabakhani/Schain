@@ -417,8 +417,9 @@ async def _run_query(
         results = await PROVIDERS[provider](client, query, max_results, options)
     if not results and request_error.get():
         raise RuntimeError(f"{provider} search failed: {request_error.get()}")
-    for result in results:
+    for rank, result in enumerate(results, start=1):
         result.entity_key, result.tier, result.search_id = entity_key, tier, sid
+        result.provider_rank = rank
     return results
 
 
@@ -430,6 +431,7 @@ async def _add_full_text(
     manifest: Optional[mf.RetrievalManifest] = None,
     *,
     max_title_lookups: int = 0,
+    fetch_body: bool = True,
 ) -> None:
     """Resolve publisher article URLs first; fetch each direct URL at most once.
 
@@ -480,6 +482,12 @@ async def _add_full_text(
                 result.canonical_source_url = recovered
             elif not result.fetch_error:
                 result.fetch_error = "title_lookup_no_result"
+
+    if not fetch_body:
+        if manifest:
+            for result in results:
+                manifest.record_content(result)
+        return
 
     fetch_tasks: dict[str, asyncio.Task] = {}
 
@@ -554,6 +562,9 @@ async def retrieve_async(
     sources = expansion.get("sources", {}) or {}
     relevance = relevance_settings(expansion)
     retrieval_cfg = expansion.get("retrieval") or {}
+    selection_cfg = expansion.get("selection") or {}
+    adaptive = selection_cfg.get("policy") == "adaptive_linucb"
+    metadata_pool = adaptive or selection_cfg.get("candidate_pool_policy") == "title_snippet"
     resume = config.get("runtime", {}).get("resume", True)
     concurrency = config.get("concurrency", {})
     semaphore = asyncio.Semaphore(max(1, concurrency.get("retrieval", 8)))
@@ -608,6 +619,12 @@ async def retrieve_async(
             ):
                 cached_ids.append(sid)
                 continue
+            if resume and search is None and cached_counts.get(sid, 0):
+                cached_ids.append(sid)
+                state.record_search(connection, sid, entity_key, tier, provider, query,
+                                    state.DONE, int(cached_counts[sid]))
+                logger.info("reused %d cached provider candidates for %s", cached_counts[sid], sid)
+                continue
             pending.append((provider, query, query_limit(spec, provider), options, sid))
 
     fresh: list[SearchResult] = []
@@ -639,6 +656,10 @@ async def retrieve_async(
         combined = cached + fresh
         if cached_ids:
             logger.info("%d query result set(s) reused from a previous run", len(cached_ids))
+        if not metadata_pool:
+            for result in combined:
+                if result.cached_full_text and not result.text:
+                    result.text = result.cached_full_text
         for rank, result in enumerate(combined, start=1):
             if manifest:
                 manifest.record_candidate(entity_name, tier, result.provider,
@@ -654,6 +675,16 @@ async def retrieve_async(
             previous = unique.get(key)
             if previous is None or (result.text and not previous.text):
                 unique[key] = result
+            if previous is not None and result.provider_rank:
+                representative = unique[key]
+                if not representative.provider_rank or result.provider_rank < representative.provider_rank:
+                    representative.provider_rank = result.provider_rank
+
+        if metadata_pool:
+            for result in unique.values():
+                if result.text:
+                    result.cached_full_text = result.text
+                    result.text = None
 
         preliminary = sort_discovery_results(list(unique.values()), entity_name,
                                              aliases=variants, policy=policy)
@@ -671,6 +702,8 @@ async def retrieve_async(
         attempted = sum(bool(r.full_text_attempted) for r in unique.values())
         remaining_fetches = max(0, max_fetches - attempted)
         fetchable = [r for r in fetchable if not r.full_text_attempted][:remaining_fetches]
+        if metadata_pool:
+            fetchable = preliminary_fetch
         # Ensure top unresolved Google News wrappers get title recovery even when
         # they sit just outside the body-fetch shortlist (snippet evidence still valid).
         fetchable_ids = {id(r) for r in fetchable}
@@ -689,13 +722,14 @@ async def retrieve_async(
         await _add_full_text(
             client, semaphore, fetchable, sources, manifest,
             max_title_lookups=max(0, max_lookups - prior_lookups),
+            fetch_body=not metadata_pool,
         )
         # Preserve raw provider/query candidates, but share fetched content/provenance
         # for exact URL duplicates without issuing more requests.
         for key, representative in unique.items():
             for result in duplicates[key]:
                 if result is not representative:
-                    for name in ("text", "canonical_source_url", "canonical_resolution_attempted", "title_lookup_attempted",
+                    for name in ("text", "cached_full_text", "canonical_source_url", "canonical_resolution_attempted", "title_lookup_attempted",
                                  "full_text_attempted", "fetch_status_code", "fetch_error"):
                         setattr(result, name, getattr(representative, name))
                     if manifest:
@@ -766,10 +800,11 @@ async def retrieve_async(
         )]
         ranked = sort_discovery_results(usable, entity_name, aliases=variants, policy=policy)
         selected = diversify_by_title(ranked)
-        selected = diversify_by_domain(
-            selected,
-            max_per_domain=int(retrieval_cfg.get("max_candidates_per_domain") or 0),
-        )
+        if not adaptive:
+            selected = diversify_by_domain(
+                selected,
+                max_per_domain=int(retrieval_cfg.get("max_candidates_per_domain") or 0),
+            )
         max_candidates = int(retrieval_cfg.get("max_candidates_per_entity") or 0)
         if max_candidates > 0:
             selected = selected[:max_candidates]
@@ -826,3 +861,23 @@ def retrieve_for_entity(
             llm=llm, escalation_stages=escalation_stages,
         )
     )
+
+
+def fetch_selected_full_text(result: SearchResult, config: dict[str, Any], manifest=None) -> SearchResult:
+    """Fetch one already-selected candidate; adaptive mode never bulk-fetches bodies."""
+    if result.cached_full_text:
+        result.text = result.cached_full_text
+        asyncio.run(enrich_search_results([result], config))
+        return result
+
+    async def fetch_one():
+        timeout = config.get("concurrency", {}).get("http_timeout_seconds", 20)
+        async with build_client(timeout) as client:
+            await _add_full_text(
+                client, asyncio.Semaphore(1), [result],
+                config.get("expansion", {}).get("sources", {}) or {}, manifest,
+                max_title_lookups=0,
+            )
+            await enrich_search_results([result], config, client=client)
+    asyncio.run(fetch_one())
+    return result

@@ -5,13 +5,13 @@
   const explorer = window.SChainExplorer;
   const activeStates = new Set(['queued', 'running', 'pausing']);
   const limits = [
-    ['max_tier', 'Maximum discovery tier', 3, 0, 10, 'Only supply relationships advance a tier.'],
+    ['max_tier', 'Discovery depth', 3, 0, 10, 'Supply-chain tiers beyond the starting companies.'],
     ['max_documents_per_entity', 'Documents per entity', 5, 1, 100],
     ['max_documents_per_run', 'Documents per run', 10, 1, 1000],
     ['max_total_documents', 'Total document budget', 100, 1, 100000],
-    ['llm_max_concurrency', 'LLM concurrency', 1, 1, 8],
-    ['retrieval_concurrency', 'Retrieval concurrency', 2, 1, 8],
-    ['max_minutes', 'Session duration (minutes)', 30, 0.01, 1440, 'A new time allowance for each execution session.']
+    ['llm_max_concurrency', 'Parallel model requests', 1, 1, 8],
+    ['retrieval_concurrency', 'Parallel searches', 2, 1, 8],
+    ['max_minutes', 'Run time (minutes)', 30, 0.01, 1440]
   ];
   const session = { base: '', token: '', connected: false, projects: [], request: null, localProxy: false, csrf: '', connecting: false };
   let current = null, timer = null, editing = false, saving = false;
@@ -22,8 +22,8 @@
     const input = document.createElement('input');
     Object.assign(input, { id: key, type: 'number', min, max, value, required: true, className: 'field', step: key === 'max_minutes' ? 'any' : '1' });
     label.append(input);
-    if (hint) { const small = document.createElement('small'); small.textContent = hint; label.append(small); }
-    $('projectLimits').append(label);
+    if (hint) input.title = hint;
+    $(key === 'max_tier' ? 'projectLimits' : 'advancedLimits').append(label);
   }
 
   function message(text = '') {
@@ -35,6 +35,7 @@
     $('projectActivity').hidden = true;
     $('liveActivity').hidden = true;
     $('liveDocuments').replaceChildren(); $('liveEvents').replaceChildren();
+    $('pendingCount').hidden = true;
     $('projectSummary').textContent = 'Select a project to inspect its graph.';
     $('projectDialog').close();
   }
@@ -81,6 +82,11 @@
     $('projectSelect').disabled = !session.connected;
     $('newProject').disabled = !session.connected || saving;
     $('manageProject').disabled = !project;
+    $('showActivity').disabled = !project;
+    $('projectBar').hidden = !project;
+    $('startRun').hidden = active;
+    $('pauseRun').hidden = !active;
+    $('resumeRun').hidden = !['paused', 'failed', 'completed'].includes(project?.status);
     $('startRun').disabled = !project || active || current.busy;
     $('pauseRun').disabled = !project || !['queued', 'running'].includes(project.status) || current.busy;
     $('resumeRun').disabled = !project || !['paused', 'failed', 'completed'].includes(project.status) || current.busy;
@@ -90,7 +96,12 @@
     if (locked) { $('projectSeeds').value = project.seeds.join('\n'); $('max_tier').value = project.limits.max_tier; }
     $('identityNote').hidden = !locked;
     for (const input of $('projectForm').querySelectorAll('input,textarea')) input.disabled = saving || (editing && active) || (locked && ['projectSeeds', 'max_tier'].includes(input.id));
+    if ($('runUntilPaused').checked) {
+      for (const key of ['max_minutes', 'max_documents_per_run', 'max_total_documents']) $(key).disabled = true;
+    }
     $('saveProject').disabled = saving || (editing && active);
+    $('saveProject').hidden = editing && active;
+    $('settingsNote').hidden = !editing || !active;
   }
   function projectPath(context) { return '/projects/' + encodeURIComponent(context.id); }
   function showProject(context) {
@@ -99,46 +110,78 @@
     if (option) option.textContent = project.name;
     $('datasetTitle').textContent = project.name;
     $('projectState').textContent = project.status;
-    const explanation = { queued: 'Waiting for the server worker', running: 'Processing on the server', pausing: 'Graceful pause requested; finishing the current unit', paused: 'Paused', completed: 'Last job completed', failed: 'Last job failed; inspect recent errors', ready: 'Ready to start' }[project.status];
-    const stats = project.statistics;
-    const documents = Object.entries(stats.documents).map(([key, value]) => `${value} ${key.toLowerCase()}`).join(', ');
-    $('projectSummary').textContent = `${explanation} · ${stats.nodes} entities · ${stats.edges} relationships · ${documents || 'No documents'}`;
+    const explanation = { queued: 'Waiting for worker', running: 'Running', pausing: 'Pausing · finishing current document', paused: 'Paused', completed: 'Completed', failed: 'Run failed · see Activity', ready: 'Ready' }[project.status];
+    $('projectSummary').textContent = explanation;
     updateControls(); renderActivity(context);
   }
   function row(root, title, detail) {
     const element = document.createElement('div'); element.className = 'activity-row';
-    const heading = document.createElement('strong'); heading.textContent = title;
+    const heading = document.createElement('strong'); heading.textContent = title; heading.title = title;
     const note = document.createElement('span'); note.textContent = detail;
     element.append(heading, note); root.append(element); return element;
   }
   function renderActivity(context) {
+    const signature = JSON.stringify([context.documents, context.project.runs, context.project.errors]);
+    if (signature === context.documentSignature) return;
+    context.documentSignature = signature;
+    const opened = new Set([...$('documentList').querySelectorAll('details[open]')].map(el => el.dataset.document));
+    const scroll = $('documentList').scrollTop;
     $('documentList').replaceChildren(); $('runList').replaceChildren();
-    for (const doc of context.documents) row($('documentList'), `${doc.title || doc.doc_id} · ${doc.status}${doc.stage ? ' · ' + (stageLabels[doc.stage] || doc.stage) : ''}`, [doc.error, doc.source_url, doc.origin_entity, doc.updated_at].filter(Boolean).join(' · '));
-    if (!context.documents.length) $('documentList').textContent = 'No processed documents yet.';
+    for (const doc of context.documents) {
+      const item = document.createElement('details'); item.className = 'document-row';
+      item.dataset.document = doc.doc_id; item.open = opened.has(doc.doc_id);
+      const summary = document.createElement('summary');
+      const title = document.createElement('strong'); title.textContent = doc.title || doc.doc_id; title.title = title.textContent;
+      const status = document.createElement('span'); status.className = 'document-status';
+      status.textContent = doc.error ? 'Error' : ({ PENDING: 'Waiting', PROCESSING: 'Extracting', EXTRACTED: 'Validating', RESOLVED: 'Processed', COMMITTED: 'Processed', FAILED: 'Failed' }[doc.status] || doc.status);
+      summary.append(title, status); item.append(summary);
+      const detail = document.createElement('div'); detail.className = 'document-detail';
+      const note = document.createElement('p');
+      note.textContent = [doc.status, doc.error || stageLabels[doc.stage], doc.origin_entity, doc.updated_at, doc.doc_id].filter(Boolean).join(' · ');
+      detail.append(note);
+      if (doc.source_url) {
+        try {
+          const url = new URL(doc.source_url);
+          if (['http:', 'https:'].includes(url.protocol)) {
+            const link = document.createElement('a'); link.href = url.href; link.textContent = url.hostname;
+            link.title = url.href; link.target = '_blank'; link.rel = 'noopener noreferrer'; detail.append(link);
+          }
+        } catch { /* Source remains available in the exported graph. */ }
+      }
+      item.append(detail); $('documentList').append(item);
+    }
+    $('documentList').scrollTop = scroll;
+    if (!context.documents.length) $('documentList').textContent = 'No documents yet.';
     for (const run of context.project.runs) row($('runList'), `${run.kind} · ${run.status}`, [run.created_at, run.error, run.summary?.stop_reason].filter(Boolean).join(' · '));
     for (const error of context.project.errors) row($('runList'), error.doc_id || error.entity_key, error.error);
     if (!context.project.runs.length) $('runList').textContent = 'No runs yet.';
     $('moreDocuments').hidden = context.documentLimit >= 200 || context.documents.length < context.documentLimit;
   }
   const stageLabels = {
-    retrieved: 'Document received', extraction: 'Extracting relationships', resolution: 'Resolving entities',
-    validation: 'Validating relationships', facts_persistence: 'Saving validated facts',
-    resolved: 'Validation completed', commit: 'Graph commit', failed: 'Document failed', chunk_started: 'Processing chunk',
-    chunk_extracted: 'Chunk extracted', run_running: 'Run started', run_completed: 'Run completed',
+    retrieved: 'Received', extraction: 'Extracting', resolution: 'Resolving',
+    validation: 'Validating', facts_persistence: 'Saving',
+    resolved: 'Validated', commit: 'Saved', failed: 'Failed', chunk_started: 'Processing chunk',
+    chunk_extracted: 'Chunk extracted', run_running: 'Started', run_completed: 'Completed',
     run_paused: 'Run paused', run_failed: 'Run failed', run_interrupted: 'Worker interrupted'
   };
   function showLive(context, activity) {
     context.cursor = activity.cursor; context.moreActivity = activity.has_more;
-    $('liveActivity').hidden = false;
-    $('liveStatus').textContent = `${activeStates.has(context.project.status) ? 'Live' : 'Up to date'} · ${new Date().toLocaleTimeString()}`;
-    $('pendingCount').textContent = `${activity.pending_relationships} pending relationships`;
-    const activeSignature = JSON.stringify([activity.active_documents, activity.entities]);
+    $('liveStatus').textContent = `Updated ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+    $('pendingCount').textContent = `${activity.pending_relationships} pending`;
+    $('pendingCount').hidden = !activity.pending_relationships;
+    // Older servers retain the final commit stage after a document is resolved.
+    const processing = activity.active_documents.filter(doc => !['commit', 'resolved', 'completed'].includes(doc.stage));
+    if (context.project.status === 'running' && processing.length) {
+      $('projectSummary').textContent = `${stageLabels[processing[0].stage] || processing[0].stage} · ${processing[0].title || 'Document'}`;
+    }
+    $('projectSummary').title = $('projectSummary').textContent;
+    const activeSignature = JSON.stringify([processing, activity.entities, context.project.status]);
     if (context.activeSignature !== activeSignature) {
       context.activeSignature = activeSignature; $('liveDocuments').replaceChildren();
-      for (const doc of activity.active_documents) row($('liveDocuments'), doc.title || doc.doc_id, `${stageLabels[doc.stage] || doc.stage} · ${doc.source_url || doc.doc_id}`);
-      if (!activity.active_documents.length) {
-        for (const entity of activity.entities) row($('liveDocuments'), entity.entity_name, `Expanding Tier ${entity.tier} · retrieving or processing documents`);
-        if (!activity.entities.length) $('liveDocuments').textContent = activeStates.has(context.project.status) ? 'Waiting for the next document or worker update.' : 'No documents being processed.';
+      for (const doc of processing) row($('liveDocuments'), doc.title || doc.doc_id, stageLabels[doc.stage] || doc.stage);
+      if (!processing.length) {
+        for (const entity of activity.entities) row($('liveDocuments'), entity.entity_name, `Expanding · Tier ${entity.tier}`);
+        if (!activity.entities.length) $('liveDocuments').textContent = activeStates.has(context.project.status) ? 'Waiting for documents.' : 'No documents being processed.';
       }
     }
     if (activity.events.length) {
@@ -152,7 +195,7 @@
         const details = [p.title, Number.isInteger(p.chunk_index) ? `chunk ${p.chunk_index + 1}${p.chunk_total ? '/' + p.chunk_total : ''}` : '',
           p.relationships != null ? `${p.relationships} extracted relationships` : '',
           p.accepted != null ? `${p.accepted} accepted, ${p.rejected} rejected` : '', p.cached ? 'cached' : '', p.error].filter(Boolean);
-        root.prepend(row(root, `${new Date(event.created_at).toLocaleTimeString()} · ${stageLabels[event.stage] || event.stage}`, details.join(' · ')));
+        root.prepend(row(root, `${new Date(event.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} · ${stageLabels[event.stage] || event.stage}`, details.join(' · ')));
       }
       while (root.children.length > 100) root.lastElementChild.remove();
       if (previousScroll > 0) root.scrollTop = previousScroll + root.scrollHeight - previousHeight;
@@ -229,14 +272,21 @@
       showProject(current); poll(current);
     } else { $('projectState').textContent = session.connected ? 'Connected' : 'Disconnected'; updateControls(); populateProjects(); }
   }
-  function openProject(edit) {
+  function showProjectTab(tab) {
+    for (const [name, id] of [['settings', 'projectForm'], ['documents', 'projectActivity'], ['activity', 'liveActivity']]) $(id).hidden = name !== tab;
+    for (const button of $('projectTabs').querySelectorAll('button')) button.setAttribute('aria-pressed', String(button.dataset.projectTab === tab));
+  }
+  function openProject(edit, tab = 'settings') {
     editing = edit; $('projectError').textContent = ''; $('uploadMessage').textContent = '';
     const project = edit ? current?.project : null;
-    $('projectDialogTitle').textContent = edit ? 'Project settings and activity' : 'New project';
+    $('projectDialogTitle').textContent = edit ? project.name : 'New project';
     $('projectName').value = project?.name || ''; $('projectSeeds').value = project?.seeds.join('\n') || '';
+    $('runUntilPaused').checked = project?.run_until_paused ?? false;
     for (const [key, , value] of limits) $(key).value = project?.limits[key] ?? value;
     $('saveProject').textContent = edit ? 'Save settings' : 'Create project';
-    $('projectActivity').hidden = !edit; updateControls();
+    $('projectTabs').hidden = !edit;
+    $('advancedSettings').open = false;
+    showProjectTab(edit ? tab : 'settings'); updateControls();
     $('projectDialog').showModal();
   }
 
@@ -291,12 +341,15 @@
   };
   $('newProject').onclick = () => openProject(false);
   $('manageProject').onclick = () => openProject(true);
+  $('showActivity').onclick = () => openProject(true, 'activity');
+  for (const button of $('projectTabs').querySelectorAll('button')) button.onclick = () => showProjectTab(button.dataset.projectTab);
+  $('runUntilPaused').onchange = updateControls;
   $('projectSelect').onchange = event => selectProject(event.target.value);
   document.querySelectorAll('[data-close-dialog]').forEach(button => button.onclick = () => button.closest('dialog').close());
   $('projectForm').onsubmit = async event => {
     event.preventDefault(); if (saving) return;
     const context = current, request = session.request;
-    const payload = { name: $('projectName').value.trim(), seeds: $('projectSeeds').value.split('\n').map(x => x.trim()).filter(Boolean), limits: Object.fromEntries(limits.map(([key]) => [key, Number($(key).value)])) };
+    const payload = { name: $('projectName').value.trim(), seeds: $('projectSeeds').value.split('\n').map(x => x.trim()).filter(Boolean), limits: Object.fromEntries(limits.map(([key]) => [key, Number($(key).value)])), run_until_paused: $('runUntilPaused').checked };
     if (!payload.name || !payload.seeds.length || new Set(payload.seeds).size !== payload.seeds.length) { $('projectError').textContent = 'Enter a name and at least one unique Tier-0 company.'; return; }
     saving = true; updateControls();
     try {
@@ -335,6 +388,7 @@
   $('moreDocuments').onclick = () => { if (current) { current.documentLimit = Math.min(200, current.documentLimit + 50); poll(current); } };
   document.addEventListener('visibilitychange', () => { if (!document.hidden) poll(); });
   $('openJsonBtn').disabled = true;
+  $('datasetMenu').querySelector('.dataset-trigger span:nth-child(2)').textContent = 'Export';
   $('openJsonBtn').title = 'Use python -m schain view for a separate offline graph';
   disconnected();
   if (location.protocol === 'file:') message('Serve the generated directory locally with python -m http.server; file:// is unsupported.');

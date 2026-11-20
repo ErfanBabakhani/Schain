@@ -22,6 +22,7 @@ class ProjectSettings(BaseModel):
     name: Name
     seeds: list[Name] = Field(min_length=1, max_length=100)
     limits: Limits = Field(default_factory=Limits)
+    run_until_paused: bool = False
 
     @model_validator(mode="after")
     def unique_seeds(self):

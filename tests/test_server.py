@@ -141,11 +141,15 @@ def test_api_auth_validation_upload_and_conflicts(tmp_path):
     assert "access-control-allow-origin" not in response.headers
 
 
-def test_expand_pause_and_resume_without_reextracting(projects, stub_llm, monkeypatch):
+@pytest.mark.parametrize("continuous", [False, True])
+def test_expand_pause_and_resume_without_reextracting(projects, stub_llm, monkeypatch, continuous):
     from schain.expansion import loop
     from schain.sources.base import SearchResult
 
-    project_id = projects.create(settings(limits={"max_tier": 2}))["id"]
+    limits = {"max_tier": 2}
+    if continuous:
+        limits.update(max_minutes=0.000001, max_documents_per_run=1, max_total_documents=1)
+    project_id = projects.create(settings(limits=limits, run_until_paused=continuous))["id"]
     retrievals = []
 
     def retrieve(config, entity_name, entity_key, tier, connection, manifest=None, **kwargs):
@@ -170,7 +174,10 @@ def test_expand_pause_and_resume_without_reextracting(projects, stub_llm, monkey
         assert project["status"] == "paused", project["runs"]
         assert project["runs"][0]["summary"]["stop_reason"] == "pause_requested"
         calls = stub_llm.extraction_calls
-        projects.resume(project_id)
+        # The frontend's Start action submits expansion against the saved state.
+        client = TestClient(create_app(projects.root, TOKEN))
+        client.headers["Authorization"] = "Bearer " + TOKEN
+        assert client.post(f"/projects/{project_id}/start").status_code == 202
         monkeypatch.setattr(loop, "process_document", original)
         worker.tick()
         assert stub_llm.extraction_calls == calls
@@ -178,6 +185,48 @@ def test_expand_pause_and_resume_without_reextracting(projects, stub_llm, monkey
         before = len(retrievals)
         assert not worker.tick()
         assert len(retrievals) == before
+
+
+def test_continuous_run_passes_old_timing_and_document_limits(projects, stub_llm, monkeypatch):
+    from schain import state
+    from schain.expansion import loop
+    from schain.sources.base import SearchResult
+
+    project_id = projects.create(settings(
+        run_until_paused=True, limits={"max_tier": 1, "max_minutes": 0.000001,
+                                      "max_documents_per_run": 1, "max_total_documents": 1,
+                                      "max_documents_per_entity": 2},
+    ))["id"]
+    with connect(projects.database(project_id)) as connection:
+        state.set_run_value(connection, "elapsed_seconds", 100000)
+        state.reserve_document(connection, "old-attempt", "old-entity")
+        state.finish_document_usage(connection, "old-attempt", "old-entity",
+                                    completed=True, elapsed_seconds=100000)
+
+    def retrieve(config, entity_name, entity_key, tier, connection, manifest=None, **kwargs):
+        return [SearchResult(provider="test", query="supplier", title=f"Supplier {n}",
+                             url=f"https://example.com/supplier-{n}",
+                             text=DOCUMENT_TEXT + f"\nReport number {n}.",
+                             entity_key=entity_key, tier=tier) for n in range(2)]
+
+    monkeypatch.setattr(loop, "retrieve_for_entity", retrieve)
+    projects.submit(project_id)
+    with worker_lock(projects.root):
+        Worker(projects, lambda config: stub_llm).tick()
+    detail = projects.detail(project_id)
+    assert detail["status"] == "completed", detail["runs"]
+    assert detail["statistics"]["documents"] == {"RESOLVED": 2}
+    assert detail["runs"][0]["summary"]["documents_processed"] == 2
+    # Switching back to bounded mode must restore the stored numeric limits.
+    # Older frontends omit the new setting; editing limits must preserve it.
+    changed = settings(limits={"max_tier": 1, "max_total_documents": 1})
+    assert projects.update(project_id, changed)["run_until_paused"] is True
+    changed = settings(run_until_paused=False, limits={"max_tier": 1, "max_total_documents": 1})
+    projects.update(project_id, changed)
+    projects.submit(project_id)
+    with worker_lock(projects.root):
+        Worker(projects, lambda config: pytest.fail("Total budget should stop this run")).tick()
+    assert projects.detail(project_id)["runs"][0]["summary"]["stop_reason"] == "total_document_budget"
 
 
 def test_settings_lock_and_seed_reconfiguration(projects):

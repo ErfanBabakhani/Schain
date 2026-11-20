@@ -86,6 +86,8 @@ If another interface appears, check the absolute directory printed by the build 
 
 Create a project, set its seeds and limits, then select Start. Pause and wait for `paused` before changing settings or uploading UTF-8 `.txt`, `.md`, or PDF documents up to 10 MiB. Resume continues expansion or retries a paused/failed ingestion job. Seeds and maximum tier cannot change after the first job; create a new project for a different experiment.
 
+Enable **Run until paused** in project settings to disable time, per-run document, and total document budgets. Entity document targets, discovery depth, concurrency, validation and failure handling still apply; discovery can finish naturally. Pause waits for the current unit and preserves SQLite checkpoints. Start continues expansion from those checkpoints without resetting the project. This setting does not extend scheduler allocations or keep the API, worker, model, or SSH tunnels alive: those must remain available while using the frontend controls.
+
 Live activity shows the current document, extraction chunks, resolution, validation and recent results. Extracted relationships appear faint and dashed until validation finishes; rejected relationships disappear. Active projects refresh every second, idle projects every five seconds, with slower polling in background tabs and on errors. Progress survives page reloads; unchanged graphs are not downloaded again. A relationship becomes visible when its extraction chunk returns, not while the model is still generating that chunk.
 
 The API stays on the server; frontend files stay local. Keep the default loopback binding. For direct static connections only, changing the local frontend port requires matching `SCHAIN_CORS_ORIGINS` on the backend.

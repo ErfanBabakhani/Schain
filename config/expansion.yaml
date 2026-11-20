@@ -64,6 +64,11 @@ expansion:
     query_planner_max_queries: 12
     max_candidates_per_entity: 96
 
+  # Selection policy defaults to legacy for existing runs. Use config/adaptive_expand.yaml
+  # for the isolated, token-budgeted adaptive experiment.
+  selection:
+    policy: legacy
+
   # Soft per-run SCHEDULING batch sizes (ORDER fairness across tiers only).
   # Every accepted valid supplier is enqueued and eventually processed.
   # These numbers do NOT permanently exclude suppliers ranked below a cutoff.

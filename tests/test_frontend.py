@@ -142,7 +142,8 @@ def wait_status(page, status):
     page.wait_for_function("status => document.getElementById('projectState').textContent === status", arg=status)
 
 
-def test_empty_workspace_creation_and_lifecycle(workspace):
+@pytest.mark.parametrize("continuous", [False, True])
+def test_empty_workspace_creation_and_lifecycle(workspace, continuous):
     page = workspace["page"]
     assert page.locator("#visibleNodeCount").inner_text() == "0"
     assert workspace["client"].get("/projects").json() == []
@@ -154,6 +155,12 @@ def test_empty_workspace_creation_and_lifecycle(workspace):
     assert page.locator("#projectSeeds").input_value() == ""
     page.locator("#projectName").fill("Battery research")
     page.locator("#projectSeeds").fill("BMW\nToyota")
+    if continuous:
+        page.locator("#runUntilPaused").check()
+        assert page.locator("#max_minutes").is_disabled()
+        assert page.locator("#max_documents_per_run").is_disabled()
+        assert page.locator("#max_total_documents").is_disabled()
+        assert page.locator("#llm_max_concurrency").is_enabled()
     page.locator("#saveProject").click()
     wait_status(page, "ready")
     page.wait_for_function("document.getElementById('visibleNodeCount').textContent === '2'")
@@ -166,6 +173,10 @@ def test_empty_workspace_creation_and_lifecycle(workspace):
     payload = json.loads(next(body for method, path, body, _ in workspace["requests"] if method == "POST" and path == "/projects"))
     from backend.models import Limits
     assert payload["limits"] == Limits().model_dump()
+    assert payload["run_until_paused"] is continuous
+    page.locator("#manageProject").click()
+    assert page.locator("#runUntilPaused").is_checked() is continuous
+    page.locator("#projectDialog [data-close-dialog]").click()
     page.locator("#startRun").click()
     wait_status(page, "queued")
     assert page.locator("#startRun").is_disabled()
@@ -208,6 +219,7 @@ def test_browser_upload_uses_pipeline_and_publishes_graph(workspace, stub_llm):
     page.locator("#projectSelect").select_option(project["id"])
     wait_status(page, "ready")
     page.locator("#manageProject").click()
+    page.locator('[data-project-tab="documents"]').click()
     page.locator("#documentInput").set_input_files({"name": "سند.txt", "mimeType": "text/plain", "buffer": DOCUMENT_TEXT.encode()})
     page.locator("#uploadDocument").click()
     wait_status(page, "queued")
@@ -218,12 +230,50 @@ def test_browser_upload_uses_pipeline_and_publishes_graph(workspace, stub_llm):
         Worker(workspace["projects"], lambda config: stub_llm).tick()
     wait_status(page, "completed")
     page.wait_for_function("Number(document.getElementById('visibleEdgeCount').textContent) > 0")
-    assert "RESOLVED" in page.locator("#documentList").inner_text()
+    assert "Processed" in page.locator("#documentList").inner_text()
     assert page.locator("#resumeRun").is_enabled()
     page.locator("#projectDialog [data-close-dialog]").click()
     page.locator('[data-side-tab="evidence"]').click()
     assert "CATL" in page.locator("#sideContent").inner_text()
     assert "Source quote verified" in page.locator("#sideContent").inner_text()
+
+
+def test_compact_workspace_keeps_document_and_advanced_controls(workspace):
+    from backend.activity import record
+    from backend.storage import connect as database
+    from schain import state
+
+    project = create_project(workspace)
+    path = workspace["projects"].database(project["id"])
+    document = {"doc_id": "report", "content_hash": "report-hash", "title": "Supplier report",
+                "source_url": "https://example.org/report?tracking=" + "x" * 200}
+    with database(path) as connection:
+        state.register_document(connection, document)
+    record(path, "history", "resolved", document)
+    page = workspace["page"]
+    connect(workspace)
+    page.locator("#projectSelect").select_option(project["id"])
+    page.wait_for_function("document.getElementById('documentList').children.length > 0")
+    assert not page.locator("#projectDialog").is_visible()
+    assert page.locator("#graphCanvas").bounding_box()["height"] > page.viewport_size["height"] * .7
+    page.locator("#manageProject").click()
+    assert page.locator("#max_tier").is_visible()
+    assert not page.locator("#max_minutes").is_visible()
+    page.locator("#advancedSettings summary").click()
+    assert page.locator("#max_minutes").is_visible()
+    page.locator('[data-project-tab="documents"]').click()
+    assert not page.locator("#projectForm").is_visible()
+    item = page.locator("#documentList details").first
+    assert item.bounding_box()["height"] < 60
+    item.locator("summary").click()
+    assert item.locator("a").inner_text() == "example.org"
+    assert item.locator("a").get_attribute("href") == document["source_url"]
+    assert "PENDING" in item.locator(".document-detail").inner_text()
+    page.locator('[data-project-tab="activity"]').click()
+    assert page.locator("#liveActivity").is_visible()
+    page.locator('[data-project-tab="documents"]').click()
+    assert item.get_attribute("open") is not None
+    assert all(method == "GET" for method, *_ in workspace["requests"])
 
 
 def test_pagination_revisions_and_project_switching(workspace):
@@ -246,7 +296,9 @@ def test_pagination_revisions_and_project_switching(workspace):
     page.wait_for_function("document.getElementById('datasetTitle').textContent === 'First' && document.getElementById('datasetMeta').textContent.startsWith('3 entities')")
     page.locator('[data-view="global"]').click()
     assert page.locator("#visibleNodeCount").inner_text() == "3"
+    page.locator('#filterBtn').click()
     page.locator('[data-dimension="2d"]').click()
+    page.locator('#filterBtn').click()
     page.locator("#graphCanvas").hover()
     page.mouse.wheel(0, -200)
     before = page.evaluate("SChainExplorer.getViewState()")
@@ -282,7 +334,9 @@ def test_offline_renderer_preserves_selection_camera_and_grounding(workspace):
     page.goto(workspace["origin"] + "/offline.html")
     assert page.locator("#visibleNodeCount").inner_text() == "2"
     assert not page.locator("#projectSelect").is_visible()
+    page.locator('#filterBtn').click()
     page.locator('[data-dimension="2d"]').click()
+    page.locator('#filterBtn').click()
     page.locator("#entitySearch").fill("B")
     page.locator('#searchResults [data-node="b"]').click()
     page.wait_for_timeout(100)

@@ -343,6 +343,7 @@ def test_browser_live_provisional_graph_through_proxy(dev_workspace, stub_llm, m
     page.locator("#projectSelect").select_option(project_id)
     page.wait_for_function("document.getElementById('projectState').textContent === 'ready'")
     page.locator("#manageProject").click()
+    page.locator('[data-project-tab="documents"]').click()
     page.locator("#documentInput").set_input_files({"name": "Supplier report.txt", "mimeType": "text/plain", "buffer": DOCUMENT_TEXT.encode()})
     page.locator("#uploadDocument").click()
     page.wait_for_function("document.getElementById('projectState').textContent === 'queued'")
@@ -351,7 +352,9 @@ def test_browser_live_provisional_graph_through_proxy(dev_workspace, stub_llm, m
     worker.start()
     try:
         assert ready.wait(15)
-        page.wait_for_function("document.getElementById('liveDocuments').textContent.includes('Validating relationships')")
+        page.wait_for_function("document.getElementById('liveDocuments').textContent.includes('Validating')")
+        assert not page.locator('#projectDialog').is_visible()
+        page.locator('#showActivity').click()
         assert "Supplier report.txt" in page.locator("#liveDocuments").inner_text()
         page.wait_for_function("window.pendingStrokeSeen === true")
         assert int(page.locator("#visibleEdgeCount").inner_text()) > 0
@@ -365,7 +368,8 @@ def test_browser_live_provisional_graph_through_proxy(dev_workspace, stub_llm, m
         page.reload()
         page.wait_for_function("!document.getElementById('projectSelect').disabled")
         page.locator("#projectSelect").select_option(project_id)
-        page.wait_for_function("document.getElementById('liveDocuments').textContent.includes('Validating relationships')")
+        page.wait_for_function("document.getElementById('liveDocuments').textContent.includes('Validating')")
+        page.locator('#showActivity').click()
         page.wait_for_function("window.pendingStrokeSeen === true")
         camera = page.evaluate("SChainExplorer.getViewState()")
     finally:
@@ -373,8 +377,8 @@ def test_browser_live_provisional_graph_through_proxy(dev_workspace, stub_llm, m
         worker.join(timeout=15)
     assert not worker.is_alive() and not failures
     page.wait_for_function("document.getElementById('projectState').textContent === 'completed'")
-    page.wait_for_function("document.getElementById('pendingCount').textContent === '0 pending relationships'")
-    assert "Validation completed" in page.locator("#liveEvents").inner_text()
+    page.wait_for_function("document.getElementById('pendingCount').textContent === '0 pending'")
+    assert "Validated" in page.locator("#liveEvents").inner_text()
     assert "accepted" in page.locator("#liveEvents").inner_text()
     assert "No documents being processed" in page.locator("#liveDocuments").inner_text()
     assert page.evaluate("SChainExplorer.getViewState()") == camera

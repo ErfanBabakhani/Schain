@@ -9,6 +9,8 @@ there is a factory here and not an abstraction layer.
 from __future__ import annotations
 
 import logging
+import json
+import math
 import os
 import time
 from typing import Any
@@ -24,6 +26,55 @@ DEFAULT_VLLM_BASE_URL = "http://localhost:8000/v1"
 
 class RuntimeDeadlineExceeded(TimeoutError):
     """No new model call may start after the experiment deadline."""
+
+
+class InputTokenBudgetExceeded(RuntimeError):
+    """The next LLM request would exceed the configured estimated input budget."""
+
+    stop_reason = "token_budget"
+
+
+class InputBudgetLLM:
+    """LLM proxy that accounts for every run-level prompt before invoking the provider.
+
+    The configured model tokenizer is not exposed by neo4j-graphrag's LLM interface,
+    so request sizes use a deliberately conservative serialized-character estimate.
+    """
+
+    _schain_input_budget = True
+
+    def __init__(self, llm, reserve_input_tokens, *, characters_per_token: float = 1.0):
+        self._schain_wrapped_llm = llm
+        self.reserve_input_tokens = reserve_input_tokens
+        if characters_per_token <= 0:
+            raise ValueError("characters_per_token must be positive")
+        self.characters_per_token = characters_per_token
+
+    def __getattr__(self, name):
+        return getattr(self._schain_wrapped_llm, name)
+
+    @staticmethod
+    def estimate_input_tokens(args, kwargs, *, characters_per_token: float = 1.0) -> int:
+        request = {
+            "args": args[:3],
+            "input": kwargs.get("input"),
+            "message_history": kwargs.get("message_history"),
+            "system_instruction": kwargs.get("system_instruction"),
+        }
+        serialized = json.dumps(request, ensure_ascii=False, default=str)
+        return max(1, math.ceil(len(serialized) / characters_per_token))
+
+    def invoke(self, *args, **kwargs):
+        self.reserve_input_tokens(self.estimate_input_tokens(
+            args, kwargs, characters_per_token=self.characters_per_token,
+        ))
+        return self._schain_wrapped_llm.invoke(*args, **kwargs)
+
+    async def ainvoke(self, *args, **kwargs):
+        self.reserve_input_tokens(self.estimate_input_tokens(
+            args, kwargs, characters_per_token=self.characters_per_token,
+        ))
+        return await self._schain_wrapped_llm.ainvoke(*args, **kwargs)
 
 
 def _public_endpoint(url: str | None) -> str | None:

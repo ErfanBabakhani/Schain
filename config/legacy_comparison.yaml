@@ -1,0 +1,31 @@
+# Controlled legacy arm with the adaptive experiment's candidate and input budget caps.
+# Run with: schain expand --config config/legacy_comparison.yaml
+include:
+  - config/expansion.yaml
+
+expansion:
+  retrieval:
+    max_candidates_per_entity: 200
+    max_candidates_per_domain: null
+    max_full_text_fetches_per_domain: null
+  selection:
+    policy: legacy
+    candidate_pool_policy: title_snippet
+    total_input_tokens: 200000
+    input_token_metric: estimated_input_tokens
+    input_token_chars_per_estimate: 1.0
+
+storage:
+  raw_documents: data/experiments/legacy/documents.jsonl
+  normalized_documents: data/experiments/legacy/documents.parquet
+  extracted_facts: data/experiments/legacy/facts.parquet
+  extractions: data/experiments/legacy/extractions
+  search_results: data/experiments/shared/search_results.parquet
+  entity_resolution: data/experiments/legacy/entity_resolution.parquet
+  rejected_facts: data/experiments/legacy/rejected_facts.parquet
+  edge_support: data/experiments/legacy/edge_support.parquet
+  verification_evidence: data/experiments/legacy/verification_evidence.parquet
+  extraction_integrity: data/experiments/legacy/extraction_integrity.json
+  state_db: data/experiments/legacy/state.db
+  graph_export: outputs/experiments/legacy_graph.json
+  logs: logs/experiments/legacy

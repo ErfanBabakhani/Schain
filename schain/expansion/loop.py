@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import time
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
 import pandas as pd
+import numpy as np
 
 from .. import state
 from ..config import REPO_ROOT, seed_entities, storage_path
@@ -50,8 +53,11 @@ from ..kg.support import load_edge_support, refresh_edge_support
 from ..pipeline import process_document
 from ..sources import manifest as mf
 from ..sources.retrieve import document_kwargs_from_result, retrieve_for_entity
+from ..sources.retrieve import fetch_selected_full_text
 from ..sources.ranking import discovery_candidate_is_meaningful
 from ..sources.origin import origin_name_variants
+from .adaptive import LinUCB, build_document_contexts, choose_action, normalize_reward
+from ..llm.provider import InputBudgetLLM, InputTokenBudgetExceeded
 from .frontier import discover_upstream, seed_frontier
 
 logger = logging.getLogger(__name__)
@@ -74,6 +80,45 @@ def _facts_for_entity(config: dict[str, Any], connection, entity_key: str) -> pd
 def _entity_document_limits(expansion: dict[str, Any], tier: int = 0) -> tuple[int, int]:
     """Compatibility wrapper around the tier-aware policy."""
     return entity_document_limits(expansion, tier)
+
+
+def _record_adaptive_decision(config, run_id, record) -> None:
+    path = Path(config.get("storage", {}).get("logs", REPO_ROOT / "logs"))
+    path.mkdir(parents=True, exist_ok=True)
+    with (path / f"adaptive_decisions_{run_id}.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record, ensure_ascii=False, default=float) + "\n")
+
+
+def _settle_adaptive_cost(connection, run_id, decision_data, selection_cfg, *, charge=True) -> None:
+    """Release the action reservation and pace using measured proxy request cost."""
+    cost = int(decision_data["estimated_cost"])
+    budget_key = f"input_budget:{run_id}"
+    budget = state.run_value(connection, budget_key)
+    budget["reserved_estimate"] = max(0, int(budget["reserved_estimate"]) - cost)
+    queue_spent_key = f"adaptive_queue_spent:{run_id}"
+    previous_spend = int(state.run_value(connection, queue_spent_key, 0))
+    spent_delta = max(0, int(budget["spent_estimate"]) - previous_spend) if charge else 0
+    state.set_run_value(connection, budget_key, budget)
+    queue_key = f"adaptive_virtual_price:{run_id}"
+    price = float(state.run_value(connection, queue_key, decision_data["decision"]["queue_before"]))
+    target = float(selection_cfg["target_tokens_per_candidate"])
+    reference = float(selection_cfg.get("cost_reference_tokens", 1000))
+    state.set_run_value(connection, queue_key, max(0.0, price + (spent_delta - target) / reference))
+    state.set_run_value(connection, queue_spent_key, int(budget["spent_estimate"]))
+
+
+def _settle_adaptive_skips(connection, run_id, count, selection_cfg) -> None:
+    budget = state.run_value(connection, f"input_budget:{run_id}")
+    queue_spent_key = f"adaptive_queue_spent:{run_id}"
+    previous_spend = int(state.run_value(connection, queue_spent_key, 0))
+    allocated = max(0, int(budget["spent_estimate"]) - previous_spend)
+    queue_key = f"adaptive_virtual_price:{run_id}"
+    price = float(state.run_value(connection, queue_key,
+                                  selection_cfg.get("initial_virtual_queue", 0.0)))
+    target = float(selection_cfg["target_tokens_per_candidate"])
+    reference = float(selection_cfg.get("cost_reference_tokens", 1000))
+    state.set_run_value(connection, queue_key, max(0.0, price + (allocated - count * target) / reference))
+    state.set_run_value(connection, queue_spent_key, int(budget["spent_estimate"]))
 
 
 def _quality_summary(config: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
@@ -411,6 +456,8 @@ def run_expand(
     max_failures = int(runtime.get("max_consecutive_failures", DEFAULT_MAX_CONSECUTIVE_FAILURES))
     max_attempts = int(runtime.get("max_document_attempts", 2))
     retrieval_cfg = expansion.get("retrieval") or {}
+    selection_cfg = expansion.get("selection") or {}
+    adaptive = selection_cfg.get("policy", "legacy") == "adaptive_linucb"
     relation_policy = load_relation_evidence(
         ((config.get("validation") or {}).get("evidence") or {}).get("policy_file"))
     patience = int(retrieval_cfg.get("zero_gain_patience", 3))
@@ -428,6 +475,66 @@ def run_expand(
     run_new_claims_by_tier: dict[int, int] = {}
     run_id = state.run_value(connection, "run_id") or datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S_%f")
     state.set_run_value(connection, "run_id", run_id)
+    adaptive_model = None
+    adaptive_state_key = f"adaptive_model:{run_id}"
+    input_budget_key = f"input_budget:{run_id}"
+    budget_limit = selection_cfg.get("total_input_tokens")
+    if adaptive and budget_limit is None:
+        raise ValueError("adaptive selection requires expansion.selection.total_input_tokens")
+    if budget_limit is not None:
+        if state.run_value(connection, input_budget_key) is None:
+            state.set_run_value(connection, input_budget_key, {
+                "spent_estimate": 0, "reserved_estimate": 0, "limit": int(budget_limit),
+                "requests": 0,
+            })
+        elif int(state.run_value(connection, input_budget_key)["limit"]) != int(budget_limit):
+            raise ValueError("input-token budget changed; start a fresh EXPAND state")
+        if llm is not None and not getattr(llm, "_schain_input_budget", False):
+            def reserve_input_tokens(estimate):
+                budget = state.run_value(connection, input_budget_key)
+                if int(budget["spent_estimate"]) + int(estimate) > int(budget["limit"]):
+                    budget["rejected_requests"] = int(budget.get("rejected_requests", 0)) + 1
+                    state.set_run_value(connection, input_budget_key, budget)
+                    request_log = Path(config.get("storage", {}).get("logs", REPO_ROOT / "logs"))
+                    request_log.mkdir(parents=True, exist_ok=True)
+                    with (request_log / f"input_token_requests_{run_id}.jsonl").open("a", encoding="utf-8") as handle:
+                        handle.write(json.dumps({
+                            "run_id": run_id, "request_index": budget.get("requests", 0) + 1,
+                            "estimated_input_tokens": int(estimate), "spent_before": budget["spent_estimate"],
+                            "status": "rejected_by_budget",
+                            "accounting_source": "serialized characters divided by configured chars-per-token estimate",
+                        }) + "\n")
+                    raise InputTokenBudgetExceeded(
+                        f"estimated input-token budget exhausted: "
+                        f"{budget['spent_estimate']} + {estimate} > {budget['limit']}"
+                    )
+                before = int(budget["spent_estimate"])
+                budget["spent_estimate"] += int(estimate)
+                budget["requests"] = int(budget.get("requests", 0)) + 1
+                state.set_run_value(connection, input_budget_key, budget)
+                request_log = Path(config.get("storage", {}).get("logs", REPO_ROOT / "logs"))
+                request_log.mkdir(parents=True, exist_ok=True)
+                with (request_log / f"input_token_requests_{run_id}.jsonl").open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps({
+                        "run_id": run_id, "request_index": budget["requests"],
+                        "estimated_input_tokens": int(estimate), "spent_before": before,
+                        "spent_after": budget["spent_estimate"],
+                        "accounting_source": "serialized characters divided by configured chars-per-token estimate",
+                    }) + "\n")
+            llm = InputBudgetLLM(
+                llm, reserve_input_tokens,
+                characters_per_token=float(selection_cfg.get("input_token_chars_per_estimate", 1.0)),
+            )
+    if adaptive:
+        model_data = state.run_value(connection, adaptive_state_key)
+        adaptive_model = LinUCB.from_dict(model_data) if model_data else LinUCB(
+            ridge_lambda=float(selection_cfg.get("ridge_lambda", 1.0)),
+            alpha=float(selection_cfg.get("linucb_alpha", 0.5)),
+        )
+        if (adaptive_model.ridge_lambda != float(selection_cfg.get("ridge_lambda", 1.0)) or
+                adaptive_model.alpha != float(selection_cfg.get("linucb_alpha", 0.5))):
+            raise ValueError("adaptive model settings changed; start a fresh EXPAND state")
+        state.set_run_value(connection, adaptive_state_key, adaptive_model.to_dict())
     log_dir = Path(config.get("storage", {}).get("logs", REPO_ROOT / "logs"))
     manifest = mf.RetrievalManifest(log_dir / f"retrieval_manifest_{run_id}.csv", run_id)
     requeued = state.requeue_stale_processing(connection)
@@ -552,27 +659,78 @@ def run_expand(
                         retrieval_checkpoint.save(entity_key, tier, results, stages=stages)
             except Exception as error:
                 checkpoint_time()
+                if getattr(error, "stop_reason", None) == "token_budget":
+                    summary["stop_reason"] = "token_budget"
+                    state.set_frontier_status(connection, entity_key, state.PENDING,
+                                              str(error), stop_reason="token_budget")
+                    break
                 retriable = int(row["attempts"]) + 1 < int(runtime.get("max_retrieval_attempts", 2))
                 state.set_frontier_status(connection, entity_key, state.PENDING if retriable else state.FAILED,
                                           str(error), stop_reason="retrieval_failed")
                 continue
             checkpoint_time()
+            if adaptive:
+                budget = state.run_value(connection, input_budget_key)
+                state.set_run_value(
+                    connection, f"adaptive_queue_spent:{run_id}",
+                    int(budget["spent_estimate"]),
+                )
             reason, retry_pending = "candidate_pool_exhausted", False
             # Incomplete admitted documents must be retried before unseen candidates,
             # even when the global hard ceiling has already been reached.
             prepared = []
+            adaptive_decisions = {}
             entity_aliases = origin_name_variants(entity_name, (ontology.get("aliases") or {}).get("Company"))
             for result in results:
-                if not discovery_candidate_is_meaningful(result, entity_name,
+                candidate_view = replace(result, text=None) if adaptive else result
+                if adaptive:
+                    candidate_view.discovery_direction = None
+                    if not (candidate_view.title or candidate_view.snippet):
+                        _record_adaptive_decision(config, run_id, {
+                            "run_id": run_id, "entity_id": entity_key, "entity": entity_name,
+                            "tier": tier, "url": result.canonical_source_url or result.url,
+                            "policy": "adaptive_linucb", "action": "skip",
+                            "skip_reason": "unscorable_missing_title_and_snippet",
+                        })
+                        decision_key = f"adaptive_candidate_decisions:{run_id}"
+                        state.set_run_value(connection, decision_key,
+                            int(state.run_value(connection, decision_key, 0)) + 1)
+                        action_key = f"adaptive_action_counts:{run_id}"
+                        counts = state.run_value(connection, action_key,
+                            {"skip": 0, "snippet": 0, "full_text": 0, "both": 0})
+                        counts["skip"] += 1
+                        state.set_run_value(connection, action_key, counts)
+                        _settle_adaptive_skips(connection, run_id, 1, selection_cfg)
+                        prompt1_drops["candidate_unusable"] += 1
+                        continue
+                if not discovery_candidate_is_meaningful(candidate_view, entity_name,
                         aliases=entity_aliases, policy=relation_policy):
                     prompt1_drops["candidate_unusable"] += 1
                     continue
-                direction = (getattr(result, "discovery_direction", None)
-                             or getattr(result, "_discovery_direction", None)
-                             or classify_supply_direction(entity_name, result.document_text(),
-                                                          aliases=entity_aliases, policy=relation_policy))
+                direction = (
+                    classify_supply_direction(entity_name, candidate_view.document_text(),
+                                               aliases=entity_aliases, policy=relation_policy)
+                    if adaptive else
+                    (getattr(result, "discovery_direction", None)
+                     or getattr(result, "_discovery_direction", None)
+                     or classify_supply_direction(entity_name, candidate_view.document_text(),
+                                                  aliases=entity_aliases, policy=relation_policy))
+                )
                 if direction == DOWNSTREAM_EXPLICIT:
                     prompt1_drops["downstream_only"] += 1
+                    continue
+                if adaptive:
+                    try:
+                        document = make_document(candidate_view.document_text(),
+                                                 **document_kwargs_from_result(candidate_view))
+                    except ValueError:
+                        prompt1_drops["candidate_unusable"] += 1
+                        continue
+                    known = state.find_document(connection, document["content_hash"], document.get("source_url"))
+                    doc_id = known["doc_id"] if known else document["doc_id"]
+                    usage = state.document_usage(connection, doc_id, entity_key)
+                    unfinished = usage is not None and not usage["completed"] and state.document_attempt_count(connection, doc_id) < max_attempts
+                    prepared.append((not unfinished, result, direction, document, known, usage, doc_id))
                     continue
                 try:
                     document = make_document(result.document_text(), **document_kwargs_from_result(result))
@@ -585,6 +743,218 @@ def run_expand(
                 unfinished = usage is not None and not usage["completed"] and state.document_attempt_count(connection, doc_id) < max_attempts
                 prepared.append((not unfinished, result, direction, document, known, usage, doc_id))
             prepared.sort(key=lambda item: item[0])
+            if adaptive:
+                seen_key = f"adaptive_seen:{run_id}:{entity_key}"
+                seen_urls = set(state.run_value(connection, seen_key, []))
+                candidates = []
+                for item in prepared:
+                    _, candidate, _, _, known, usage, _ = item
+                    url = candidate.canonical_source_url or candidate.url
+                    if url in seen_urls:
+                        continue
+                    if known and known["status"] in (state.COMMITTED, state.RESOLVED) and (
+                            driver is None or known["status"] == state.COMMITTED):
+                        continue
+                    if usage and usage["completed"]:
+                        continue
+                    if state.document_attempt_count(connection, item[-1]) >= max_attempts:
+                        continue
+                    candidates.append(item)
+                prepared = []
+                if candidates:
+                    known_companies = {
+                        str(item[0]) for item in connection.execute(
+                            "SELECT entity_name FROM frontier"
+                        ).fetchall()
+                    }
+                    facts_path = storage_path(config, "extracted_facts")
+                    if facts_path.exists():
+                        known_facts = pd.read_parquet(facts_path)
+                        for name_col, type_col in (("subject_name", "subject_type"),
+                                                   ("object_name", "object_type")):
+                            if name_col in known_facts and type_col in known_facts:
+                                known_companies.update(
+                                    known_facts.loc[known_facts[type_col].eq("Company"), name_col]
+                                    .dropna().astype(str).tolist()
+                                )
+                    resolution_path = storage_path(config, "entity_resolution")
+                    if resolution_path.exists():
+                        resolutions = pd.read_parquet(resolution_path)
+                        if "aliases" in resolutions:
+                            for aliases in resolutions["aliases"].dropna():
+                                if isinstance(aliases, (list, tuple, set)):
+                                    known_companies.update(map(str, aliases))
+                    history_key = f"adaptive_history:{run_id}:{entity_key}"
+                    history = state.run_value(connection, history_key, [])
+                    contexts, embeddings = build_document_contexts(
+                        [item[1] for item in candidates], entity_name, aliases=entity_aliases,
+                        known_companies=known_companies, history=history,
+                        official_domains=list(selection_cfg.get("official_domains") or []), config=config,
+                    )
+                    decision_count_key = f"adaptive_candidate_decisions:{run_id}"
+                    decision_count = int(state.run_value(connection, decision_count_key, 0))
+                    budget_key = input_budget_key
+                    budget_state = state.run_value(connection, budget_key)
+                    remaining_tokens = max(
+                        0, int(budget_state["limit"]) - int(budget_state["spent_estimate"])
+                        - int(budget_state["reserved_estimate"]),
+                    )
+                    queue_key = f"adaptive_virtual_price:{run_id}"
+                    virtual_price = float(state.run_value(
+                        connection, queue_key, float(selection_cfg.get("initial_virtual_queue", 0.0)),
+                    ))
+                    warmup_limit = int(selection_cfg.get("warmup_candidates", 200))
+                    warmup = decision_count < warmup_limit
+                    candidate_indices = [0] if warmup else list(range(len(candidates)))
+                    choices = {}
+                    choice_details = {}
+                    for index in candidate_indices:
+                        item = candidates[index]
+                        candidate = item[1]
+                        snippet = "\n".join(part for part in (candidate.title, candidate.snippet) if part)
+                        overhead = int(selection_cfg.get("prompt_overhead_tokens_estimate", 2000))
+                        chars_per_token = float(selection_cfg.get("input_token_chars_per_estimate", 1.0))
+                        snippet_cost = math.ceil(len(snippet) / chars_per_token) + overhead
+                        full_cost = int(selection_cfg.get("full_text_tokens_estimate", 4000)) + overhead
+                        costs = {"snippet": snippet_cost, "full_text": full_cost,
+                                 "both": full_cost + math.ceil(len(snippet) / chars_per_token)}
+                        feasible_costs = {action: cost for action, cost in costs.items()
+                                          if cost <= remaining_tokens}
+                        action, details = choose_action(
+                            adaptive_model, contexts[index], estimated_costs=feasible_costs,
+                            virtual_price=virtual_price,
+                            cost_reference=float(selection_cfg.get("cost_reference_tokens", 1000)),
+                            reward_weight=float(selection_cfg.get("primal_reward_weight_V", 1.0)),
+                            priors=selection_cfg.get("initial_action_prior"),
+                            warmup=decision_count < int(selection_cfg.get("warmup_candidates", 200)),
+                            temperature=float(selection_cfg.get("warmup_temperature", 1.0)),
+                            rng=np.random.default_rng(int(selection_cfg.get("random_seed", 42)) + decision_count),
+                        )
+                        choices[index] = action
+                        choice_details[index] = (details, costs)
+                    # Warm-up finalizes one candidate in retrieval order. Greedy selects
+                    # the best feasible document/action pair from the unresolved pool.
+                    if warmup:
+                        selected_index = 0
+                    else:
+                        selected_index = max(
+                            candidate_indices,
+                            key=lambda i: choice_details[i][0]["scores"].get(choices[i], 0.0),
+                        )
+                    action = choices[selected_index]
+                    pool_exhausted = not warmup and choice_details[selected_index][0]["scores"].get(action, 0.0) <= 0
+                    if pool_exhausted:
+                        for skipped_index in candidate_indices:
+                            skipped = candidates[skipped_index][1]
+                            _record_adaptive_decision(config, run_id, {
+                                "run_id": run_id, "entity_id": entity_key, "entity": entity_name,
+                                "tier": tier, "url": skipped.canonical_source_url or skipped.url,
+                                "policy": "adaptive_linucb", "feature_version": "schain-adaptive-v1",
+                                "context": contexts[skipped_index].tolist(), "action": "skip",
+                                "scores": choice_details[skipped_index][0]["scores"],
+                                "phase": "greedy", "skip_reason": "no_positive_feasible_score",
+                            })
+                        seen_urls.update(item[1].canonical_source_url or item[1].url for item in candidates)
+                        state.set_run_value(connection, seen_key, sorted(seen_urls))
+                        _settle_adaptive_skips(connection, run_id, len(candidates), selection_cfg)
+                        reason = "adaptive_pool_exhausted"
+                        prepared = []
+                        action = "skip"
+                    decision_count += len(candidate_indices) if pool_exhausted else 1
+                    state.set_run_value(connection, decision_count_key, decision_count)
+                    action_counts_key = f"adaptive_action_counts:{run_id}"
+                    action_counts = state.run_value(connection, action_counts_key,
+                                                    {"skip": 0, "snippet": 0, "full_text": 0, "both": 0})
+                    if pool_exhausted:
+                        action_counts["skip"] += len(candidates)
+                    else:
+                        action_counts[action] += 1
+                    state.set_run_value(connection, action_counts_key, action_counts)
+                    item = candidates[selected_index]
+                    candidate = item[1]
+                    decision = {
+                        "run_id": run_id, "entity_id": entity_key, "entity": entity_name,
+                        "tier": tier, "document_id": item[-1],
+                        "url": candidate.canonical_source_url or candidate.url,
+                        "policy": "adaptive_linucb", "feature_version": "schain-adaptive-v1",
+                        "context": contexts[selected_index].tolist(), "action": action,
+                        "scores": choice_details[selected_index][0]["scores"],
+                        "probabilities": choice_details[selected_index][0]["probabilities"],
+                        "estimated_cost_tokens": (0 if action == "skip" else
+                            choice_details[selected_index][1].get(action)),
+                        "cost_source": "configured conservative estimate",
+                        "phase": "warmup" if warmup else "greedy",
+                        "queue_before": virtual_price,
+                    }
+                    if not pool_exhausted:
+                        _record_adaptive_decision(config, run_id, decision)
+                    if action == "skip":
+                        if warmup:
+                            seen_urls.add(candidate.canonical_source_url or candidate.url)
+                            state.set_run_value(connection, seen_key, sorted(seen_urls))
+                            _settle_adaptive_skips(connection, run_id, 1, selection_cfg)
+                            reason = "adaptive_next_candidate"
+                        else:
+                            reason = "adaptive_pool_exhausted"
+                        prepared = []
+                    else:
+                        url = candidate.canonical_source_url or candidate.url
+                        if action in ("full_text", "both"):
+                            had_full_text = bool(candidate.cached_full_text)
+                            fetch_selected_full_text(candidate, config, manifest)
+                            if not had_full_text and candidate.full_text_attempted:
+                                attempt_key = f"adaptive_full_fetch_attempts:{run_id}"
+                                state.set_run_value(connection, attempt_key,
+                                    int(state.run_value(connection, attempt_key, 0)) + 1)
+                            elif had_full_text:
+                                reuse_key = f"adaptive_full_text_reuses:{run_id}"
+                                state.set_run_value(connection, reuse_key,
+                                    int(state.run_value(connection, reuse_key, 0)) + 1)
+                            if not candidate.text:
+                                decision["failure_reason"] = candidate.fetch_error or "full_text_unavailable"
+                                _record_adaptive_decision(config, run_id, decision)
+                                seen_urls.add(url)
+                                state.set_run_value(connection, seen_key, sorted(seen_urls))
+                                _settle_adaptive_skips(connection, run_id, 1, selection_cfg)
+                                reason = "adaptive_next_candidate"
+                                prepared = []
+                            else:
+                                download_counts_key = f"adaptive_full_downloads:{run_id}"
+                                if not had_full_text and candidate.full_text_attempted:
+                                    state.set_run_value(connection, download_counts_key,
+                                        int(state.run_value(connection, download_counts_key, 0)) + 1)
+                                evidence = candidate.text
+                                if action == "both":
+                                    evidence = (f"Search title and snippets:\n{candidate.title}\n"
+                                                f"{candidate.snippet}\n\nFull document:\n{candidate.text}")
+                                candidate.text = evidence
+                        else:
+                            candidate.text = None
+                        if action == "snippet" or candidate.text:
+                            try:
+                                document = make_document(candidate.document_text(), **document_kwargs_from_result(candidate))
+                            except ValueError:
+                                reason = "adaptive_candidate_unusable"
+                                prepared = []
+                            else:
+                                document["processing_action"] = action
+                                known = state.find_document(connection, document["content_hash"], document.get("source_url"))
+                                doc_id = known["doc_id"] if known else document["doc_id"]
+                                usage = state.document_usage(connection, doc_id, entity_key)
+                                remaining_budget = state.run_value(connection, budget_key)
+                                adaptive_decisions[doc_id] = {
+                                    "context": contexts[selected_index].tolist(),
+                                    "embedding": embeddings[selected_index].tolist(),
+                                    "action": action,
+                                    "estimated_cost": choice_details[selected_index][1][action],
+                                    "decision": decision,
+                                }
+                                prepared = [(item[0], candidate, item[2], document, known, usage, doc_id)]
+                                remaining_budget["reserved_estimate"] += choice_details[selected_index][1][action]
+                                state.set_run_value(connection, budget_key, remaining_budget)
+                                reason = "adaptive_next_candidate"
+                else:
+                    reason = "adaptive_pool_exhausted"
             source_domains = len({
                 str(getattr(result, "source_domain", "") or "").casefold()
                 for _, result, *_ in prepared
@@ -632,16 +1002,19 @@ def run_expand(
                         summary["stop_reason"], reason = "document_budget", "document_budget"
                         prompt1_drops["global_cap"] += 1
                         break
-                    admit, stop_reason, entered_rescue = _admit_above_target(
-                        used=used, target=target, hard=hard, direction=direction,
-                        existing_keys=existing_keys, zero_gain=zero_gain,
-                        patience=patience, min_docs=min_docs,
-                        rescue_enabled=rescue_enabled, connection=connection,
-                        config=config, max_documents=run_remaining if max_documents else 0,
-                        source_domains=source_domains, query_families=query_families,
-                        min_source_domains=min_source_domains,
-                        min_query_families=min_query_families,
-                    )
+                    if adaptive:
+                        admit, stop_reason, entered_rescue = True, None, False
+                    else:
+                        admit, stop_reason, entered_rescue = _admit_above_target(
+                            used=used, target=target, hard=hard, direction=direction,
+                            existing_keys=existing_keys, zero_gain=zero_gain,
+                            patience=patience, min_docs=min_docs,
+                            rescue_enabled=rescue_enabled, connection=connection,
+                            config=config, max_documents=run_remaining if max_documents else 0,
+                            source_domains=source_domains, query_families=query_families,
+                            min_source_domains=min_source_domains,
+                            min_query_families=min_query_families,
+                        )
                     if entered_rescue and not rescue_active:
                         rescue_active = True
                         _set_rescue_mode(connection, entity_key, True)
@@ -678,6 +1051,8 @@ def run_expand(
                         checkpoint_sink=document_checkpoint_sink, progress_sink=progress_sink)
                 except Exception as error:
                     doc_elapsed = time.monotonic() - doc_started
+                    if adaptive and doc_id in adaptive_decisions:
+                        _settle_adaptive_cost(connection, run_id, adaptive_decisions[doc_id], selection_cfg)
                     state.finish_document_usage(connection, doc_id, entity_key, completed=False, elapsed_seconds=doc_elapsed)
                     checkpoint_time()
                     if checkpoint_manager is not None:
@@ -686,8 +1061,12 @@ def run_expand(
                         )
                     manifest.record_document(result, doc_id, mf.LLM_FAILED)
                     summary["documents_failed"] += 1
-                    if time_reason() or getattr(error, "stop_reason", None) == "runtime_deadline":
-                        summary["stop_reason"], reason = "runtime_budget", "runtime_budget"
+                    if time_reason() or getattr(error, "stop_reason", None) in ("runtime_deadline", "token_budget"):
+                        stop_reason = getattr(error, "stop_reason", None)
+                        summary["stop_reason"], reason = (
+                            ("token_budget", "token_budget") if stop_reason == "token_budget"
+                            else ("runtime_budget", "runtime_budget")
+                        )
                         break
                     consecutive_failures += 1
                     retry_pending = True
@@ -716,11 +1095,54 @@ def run_expand(
                         connection, reason=f"document_completed:{doc_id}",
                     )
                 if document_summary.get("skipped"):
+                    if adaptive and doc_id in adaptive_decisions:
+                        _settle_adaptive_cost(connection, run_id, adaptive_decisions[doc_id],
+                                              selection_cfg, charge=False)
                     summary["documents_skipped"] += 1
                     manifest.record_document(result, doc_id, mf.SKIPPED)
                     manifest.update_by_url(result.url, dedup_status=mf.DUPLICATE_CONTENT)
                     prompt1_drops["duplicate_content"] += 1
                     continue
+                if adaptive and doc_id in adaptive_decisions:
+                    decision_data = adaptive_decisions[doc_id]
+                    reward_weight = float((selection_cfg.get("reward_weights") or {}).get("new_supply_edge", 1.0))
+                    clip_max = float((selection_cfg.get("reward_weights") or {}).get("clip_max", 5.0))
+                    raw_reward = gained * reward_weight
+                    reward = normalize_reward(raw_reward, clip_max)
+                    reward_components = {
+                        "new_supply_edge": raw_reward,
+                        "independent_corroboration": 0.0,
+                        "verified_correction": 0.0,
+                        "new_auxiliary_edge": 0.0,
+                    }
+                    adaptive_model.update(decision_data["action"],
+                                          np.asarray(decision_data["context"], dtype=float), reward)
+                    state.set_run_value(connection, adaptive_state_key, adaptive_model.to_dict())
+                    reward_key = f"adaptive_reward_summary:{run_id}"
+                    reward_summary = state.run_value(connection, reward_key, {})
+                    action_reward = reward_summary.setdefault(decision_data["action"], {
+                        "documents": 0, "raw_reward": 0.0, "normalized_reward": 0.0,
+                        "new_supply_edges": 0,
+                    })
+                    action_reward["documents"] += 1
+                    action_reward["raw_reward"] += raw_reward
+                    action_reward["normalized_reward"] += reward
+                    action_reward["new_supply_edges"] += gained
+                    state.set_run_value(connection, reward_key, reward_summary)
+                    history_key = f"adaptive_history:{run_id}:{entity_key}"
+                    history = state.run_value(connection, history_key, [])
+                    history.append(decision_data["embedding"])
+                    state.set_run_value(connection, history_key, history)
+                    _settle_adaptive_cost(connection, run_id, decision_data, selection_cfg)
+                    _record_adaptive_decision(config, run_id, {
+                        **decision_data["decision"], "outcome": "processed",
+                        "marginal_new_supply_edges": gained,
+                        "reward_components": reward_components,
+                        "raw_reward": raw_reward, "reward": reward,
+                        "action_model_counts": dict(adaptive_model.counts),
+                        "queue_after": state.run_value(connection,
+                            f"adaptive_virtual_price:{run_id}", 0.0),
+                    })
                 manifest.record_document(result, doc_id, mf.PROCESSED, accepted_expansion_edges=gained_keys)
                 summary["documents_processed"] += 1
                 summary["documents_by_origin"][entity_name] = summary["documents_by_origin"].get(entity_name, 0) + 1
@@ -743,13 +1165,14 @@ def run_expand(
                     pending_escalation = False
             else:
                 pending_escalation = False
-            if not existing_keys and used >= (target or 0):
+            if not adaptive and not existing_keys and used >= (target or 0):
                 zero_yield_origins += 1
             finalize_entity(entity_name, entity_key, tier)
             unfinished = entity_key in state.incomplete_usage_entities(connection, max_attempts)
             pending = bool(
                 summary["stop_reason"]
                 or reason == "target_yield"
+                or (adaptive and reason == "adaptive_next_candidate")
                 or (retry_pending and unfinished)
                 or pending_escalation
             )
@@ -810,6 +1233,42 @@ def run_expand(
     summary["elapsed_seconds"] = round(time.monotonic() - started, 1)
     summary["elapsed_seconds_cumulative"] = round(elapsed(), 1)
     summary["usage"] = _usage_metrics(connection, config)
+    if budget_limit is not None:
+        budget_summary = state.run_value(connection, input_budget_key)
+        summary["input_token_budget"] = {
+            "limit_estimate": int(budget_summary["limit"]),
+            "spent_estimate": int(budget_summary["spent_estimate"]),
+            "remaining_estimate": max(0, int(budget_summary["limit"]) -
+                                      int(budget_summary["spent_estimate"])),
+            "llm_requests": int(budget_summary.get("requests", 0)),
+            "rejected_requests": int(budget_summary.get("rejected_requests", 0)),
+            "accounting_source": "serialized request characters divided by configured chars-per-token estimate; model tokenizer usage unavailable",
+            "request_log": str(log_dir / f"input_token_requests_{run_id}.jsonl"),
+        }
+    if adaptive:
+        adaptive_budget = state.run_value(connection, input_budget_key) if budget_limit is not None else None
+        summary["adaptive_selection"] = {
+            "policy": "adaptive_linucb",
+            "candidate_decisions": int(state.run_value(
+                connection, f"adaptive_candidate_decisions:{run_id}", 0)),
+            "action_counts": state.run_value(connection, f"adaptive_action_counts:{run_id}",
+                                              {"skip": 0, "snippet": 0, "full_text": 0, "both": 0}),
+            "model_action_counts": dict(adaptive_model.counts),
+            "reward_by_action": state.run_value(
+                connection, f"adaptive_reward_summary:{run_id}", {}),
+            "full_text_downloads": int(state.run_value(
+                connection, f"adaptive_full_downloads:{run_id}", 0)),
+            "full_text_fetch_attempts": int(state.run_value(
+                connection, f"adaptive_full_fetch_attempts:{run_id}", 0)),
+            "full_text_cache_reuses": int(state.run_value(
+                connection, f"adaptive_full_text_reuses:{run_id}", 0)),
+            "input_tokens_spent_estimate": int(adaptive_budget["spent_estimate"]) if adaptive_budget else None,
+            "input_tokens_remaining_estimate": max(0, int(adaptive_budget["limit"])
+                - int(adaptive_budget["spent_estimate"])),
+            "input_token_accounting": "serialized request characters divided by configured chars-per-token estimate; provider tokenizer/usage unavailable",
+            "decision_log": str(log_dir / f"adaptive_decisions_{run_id}.jsonl"),
+            "stop_reason": summary.get("stop_reason"),
+        }
     # Clarify: extraction_retries counts only transient chunk LLM retries, not
     # validation/repair/disambiguation calls (those live in llm_calls meters).
     summary["usage"]["extraction_retries_note"] = (

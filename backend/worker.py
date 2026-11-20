@@ -149,7 +149,7 @@ class Worker:
             duplicate = manual_document and connection.execute(
                 "SELECT 1 FROM documents WHERE content_hash=?", (manual_document["content_hash"],)
             ).fetchone()
-            if remaining <= 0 and not duplicate and (run["kind"] == "ingest" or not incomplete):
+            if not settings.run_until_paused and remaining <= 0 and not duplicate and (run["kind"] == "ingest" or not incomplete):
                 final_status, summary = "paused", {"stop_reason": "total_document_budget"}
             elif pause_requested():
                 final_status, summary = "paused", {"stop_reason": "pause_requested"}
@@ -157,18 +157,20 @@ class Worker:
                 llm = self.llm_factory(config)
                 ontology = load_ontology(config)
                 if run["kind"] == "ingest":
-                    config["_runtime_deadline_monotonic"] = time.monotonic() + settings.limits.max_minutes * 60
+                    if not settings.run_until_paused:
+                        config["_runtime_deadline_monotonic"] = time.monotonic() + settings.limits.max_minutes * 60
                     summary = process_document(manual_document, config, connection, llm, ontology,
                                                checkpoint_sink=checkpoint, progress_sink=progress)
                     final_status = "completed"
                 else:
                     # Core runtime is cumulative. A session adds its allowance to persisted time.
-                    elapsed = float(state.run_value(connection, "elapsed_seconds", 0))
-                    config["runtime"]["max_minutes"] += elapsed / 60
+                    if not settings.run_until_paused:
+                        elapsed = float(state.run_value(connection, "elapsed_seconds", 0))
+                        config["runtime"]["max_minutes"] += elapsed / 60
                     summary = run_expand(config, connection, llm, ontology,
                                          document_checkpoint_sink=checkpoint, should_pause=pause_requested,
                                          progress_sink=progress,
-                                         max_total_documents=settings.limits.max_total_documents)
+                                         max_total_documents=None if settings.run_until_paused else settings.limits.max_total_documents)
                     if summary["completion"]["failed_frontier"] or summary["documents_failed"]:
                         final_status = "failed"
                         error_text = "Expansion has failed documents or frontier entities; inspect project errors"
