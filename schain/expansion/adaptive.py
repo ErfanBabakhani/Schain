@@ -150,7 +150,7 @@ def choose_action(model: LinUCB, context: np.ndarray, *, estimated_costs: dict[s
 
 
 def encode_context_texts(texts: list[str], *, model_name: str = "BAAI/bge-small-en-v1.5",
-                         batch_size: int = 32) -> np.ndarray:
+                         batch_size: int = 32, local_files_only: bool = False) -> np.ndarray:
     """Encode candidate title/snippet strings with frozen BGE; optional dependency."""
     global _EMBEDDER, _EMBEDDER_MODEL
     try:
@@ -158,7 +158,8 @@ def encode_context_texts(texts: list[str], *, model_name: str = "BAAI/bge-small-
     except ImportError as error:
         raise RuntimeError("adaptive_linucb requires sentence-transformers; install it to run adaptive mode") from error
     if _EMBEDDER is None:
-        _EMBEDDER = SentenceTransformer(model_name, device="cpu")
+        options = {"local_files_only": True} if local_files_only else {}
+        _EMBEDDER = SentenceTransformer(model_name, device="cpu", **options)
     elif _EMBEDDER_MODEL != model_name:
         raise ValueError("one EXPAND process cannot mix adaptive embedding models")
     _EMBEDDER_MODEL = model_name
@@ -235,6 +236,7 @@ def build_document_contexts(results: list, entity_name: str, *, aliases: list[st
     embeddings = encode_context_texts(
         embedding_input, model_name=selection.get("embedding_model", "BAAI/bge-small-en-v1.5"),
         batch_size=int(selection.get("embedding_batch_size", 32)),
+        **({"local_files_only": True} if config.get("_benchmark_offline") else {}),
     )
     n = len(texts)
     supplier, irrelevant = similarity_features(embeddings[:n], embeddings[n:n + 2], embeddings[n + 2:])

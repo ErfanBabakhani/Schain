@@ -57,10 +57,20 @@ def test_adaptive_policy_accepts_configured_candidate_limit_and_requires_budget(
     config["expansion"]["retrieval"]["max_candidates_per_entity"] = 0
     with pytest.raises(ValueError, match="positive max_candidates_per_entity"):
         validate_expansion_config(config)
-
     config["expansion"]["retrieval"]["max_candidates_per_entity"] = 200
     config["expansion"]["selection"].pop("total_input_tokens")
     with pytest.raises(ValueError, match="requires expansion.selection.total_input_tokens"):
+        validate_expansion_config(config)
+
+
+def test_allowed_actions_is_optional_and_rejects_unknown_or_duplicate_actions():
+    config = {"expansion": {"selection": {"policy": "legacy", "allowed_actions": ["snippet"]}}}
+    validate_expansion_config(config)
+    config["expansion"]["selection"]["allowed_actions"] = ["snippet", "telepathy"]
+    with pytest.raises(ValueError, match="allowed_actions"):
+        validate_expansion_config(config)
+    config["expansion"]["selection"]["allowed_actions"] = ["snippet", "snippet"]
+    with pytest.raises(ValueError, match="allowed_actions"):
         validate_expansion_config(config)
 
 

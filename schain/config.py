@@ -313,6 +313,15 @@ def validate_expansion_config(config: dict[str, Any]) -> None:
         raise ValueError("expansion.selection.policy must be legacy or adaptive_linucb")
     if selection.get("candidate_pool_policy") not in (None, "title_snippet"):
         raise ValueError("expansion.selection.candidate_pool_policy must be title_snippet when set")
+    allowed_actions = selection.get("allowed_actions")
+    if allowed_actions is not None:
+        if (not isinstance(allowed_actions, list) or not allowed_actions or
+                any(action not in ("snippet", "full_text", "both") for action in allowed_actions) or
+                len(set(allowed_actions)) != len(allowed_actions)):
+            raise ValueError(
+                "expansion.selection.allowed_actions must be a nonempty unique list "
+                "of snippet, full_text, and both"
+            )
     if (selection.get("total_input_tokens") is not None and
             int(selection["total_input_tokens"]) <= 0):
         raise ValueError("expansion.selection.total_input_tokens must be positive")

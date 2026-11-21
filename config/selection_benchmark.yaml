@@ -1,0 +1,32 @@
+# One extraction, validation and tokenizer configuration for the two arms.
+# schain.benchmark assigns isolated storage and configures the comparison mode.
+include:
+  - config/expansion.yaml
+
+expansion:
+  retrieval:
+    max_candidates_per_entity: 200
+    max_candidates_per_domain: null
+    max_full_text_fetches_per_domain: null
+  selection:
+    candidate_pool_policy: title_snippet
+    total_input_tokens: 200000
+    input_token_metric: tokenizer_input_tokens
+    target_tokens_per_candidate: 1000
+    random_seed: 42
+    warmup_candidates: 200
+    snippet_batch_size: 10
+    official_domains:
+      - bmwgroup.com
+      - toyota.com
+      - tesla.com
+      - byd.com
+      - catl.com
+      - panasonic.com
+      - lgensol.com
+      - samsungsdi.com
+      - tsmc.com
+      - nvidia.com
+
+runtime:
+  max_minutes: 0

@@ -59,6 +59,7 @@ from ..sources.ranking import discovery_candidate_is_meaningful
 from ..sources.origin import origin_name_variants
 from .adaptive import LinUCB, build_document_contexts, choose_action, normalize_reward
 from ..llm.provider import InputBudgetLLM, InputTokenBudgetExceeded, load_tokenizer
+from .input_budget import budgeted_llm
 from .frontier import discover_upstream, seed_frontier
 
 logger = logging.getLogger(__name__)
@@ -500,7 +501,7 @@ def run_expand(
     document_checkpoint_sink=None,
     should_pause=None,
     max_total_documents=None,
-    progress_sink=None,
+    progress_sink=None, benchmark=None,
 ) -> dict[str, Any]:
     """Expand under persisted budgets; all accepted facts survive scheduling stops.
 
@@ -543,69 +544,15 @@ def run_expand(
     tokenizer_model = str(llm_config.get("tokenizer_model") or llm_config.get("model") or "")
     if adaptive and llm is None:
         raise ValueError("adaptive selection requires a configured LLM")
-    budget_tokenizer = load_tokenizer(tokenizer_model) if budget_limit is not None and llm is not None else None
+    budget_tokenizer = None
+    if budget_limit is not None and llm is not None:
+        budget_tokenizer = (benchmark.tokenizer if benchmark is not None
+                            else load_tokenizer(tokenizer_model))
     if adaptive and budget_limit is None:
         raise ValueError("adaptive selection requires expansion.selection.total_input_tokens")
     if budget_limit is not None:
-        if state.run_value(connection, input_budget_key) is None:
-            state.set_run_value(connection, input_budget_key, {
-                "spent_estimate": 0, "reserved_estimate": 0, "limit": int(budget_limit),
-                "requests": 0, "accounting_version": "qwen_tokenizer_v1",
-                "tokenizer_model": tokenizer_model,
-            })
-        else:
-            budget_state = state.run_value(connection, input_budget_key)
-            if budget_state.get("accounting_version") != "qwen_tokenizer_v1":
-                raise ValueError("input-token ledger uses character estimates; start a fresh EXPAND state")
-            if int(budget_state["limit"]) != int(budget_limit):
-                raise ValueError("input-token budget changed; start a fresh EXPAND state")
-            if budget_state.get("tokenizer_model") not in (None, tokenizer_model):
-                raise ValueError("input-token tokenizer changed; start a fresh EXPAND state")
-            budget_state["tokenizer_model"] = tokenizer_model
-            state.set_run_value(connection, input_budget_key, budget_state)
-        budget_state = state.run_value(connection, input_budget_key)
-        if budget_state.get("reserved_estimate"):
-            budget_state["reserved_estimate"] = 0
-            state.set_run_value(connection, input_budget_key, budget_state)
-        if llm is not None and not getattr(llm, "_schain_input_budget", False):
-            def reserve_input_tokens(estimate):
-                budget = state.run_value(connection, input_budget_key)
-                if (int(budget["spent_estimate"]) + int(budget.get("reserved_estimate", 0))
-                        + int(estimate) > int(budget["limit"])):
-                    budget["rejected_requests"] = int(budget.get("rejected_requests", 0)) + 1
-                    state.set_run_value(connection, input_budget_key, budget)
-                    request_log = Path(config.get("storage", {}).get("logs", REPO_ROOT / "logs"))
-                    request_log.mkdir(parents=True, exist_ok=True)
-                    with (request_log / f"input_token_requests_{run_id}.jsonl").open("a", encoding="utf-8") as handle:
-                        handle.write(json.dumps({
-                            "run_id": run_id, "request_index": budget.get("requests", 0) + 1,
-                            "input_tokens": int(estimate), "spent_before": budget["spent_estimate"],
-                            "status": "rejected_by_budget",
-                            "accounting_source": "configured Qwen tokenizer chat-template token count",
-                            "tokenizer_model": tokenizer_model,
-                        }) + "\n")
-                    raise InputTokenBudgetExceeded(
-                        f"input-token budget exhausted: "
-                        f"{budget['spent_estimate']} + {estimate} > {budget['limit']}"
-                    )
-                before = int(budget["spent_estimate"])
-                budget["spent_estimate"] += int(estimate)
-                budget["requests"] = int(budget.get("requests", 0)) + 1
-                state.set_run_value(connection, input_budget_key, budget)
-                request_log = Path(config.get("storage", {}).get("logs", REPO_ROOT / "logs"))
-                request_log.mkdir(parents=True, exist_ok=True)
-                with (request_log / f"input_token_requests_{run_id}.jsonl").open("a", encoding="utf-8") as handle:
-                    handle.write(json.dumps({
-                        "run_id": run_id, "request_index": budget["requests"],
-                        "input_tokens": int(estimate), "spent_before": before,
-                        "spent_after": budget["spent_estimate"],
-                        "accounting_source": "configured Qwen tokenizer chat-template token count",
-                        "tokenizer_model": tokenizer_model,
-                    }) + "\n")
-            llm = InputBudgetLLM(
-                llm, reserve_input_tokens, tokenizer=budget_tokenizer,
-                tokenizer_model=tokenizer_model,
-            )
+        llm = budgeted_llm(config, connection, run_id, llm, budget_tokenizer, tokenizer_model,
+                           strict=benchmark is not None)
     if adaptive and not isinstance(llm, InputBudgetLLM):
         raise ValueError("adaptive selection requires tokenizer-based InputBudgetLLM accounting")
     if adaptive:
@@ -736,6 +683,8 @@ def run_expand(
                     if retrieval_checkpoint is not None else None
                 )
                 if results is None:
+                    if benchmark is not None:
+                        raise RuntimeError(f"missing frozen retrieval for {entity_key} at tier {tier}")
                     results = retrieve_for_entity(
                         config, entity_name, entity_key, tier, connection, manifest,
                         llm=llm, escalation_stages=stages,
@@ -744,6 +693,8 @@ def run_expand(
                         retrieval_checkpoint.save(entity_key, tier, results, stages=stages)
             except Exception as error:
                 checkpoint_time()
+                if benchmark is not None and getattr(error, "stop_reason", None) != "token_budget":
+                    raise
                 if getattr(error, "stop_reason", None) == "token_budget":
                     summary["stop_reason"] = "token_budget"
                     state.set_frontier_status(connection, entity_key, state.PENDING,
@@ -790,6 +741,8 @@ def run_expand(
                         continue
                 if not discovery_candidate_is_meaningful(candidate_view, entity_name,
                         aliases=entity_aliases, policy=relation_policy):
+                    if benchmark is not None:
+                        benchmark.event(entity_key, tier, result, "ineligible")
                     prompt1_drops["candidate_unusable"] += 1
                     continue
                 direction = (
@@ -802,6 +755,8 @@ def run_expand(
                                                   aliases=entity_aliases, policy=relation_policy))
                 )
                 if direction == DOWNSTREAM_EXPLICIT:
+                    if benchmark is not None:
+                        benchmark.event(entity_key, tier, result, "ineligible")
                     prompt1_drops["downstream_only"] += 1
                     continue
                 if adaptive:
@@ -923,6 +878,10 @@ def run_expand(
                         full_cost = int(selection_cfg.get("full_text_tokens_estimate", 4000)) + overhead
                         costs = {"snippet": snippet_cost, "full_text": full_cost,
                                  "both": full_cost + snippet_tokens}
+                        allowed_actions = selection_cfg.get("allowed_actions")
+                        if allowed_actions is not None:
+                            costs = {name: cost for name, cost in costs.items()
+                                     if name in allowed_actions}
                         feasible_costs = {action: cost for action, cost in costs.items()
                                           if cost <= remaining_tokens}
                         action, details = choose_action(
@@ -975,6 +934,8 @@ def run_expand(
                     if pool_exhausted:
                         for skipped_index in candidate_indices:
                             skipped = candidates[skipped_index][1]
+                            if benchmark is not None:
+                                benchmark.event(entity_key, tier, skipped, "skipped", phase="greedy")
                             _record_adaptive_decision(config, run_id, {
                                 "run_id": run_id, "entity_id": entity_key, "entity": entity_name,
                                 "tier": tier, "url": skipped.canonical_source_url or skipped.url,
@@ -1025,13 +986,19 @@ def run_expand(
                             }
                             _record_adaptive_decision(config, run_id, decision)
                             if action == "skip":
+                                if benchmark is not None:
+                                    benchmark.event(entity_key, tier, candidate, "skipped",
+                                                    phase=decision["phase"])
                                 seen_urls.add(url)
                                 skipped_count += 1
                                 reason = "adaptive_next_candidate"
                                 continue
                             if action in ("full_text", "both"):
                                 had_full_text = bool(candidate.cached_full_text)
-                                fetch_selected_full_text(candidate, config, manifest)
+                                if benchmark is None:
+                                    fetch_selected_full_text(candidate, config, manifest)
+                                else:
+                                    benchmark.fetch(entity_key, tier, stages, candidate)
                                 if not had_full_text and candidate.full_text_attempted:
                                     attempt_key = f"adaptive_full_fetch_attempts:{run_id}"
                                     state.set_run_value(connection, attempt_key,
@@ -1043,6 +1010,9 @@ def run_expand(
                                 if not candidate.text:
                                     decision["failure_reason"] = candidate.fetch_error or "full_text_unavailable"
                                     _record_adaptive_decision(config, run_id, decision)
+                                    if benchmark is not None:
+                                        benchmark.event(entity_key, tier, candidate, "fetch_failed",
+                                                        phase=decision["phase"], error=decision["failure_reason"])
                                     seen_urls.add(url)
                                     skipped_count += 1
                                     reason = "adaptive_next_candidate"
@@ -1146,6 +1116,8 @@ def run_expand(
                         continue
                     batch_jobs, batch_documents, batch_tokens = possible, possible_documents, request_tokens
                 if len(batch_jobs) > 1:
+                    if benchmark is not None:
+                        llm.benchmark_phase = adaptive_decisions[batch_jobs[0][-1]]["decision"]["phase"]
                     for item in batch_jobs:
                         _release_adaptive_reservation(
                             connection, run_id, adaptive_decisions[item[-1]],
@@ -1273,6 +1245,11 @@ def run_expand(
                     config["_runtime_deadline_monotonic"] = time.monotonic() + max(0, max_seconds - elapsed())
                 else:
                     config.pop("_runtime_deadline_monotonic", None)
+                if benchmark is not None:
+                    decision = adaptive_decisions.get(doc_id, {}).get("decision", {})
+                    llm.benchmark_phase = decision.get("phase", "overall")
+                    benchmark.event(entity_key, tier, result, "selected", doc_id=doc_id,
+                                    phase=llm.benchmark_phase)
                 manifest.mark_selected(result)
                 doc_started = time.monotonic()
                 try:
@@ -1281,8 +1258,12 @@ def run_expand(
                         document_index=state.document_usage_count(connection), document_budget=max_documents or None,
                         checkpoint_sink=document_checkpoint_sink, progress_sink=progress_sink,
                         precomputed_extraction=precomputed_extractions.get(document["doc_id"]))
+                    if benchmark is not None and state.run_value(connection, input_budget_key).get("first_rejection"):
+                        raise InputTokenBudgetExceeded("a request reached the input-token limit")
                 except Exception as error:
                     doc_elapsed = time.monotonic() - doc_started
+                    denied = (benchmark is not None
+                              and state.run_value(connection, input_budget_key).get("first_rejection"))
                     if adaptive and doc_id in adaptive_decisions:
                         current_spent = int(state.run_value(connection, input_budget_key,
                             {"spent_estimate": spent_before_document})["spent_estimate"])
@@ -1298,10 +1279,13 @@ def run_expand(
                         checkpoint_manager.maybe_snapshot(
                             connection, reason=f"document_failed:{doc_id}",
                         )
+                    if benchmark is not None and not denied:
+                        benchmark.event(entity_key, tier, result, "failed", doc_id=doc_id,
+                                        phase=llm.benchmark_phase, error=str(error))
                     manifest.record_document(result, doc_id, mf.LLM_FAILED)
                     summary["documents_failed"] += 1
-                    if time_reason() or getattr(error, "stop_reason", None) in ("runtime_deadline", "token_budget"):
-                        stop_reason = getattr(error, "stop_reason", None)
+                    if denied or time_reason() or getattr(error, "stop_reason", None) in ("runtime_deadline", "token_budget"):
+                        stop_reason = "token_budget" if denied else getattr(error, "stop_reason", None)
                         summary["stop_reason"], reason = (
                             ("token_budget", "token_budget") if stop_reason == "token_budget"
                             else ("runtime_budget", "runtime_budget")
@@ -1393,6 +1377,9 @@ def run_expand(
                         "queue_after": state.run_value(connection,
                             f"adaptive_virtual_price:{run_id}", 0.0),
                     })
+                if benchmark is not None:
+                    benchmark.event(entity_key, tier, result, "processed", doc_id=doc_id,
+                                    phase=llm.benchmark_phase)
                 manifest.record_document(result, doc_id, mf.PROCESSED, accepted_expansion_edges=gained_keys)
                 summary["documents_processed"] += 1
                 summary["documents_by_origin"][entity_name] = summary["documents_by_origin"].get(entity_name, 0) + 1
@@ -1511,6 +1498,7 @@ def run_expand(
         "max_documents_per_entity": retrieval_cfg.get("max_documents_per_entity"),
         "max_documents_per_run": max_documents,
         "snippet_batch_size": selection_cfg.get("snippet_batch_size", 10),
+        "allowed_actions": selection_cfg.get("allowed_actions"),
         "total_input_tokens": budget_limit,
         "target_tokens_per_candidate": selection_cfg.get("target_tokens_per_candidate"),
         "tokenizer_model": tokenizer_model or None,
@@ -1534,6 +1522,8 @@ def run_expand(
             "policy": "adaptive_linucb",
             "candidate_decisions": int(state.run_value(
                 connection, f"adaptive_candidate_decisions:{run_id}", 0)),
+            "warmup_candidates": int(selection_cfg.get("warmup_candidates", 200)),
+            "random_seed": int(selection_cfg.get("random_seed", 42)),
             "action_counts": state.run_value(connection, f"adaptive_action_counts:{run_id}",
                                               {"skip": 0, "snippet": 0, "full_text": 0, "both": 0}),
             "model_action_counts": dict(adaptive_model.counts),

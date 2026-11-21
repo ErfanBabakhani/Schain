@@ -21,22 +21,30 @@ T = TypeVar("T")
 class _PersistentLoop:
     def __init__(self) -> None:
         self._loop = asyncio.new_event_loop()
+        self._ready = threading.Event()
         self._thread = threading.Thread(
             target=self._serve,
             name="schain-async-runtime",
             daemon=True,
         )
         self._thread.start()
+        self._ready.wait()
 
     def _serve(self) -> None:
         asyncio.set_event_loop(self._loop)
+        self._loop.call_soon(self._ready.set)
         self._loop.run_forever()
 
     def run(self, coroutine: Coroutine[Any, Any, T]) -> T:
         if not self._loop.is_running():
             coroutine.close()
             raise RuntimeError("SChain async runtime is not running")
-        return asyncio.run_coroutine_threadsafe(coroutine, self._loop).result()
+        future = asyncio.run_coroutine_threadsafe(coroutine, self._loop)
+        try:
+            return future.result()
+        except KeyboardInterrupt:
+            future.cancel()
+            raise
 
     def close(self) -> None:
         if not self._loop.is_running():

@@ -554,6 +554,7 @@ async def retrieve_async(
     *,
     llm=None,
     escalation_stages: Optional[list[str]] = None,
+    record_snapshot=None,
 ) -> list[SearchResult]:
     from ..expansion.escalation import STAGE_A, STAGE_B, build_escalation_queries
     from ..kg.relation_evidence import load_relation_evidence
@@ -654,6 +655,7 @@ async def retrieve_async(
 
         cached = load_search_results(results_path, cached_ids)
         combined = cached + fresh
+        provider_rows = [result.as_row() for result in combined] if record_snapshot else None
         if cached_ids:
             logger.info("%d query result set(s) reused from a previous run", len(cached_ids))
         if not metadata_pool:
@@ -840,6 +842,12 @@ async def retrieve_async(
         logger.info("%d. direction=%s score=%.1f %r", index,
                     getattr(result, "_discovery_direction", None),
                     float(getattr(result, "_discovery_rank", 0.0)), (result.title or "")[:100])
+    if record_snapshot is not None:
+        searches = [dict(row) for row in connection.execute(
+            "SELECT provider,query,status,result_count,error FROM searches "
+            "WHERE entity_key=? AND tier=? ORDER BY rowid", (entity_key, tier),
+        )]
+        record_snapshot(query_specs, searches, provider_rows, selected)
     return selected
 
 
@@ -853,12 +861,13 @@ def retrieve_for_entity(
     *,
     llm=None,
     escalation_stages: Optional[list[str]] = None,
+    record_snapshot=None,
 ) -> list[SearchResult]:
     """Blocking wrapper around :func:`retrieve_async`."""
     return asyncio.run(
         retrieve_async(
             config, entity_name, entity_key, tier, connection, manifest,
-            llm=llm, escalation_stages=escalation_stages,
+            llm=llm, escalation_stages=escalation_stages, record_snapshot=record_snapshot,
         )
     )
 

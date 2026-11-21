@@ -537,10 +537,9 @@ def process_document(
                 )
             summary.update(extraction_metrics)
             if precomputed_extraction is not None:
-                if extraction_metrics.get("llm_calls"):
-                    summary["llm_calls_by_stage"]["extraction"] = int(
-                        extraction_metrics["llm_calls"]
-                    )
+                summary["llm_calls_by_stage"]["extraction"] = int(
+                    extraction_metrics.get("llm_calls", 0)
+                )
                 audit.emit(
                     "parsed_extraction_graph", stage="extraction", source="snippet_batch",
                     batch_size=extraction_metrics.get("extraction_batch_size"),

@@ -39,17 +39,21 @@ class InputBudgetLLM:
 
     _schain_input_budget = True
 
-    def __init__(self, llm, reserve_input_tokens, *, tokenizer, tokenizer_model: str):
+    def __init__(self, llm, reserve_input_tokens, *, tokenizer, tokenizer_model: str,
+                 strict_template=False, record_response=None):
         self._schain_wrapped_llm = llm
         self.reserve_input_tokens = reserve_input_tokens
         self.tokenizer = tokenizer
         self.tokenizer_model = tokenizer_model
+        self.strict_template = strict_template
+        self.record_response = record_response
 
     def __getattr__(self, name):
         return getattr(self._schain_wrapped_llm, name)
 
     @staticmethod
-    def estimate_input_tokens(args, kwargs, *, tokenizer, chat_template_kwargs=None) -> int:
+    def estimate_input_tokens(args, kwargs, *, tokenizer, chat_template_kwargs=None,
+                              strict_template=False) -> int:
         prompt = args[0] if args else kwargs.get("input", "")
         history = args[1] if len(args) > 1 else kwargs.get("message_history")
         system = args[2] if len(args) > 2 else kwargs.get("system_instruction")
@@ -59,7 +63,8 @@ class InputBudgetLLM:
             messages.append({"role": "system", "content": str(system)})
         if isinstance(history, dict):
             history = [history]
-        for message in history or ():
+        input_messages = prompt if isinstance(prompt, list) else ()
+        for message in [*(history or ()), *input_messages]:
             if isinstance(message, dict):
                 role = message.get("role", "user")
                 content = message.get("content", "")
@@ -68,7 +73,8 @@ class InputBudgetLLM:
                 content = getattr(message, "content", str(message))
             role = getattr(role, "value", role)
             messages.append({"role": str(role), "content": str(content)})
-        messages.append({"role": "user", "content": str(prompt)})
+        if not isinstance(prompt, list):
+            messages.append({"role": "user", "content": str(prompt)})
 
         if getattr(tokenizer, "chat_template", None):
             try:
@@ -77,7 +83,11 @@ class InputBudgetLLM:
                     **(chat_template_kwargs or {}),
                 ))
             except Exception as error:  # fall back to the same tokenizer's serialized request
+                if strict_template:
+                    raise ValueError("configured tokenizer could not render the chat request") from error
                 logger.warning("model chat-template tokenization failed; using serialized prompt tokens: %s", error)
+        elif strict_template:
+            raise ValueError("benchmark requires a tokenizer with a chat template")
         serialized = json.dumps(messages, ensure_ascii=False, default=str)
         return len(tokenizer.encode(serialized, add_special_tokens=True))
 
@@ -98,19 +108,26 @@ class InputBudgetLLM:
         return self.estimate_input_tokens(
             args, kwargs, tokenizer=self.tokenizer,
             chat_template_kwargs=template_kwargs,
+            strict_template=self.strict_template,
         )
 
     def invoke(self, *args, **kwargs):
         self.reserve_input_tokens(self.count_request_tokens(args, kwargs))
-        return self._schain_wrapped_llm.invoke(*args, **kwargs)
+        response = self._schain_wrapped_llm.invoke(*args, **kwargs)
+        if self.record_response is not None:
+            self.record_response(response)
+        return response
 
     async def ainvoke(self, *args, **kwargs):
         self.reserve_input_tokens(self.count_request_tokens(args, kwargs))
-        return await self._schain_wrapped_llm.ainvoke(*args, **kwargs)
+        response = await self._schain_wrapped_llm.ainvoke(*args, **kwargs)
+        if self.record_response is not None:
+            self.record_response(response)
+        return response
 
 
 @lru_cache(maxsize=4)
-def load_tokenizer(model_name: str):
+def load_tokenizer(model_name: str, *, local_files_only=False):
     """Load the tokenizer that matches the model configured for the EXPAND run."""
     try:
         from transformers import AutoTokenizer
@@ -119,7 +136,7 @@ def load_tokenizer(model_name: str):
             "token-budgeted EXPAND requires transformers; install the server or adaptive extra"
         ) from error
     try:
-        return AutoTokenizer.from_pretrained(model_name)
+        return AutoTokenizer.from_pretrained(model_name, local_files_only=True) if local_files_only else AutoTokenizer.from_pretrained(model_name)
     except (OSError, ValueError) as error:
         raise RuntimeError(
             f"could not load the configured model tokenizer {model_name!r}"
