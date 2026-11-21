@@ -180,7 +180,11 @@ def connect(path: Path, *, journal_mode: str = "WAL") -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     if journal_mode not in ("WAL", "DELETE"):
         raise ValueError("journal_mode must be WAL or DELETE")
-    connection = sqlite3.connect(path, timeout=30)
+    # Extraction runs on the persistent asyncio loop while the synchronous
+    # pipeline waits for it. Some pipeline callbacks touch the state connection
+    # from that loop, so permit cross-thread use; the worker remains serial and
+    # awaits each async stage before accessing the connection again.
+    connection = sqlite3.connect(path, timeout=30, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute(f"PRAGMA journal_mode={journal_mode}")
     connection.execute("PRAGMA foreign_keys=ON")
