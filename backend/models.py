@@ -9,7 +9,13 @@ Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max
 class Limits(BaseModel):
     model_config = ConfigDict(extra="forbid")
     max_tier: int = Field(default=3, ge=0, le=10)
-    max_documents_per_entity: int = Field(default=5, ge=1, le=100)
+    selection_policy: Literal["legacy", "adaptive_linucb"] = "legacy"
+    search_results_per_query: int = Field(default=30, ge=1, le=100)
+    max_candidates_per_entity: int = Field(default=200, ge=1, le=5000)
+    snippet_batch_size: int = Field(default=10, ge=1, le=10)
+    max_documents_per_entity: int | None = Field(default=None, ge=1, le=1000)
+    total_input_tokens: int = Field(default=200000, ge=1, le=100000000)
+    target_tokens_per_candidate: int = Field(default=1000, ge=1, le=1000000)
     max_documents_per_run: int = Field(default=10, ge=1, le=1000)
     max_total_documents: int = Field(default=100, ge=1, le=100000)
     llm_max_concurrency: int = Field(default=1, ge=1, le=8)

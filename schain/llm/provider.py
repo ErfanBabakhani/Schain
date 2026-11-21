@@ -84,6 +84,13 @@ class InputBudgetLLM:
     def count_text_tokens(self, text: str) -> int:
         return len(self.tokenizer.encode(text, add_special_tokens=False))
 
+    def input_context_limit_tokens(self) -> int | None:
+        context_length = int(getattr(self.tokenizer, "model_max_length", 0) or 0)
+        if not 0 < context_length < 1_000_000_000:
+            return None
+        output_tokens = int((getattr(self, "model_params", {}) or {}).get("max_tokens", 0) or 0)
+        return max(0, context_length - output_tokens)
+
     def count_request_tokens(self, args, kwargs) -> int:
         parameters = getattr(self._schain_wrapped_llm, "model_params", {}) or {}
         extra_body = parameters.get("extra_body") or {}
@@ -109,7 +116,7 @@ def load_tokenizer(model_name: str):
         from transformers import AutoTokenizer
     except ImportError as error:
         raise RuntimeError(
-            "token-budgeted EXPAND requires transformers; install the adaptive extra"
+            "token-budgeted EXPAND requires transformers; install the server or adaptive extra"
         ) from error
     try:
         return AutoTokenizer.from_pretrained(model_name)

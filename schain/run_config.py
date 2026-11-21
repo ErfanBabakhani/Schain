@@ -193,6 +193,10 @@ def _add_summary(snapshot: dict[str, Any], config: dict[str, Any]) -> None:
         },
         "retrieval_settings": _safe(expansion),
         "model": config.get("llm", {}).get("model"),
+        "tokenizer_model": (
+            config.get("llm", {}).get("tokenizer_model")
+            or config.get("llm", {}).get("model")
+        ),
         "local_model_weights_override": snapshot["effective_config"].get("llm", {}).get("local_model_weights_override"),
         "runtime_cap_minutes": config.get("runtime", {}).get("max_minutes"),
         "relation_policy_sha256": snapshot.get("relation_policy_sha256"),

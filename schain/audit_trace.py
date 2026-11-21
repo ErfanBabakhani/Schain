@@ -165,6 +165,7 @@ class RunAuditTrace:
             "run_id": self.run_id, "started_at": self.started_at,
             "schain_version": __version__, "git_commit": commit, "git_branch": branch,
             "mode": mode, "model": llm.get("model"),
+            "tokenizer_model": llm.get("tokenizer_model") or llm.get("model"),
             "provider": llm.get("provider", "local"),
             "endpoint": _safe_url(str(llm.get("base_url") or "")) or None,
             "inference_parameters": json_value({

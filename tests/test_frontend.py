@@ -276,6 +276,45 @@ def test_compact_workspace_keeps_document_and_advanced_controls(workspace):
     assert all(method == "GET" for method, *_ in workspace["requests"])
 
 
+def test_run_settings_reach_backend_and_are_saved_with_the_run(workspace):
+    from backend.storage import connect as database
+
+    page = workspace["page"]
+    connect(workspace)
+    page.locator("#newProject").click()
+    page.locator("#advancedSettings summary").click()
+    page.locator("#projectName").fill("Adaptive configuration")
+    page.locator("#projectSeeds").fill("BMW")
+    page.locator("#max_tier").fill("4")
+    page.locator("#selection_policy").select_option("adaptive_linucb")
+    page.locator("#search_results_per_query").fill("12")
+    page.locator("#max_candidates_per_entity").fill("175")
+    page.locator("#snippet_batch_size").fill("6")
+    page.locator("#max_documents_per_entity").fill("")
+    page.locator("#total_input_tokens").fill("90000")
+    page.locator("#target_tokens_per_candidate").fill("750")
+    page.locator("#saveProject").click()
+    page.wait_for_function("document.getElementById('projectSelect').value !== ''")
+
+    project_id = page.locator("#projectSelect").input_value()
+    with database(workspace["projects"].database(project_id)) as connection:
+        config = json.loads(connection.execute("SELECT config FROM project").fetchone()[0])
+    assert config["expansion"]["selection"]["policy"] == "adaptive_linucb"
+    assert config["expansion"]["selection"]["snippet_batch_size"] == 6
+    assert config["expansion"]["selection"]["total_input_tokens"] == 90000
+    assert config["expansion"]["retrieval"]["max_candidates_per_entity"] == 175
+    assert config["expansion"]["retrieval"]["max_documents_per_entity"] is None
+
+    page.locator("#startRun").click()
+    page.wait_for_function("document.getElementById('projectState').textContent === 'queued'")
+    with database(workspace["projects"].database(project_id)) as connection:
+        run_config = json.loads(connection.execute(
+            "SELECT config_snapshot FROM runs",
+        ).fetchone()[0])
+    assert run_config["expansion"]["max_tier"] == 4
+    assert run_config["expansion"]["selection"]["target_tokens_per_candidate"] == 750
+
+
 def test_pagination_revisions_and_project_switching(workspace):
     from backend.storage import connect as database, read_graph, save_graph
 

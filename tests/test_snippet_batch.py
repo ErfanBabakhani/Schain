@@ -88,23 +88,27 @@ def test_snippet_batch_does_not_turn_missing_or_cross_document_output_into_zero_
 def test_batched_graph_uses_existing_per_document_validation_pipeline(
     ontology, ingest_config, connection,
 ):
-    text = "CATL supplies battery cells to BMW."
-    document = make_document(text, source_url="https://news.test/catl-bmw")
+    first_text = "CATL supplies battery cells to BMW."
+    second_text = "Panasonic supplies battery cells to Tesla."
+    documents = [
+        make_document(first_text, source_url="https://news.test/catl-bmw"),
+        make_document(second_text, source_url="https://news.test/panasonic-tesla"),
+    ]
     llm = BatchReply({"documents": [
-        make_entry(document["doc_id"], "CATL", "BMW", text),
+        make_entry(documents[0]["doc_id"], "CATL", "BMW", first_text),
+        make_entry(documents[1]["doc_id"], "Panasonic", "Tesla", second_text),
     ]})
     extraction = extract_snippet_batch(
-        llm, [{"doc_id": document["doc_id"], "text": text}], ontology,
-    )[document["doc_id"]]
+        llm, [{"doc_id": doc["doc_id"], "text": doc["text"]} for doc in documents], ontology,
+    )
     pipeline_llm = StubLLM()
 
-    summary = process_document(
+    summaries = [process_document(
         document, ingest_config, connection, pipeline_llm, ontology,
-        precomputed_extraction=extraction,
-    )
+        precomputed_extraction=extraction[document["doc_id"]],
+    ) for document in documents]
 
-    assert summary["facts"] == 1
-    assert summary["status"] == "RESOLVED"
-    assert summary["llm_calls"] >= 1
-    assert summary["llm_calls_by_stage"]["extraction"] == 1
+    assert [summary["facts"] for summary in summaries] == [1, 1]
+    assert [summary["status"] for summary in summaries] == ["RESOLVED", "RESOLVED"]
+    assert [summary["llm_calls_by_stage"]["extraction"] for summary in summaries] == [1, 0]
     assert pipeline_llm.extraction_calls == 0

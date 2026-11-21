@@ -82,7 +82,11 @@ def initialize(path):
                     if statement.strip():
                         connection.execute(statement)
                 version = 3
-            if version != 3:
+            if version == 3:
+                connection.execute("ALTER TABLE runs ADD COLUMN config_snapshot TEXT")
+                connection.execute("INSERT INTO server_schema VALUES(4)")
+                version = 4
+            if version != 4:
                 raise ValueError(f"Unsupported server schema version: {version}")
     finally:
         connection.close()

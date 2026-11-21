@@ -1,4 +1,6 @@
 """Offline server integration tests using the real core and temporary project databases."""
+import json
+
 import pytest
 pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
@@ -9,6 +11,7 @@ from backend.models import ProjectSettings
 from backend.projects import Conflict, Projects
 from backend.storage import connect, initialize, read_graph, save_graph
 from backend.worker import Worker, worker_lock
+from schain.config import query_limit, resolve_tier_queries
 from schain.viewer import validate_graph
 from tests.conftest import DOCUMENT_TEXT
 
@@ -37,6 +40,56 @@ def test_projects_seeds_and_isolation(projects):
     assert projects.detail(second["id"])["runs"] == []
     with pytest.raises(KeyError):
         projects.database("../outside")
+
+
+def test_run_settings_propagate_and_are_snapshotted(projects):
+    from schain.expansion.budget import entity_document_limits
+
+    configured = projects.create(settings(limits={
+        "max_tier": 4,
+        "selection_policy": "adaptive_linucb",
+        "search_results_per_query": 12,
+        "max_candidates_per_entity": 175,
+        "snippet_batch_size": 6,
+        "max_documents_per_entity": None,
+        "total_input_tokens": 90000,
+        "target_tokens_per_candidate": 750,
+    }))
+    with connect(projects.database(configured["id"])) as connection:
+        config = json.loads(connection.execute("SELECT config FROM project").fetchone()[0])
+    expansion = config["expansion"]
+    retrieval = expansion["retrieval"]
+    selection = expansion["selection"]
+    assert expansion["max_tier"] == 4
+    assert selection["policy"] == "adaptive_linucb"
+    assert selection["snippet_batch_size"] == 6
+    assert selection["total_input_tokens"] == 90000
+    assert selection["target_tokens_per_candidate"] == 750
+    assert retrieval["max_candidates_per_entity"] == 175
+    assert retrieval["max_candidates_per_domain"] is None
+    assert retrieval["max_documents_per_entity"] is None
+    assert entity_document_limits(expansion, 0) == (0, 0)
+    spec = resolve_tier_queries(config, 0)[0]
+    assert query_limit(spec, "gdelt") == 12
+    assert query_limit(spec, "google_news") == 10
+    assert query_limit(spec, "wikipedia") == 4
+    assert query_limit(spec, "unlisted_provider") == 12
+
+    projects.submit(configured["id"])
+    with connect(projects.database(configured["id"])) as connection:
+        saved = json.loads(connection.execute(
+            "SELECT config_snapshot FROM runs",
+        ).fetchone()[0])
+    assert saved["expansion"]["selection"] == selection
+    assert saved["expansion"]["retrieval"]["max_candidates_per_entity"] == 175
+
+
+def test_optional_per_entity_limit_is_applied_when_configured(projects):
+    configured = projects.create(settings(limits={"max_documents_per_entity": 12}))
+    with connect(projects.database(configured["id"])) as connection:
+        config = json.loads(connection.execute("SELECT config FROM project").fetchone()[0])
+    from schain.expansion.budget import entity_document_limits
+    assert entity_document_limits(config["expansion"], 0) == (12, 12)
 
 
 @pytest.mark.parametrize("override", [
@@ -389,7 +442,7 @@ def test_additive_server_migration(tmp_path):
     initialize(path)
     initialize(path)
     with connect(path) as connection:
-        assert connection.execute("SELECT MAX(version) FROM server_schema").fetchone()[0] == 3
+        assert connection.execute("SELECT MAX(version) FROM server_schema").fetchone()[0] == 4
         assert connection.execute("SELECT id FROM graph_nodes").fetchone()[0] == "legacy"
 
 

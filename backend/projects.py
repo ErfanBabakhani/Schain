@@ -83,9 +83,22 @@ class Projects:
                          max_documents_per_run=0 if settings.run_until_paused else limits.max_documents_per_run)
         retrieval = expansion.setdefault("retrieval", {})
         retrieval.update(max_documents_per_entity=limits.max_documents_per_entity,
-                         target_documents_per_entity=limits.max_documents_per_entity)
+                         target_documents_per_entity=limits.max_documents_per_entity or 0,
+                         max_candidates_per_entity=limits.max_candidates_per_entity,
+                         max_candidates_per_domain=None)
         retrieval.pop("max_documents_by_tier", None)
         retrieval.pop("target_documents_by_tier", None)
+        search = expansion.setdefault("search", {})
+        search.setdefault("defaults", {})["max_results_cap"] = limits.search_results_per_query
+        selection = expansion.setdefault("selection", {})
+        selection.update(
+            policy=limits.selection_policy,
+            candidate_pool_policy="title_snippet",
+            snippet_batch_size=limits.snippet_batch_size,
+            total_input_tokens=limits.total_input_tokens,
+            input_token_metric="tokenizer_input_tokens",
+            target_tokens_per_candidate=limits.target_tokens_per_candidate,
+        )
         config["concurrency"].update(retrieval=limits.retrieval_concurrency,
                                      llm_max_concurrency=limits.llm_max_concurrency)
         config["runtime"]["max_minutes"] = 0 if settings.run_until_paused else limits.max_minutes
@@ -158,10 +171,15 @@ class Projects:
             with connection:
                 connection.execute("BEGIN IMMEDIATE")
                 self.require_idle(connection)
+                project = connection.execute("SELECT settings,config FROM project").fetchone()
+                settings = ProjectSettings.model_validate_json(project["settings"])
+                config = self.apply_settings(json.loads(project["config"]), settings)
                 run_id = uuid.uuid4().hex
                 connection.execute(
-                    "INSERT INTO runs(id,kind,status,input_path,created_at,input_name) VALUES(?,?,'queued',?,?,?)",
-                    (run_id, kind, str(input_path) if input_path else None, _now(), input_name)
+                    "INSERT INTO runs(id,kind,status,input_path,created_at,input_name,config_snapshot) "
+                    "VALUES(?,?,'queued',?,?,?,?)",
+                    (run_id, kind, str(input_path) if input_path else None, _now(), input_name,
+                     dumps(config)),
                 )
         return self.detail(project_id)
 

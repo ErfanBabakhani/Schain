@@ -20,7 +20,9 @@ export SCHAIN_API_TOKEN="$(python -c 'import secrets; print(secrets.token_urlsaf
 python -m uvicorn backend.api:create_app --factory --host 127.0.0.1 --port 8001
 ```
 
-Set the model endpoint and model name in `config/server.yaml` before creating projects. The endpoint must already be running and support OpenAI-compatible chat completions with JSON responses. Model weights and inference services are managed separately.
+Set the model endpoint and model name in `config/server.yaml` before creating projects. If `llm.model` is a server-side alias, set `llm.tokenizer_model` to the matching Hugging Face tokenizer ID; otherwise it defaults to `llm.model`. The endpoint must already be running and support OpenAI-compatible chat completions with JSON responses. Model weights and inference services are managed separately.
+
+Adaptive LinUCB projects also require the `adaptive` extra and its configured spaCy model: `python -m pip install -e '.[adaptive]'` and `python -m spacy download en_core_web_sm`.
 
 Keep the token in a private environment file outside the repository and reuse it after restarting the API. Store runtime data outside the checkout on a durable local filesystem, not NFS or temporary scratch. Databases initialize automatically and use SQLite rollback journals.
 

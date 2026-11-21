@@ -74,7 +74,7 @@ def critical_configuration(config: dict[str, Any]) -> dict[str, Any]:
         "llm": {
             key: llm.get(key) for key in (
                 "provider", "backend", "model", "enable_thinking", "temperature",
-                "json_mode", "structured_output", "max_tokens",
+                "tokenizer_model", "json_mode", "structured_output", "max_tokens",
             )
         },
         "ingest": {

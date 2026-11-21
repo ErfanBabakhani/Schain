@@ -18,6 +18,9 @@ def test_comparison_configs_share_candidate_and_input_caps():
     assert adaptive["expansion"]["search"] == legacy["expansion"]["search"]
     assert adaptive["expansion"]["sources"] == legacy["expansion"]["sources"]
     assert adaptive["expansion"]["relevance"] == legacy["expansion"]["relevance"]
+    assert adaptive["seeds"] == legacy["seeds"]
+    assert adaptive["validation"] == legacy["validation"]
+    assert adaptive["ontology_file"] == legacy["ontology_file"]
     for key in (
         "max_candidates_per_entity", "max_candidates_per_domain",
         "max_full_text_fetches_per_entity", "max_full_text_fetches_per_domain",
@@ -39,10 +42,31 @@ def test_comparison_configs_share_candidate_and_input_caps():
     assert legacy["expansion"]["max_documents_per_run"] == 320
 
 
-def test_adaptive_policy_requires_candidate_and_budget_configuration():
+def test_adaptive_policy_accepts_configured_candidate_limit_and_requires_budget():
     config = {"expansion": {
-        "selection": {"policy": "adaptive_linucb"},
-        "retrieval": {"max_candidates_per_entity": 20},
+        "selection": {
+            "policy": "adaptive_linucb",
+            "total_input_tokens": 1000,
+            "target_tokens_per_candidate": 100,
+        },
+        "retrieval": {"max_candidates_per_entity": 175},
     }}
-    with pytest.raises(ValueError, match="requires max_candidates_per_entity"):
+    validate_expansion_config(config)
+    assert config["expansion"]["retrieval"]["max_candidates_per_entity"] == 175
+
+    config["expansion"]["retrieval"]["max_candidates_per_entity"] = 0
+    with pytest.raises(ValueError, match="positive max_candidates_per_entity"):
         validate_expansion_config(config)
+
+    config["expansion"]["retrieval"]["max_candidates_per_entity"] = 200
+    config["expansion"]["selection"].pop("total_input_tokens")
+    with pytest.raises(ValueError, match="requires expansion.selection.total_input_tokens"):
+        validate_expansion_config(config)
+
+
+def test_server_preset_separates_api_model_alias_from_tokenizer_model():
+    config = load_config(REPO_ROOT / "config/server.yaml")
+
+    assert config["llm"]["model"] == "schain-qwen"
+    assert config["llm"]["tokenizer_model"] == "Qwen/Qwen3-4B-Instruct-2507"
+    assert config["expansion"]["selection"]["official_domains"]

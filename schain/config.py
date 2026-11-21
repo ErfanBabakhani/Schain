@@ -140,7 +140,8 @@ def save_settings(config: dict[str, Any]) -> dict[str, Any]:
 
 # Fields resolved independently through the hierarchy. Only these are inheritable.
 INHERITABLE_QUERY_FIELDS = (
-    "max_results", "max_results_by_provider", "providers", "min_snippet_chars",
+    "max_results", "max_results_cap", "max_results_by_provider", "providers",
+    "min_snippet_chars",
 )
 
 
@@ -194,10 +195,14 @@ def query_limit(spec: dict[str, Any], provider: str) -> int:
     """Candidate ceiling for one provider on one query.
 
     A per-provider entry wins over the plain ``max_results``, so news providers can be
-    given a high limit while Wikipedia stays small, without duplicating every query.
+    given a high limit while Wikipedia stays small. ``max_results_cap`` is an optional
+    user-selected ceiling that also applies to provider-specific values.
     """
     by_provider = spec.get("max_results_by_provider") or {}
-    return int(by_provider.get(provider, spec.get("max_results", 20)))
+    result_limit = int(by_provider.get(provider, spec.get("max_results", 20)))
+    if spec.get("max_results_cap") is not None:
+        result_limit = min(result_limit, int(spec["max_results_cap"]))
+    return result_limit
 
 
 def seed_entities(config: dict[str, Any]) -> list[str]:
@@ -312,8 +317,8 @@ def validate_expansion_config(config: dict[str, Any]) -> None:
             int(selection["total_input_tokens"]) <= 0):
         raise ValueError("expansion.selection.total_input_tokens must be positive")
     if selection.get("policy") == "adaptive_linucb":
-        if int(retrieval.get("max_candidates_per_entity", 0) or 0) != 200:
-            raise ValueError("adaptive_linucb requires max_candidates_per_entity: 200")
+        if int(retrieval.get("max_candidates_per_entity", 0) or 0) <= 0:
+            raise ValueError("adaptive_linucb requires a positive max_candidates_per_entity")
         if selection.get("total_input_tokens") is None:
             raise ValueError("adaptive_linucb requires expansion.selection.total_input_tokens")
         if selection.get("target_tokens_per_candidate") is None:

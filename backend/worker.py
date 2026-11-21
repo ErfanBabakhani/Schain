@@ -95,7 +95,7 @@ class Worker:
         path = self.projects.database(project_id)
         with connect(path) as connection:
             project = connection.execute("SELECT * FROM project").fetchone()
-        config = json.loads(project["config"])
+        config = json.loads(run.get("config_snapshot") or project["config"])
         settings = ProjectSettings.model_validate_json(project["settings"])
         connection = state.connect(path, journal_mode="DELETE")
 

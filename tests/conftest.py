@@ -17,9 +17,21 @@ from schain.ontology import load_ontology
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
+class OfflineTokenizer:
+    chat_template = "offline-test-template"
+    model_max_length = 131072
+
+    def apply_chat_template(self, messages, *, tokenize, add_generation_prompt, **kwargs):
+        assert tokenize and add_generation_prompt
+        return list(range(sum(len(message["content"].split()) + 1 for message in messages)))
+
+    def encode(self, text, *, add_special_tokens=False):
+        return text.split()
+
+
 @pytest.fixture(autouse=True)
 def offline_unit_tests(request, monkeypatch):
-    """A missing HTTP mock must never turn a unit test into a live experiment."""
+    """Keep ordinary tests away from live search, model, and tokenizer services."""
     if request.node.get_closest_marker("integration"):
         return
 
@@ -52,6 +64,8 @@ def offline_unit_tests(request, monkeypatch):
     monkeypatch.setattr(socket.socket, "connect", guarded_connect)
     monkeypatch.setattr(socket.socket, "connect_ex", guarded_connect_ex)
     monkeypatch.setattr(socket, "getaddrinfo", guarded_dns)
+    from schain.expansion import loop
+    monkeypatch.setattr(loop, "load_tokenizer", lambda _: OfflineTokenizer())
 
 DOCUMENT_TEXT = (
     "CATL supplies battery cells to BMW AG for its electric vehicle plants.\n"

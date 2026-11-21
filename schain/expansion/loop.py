@@ -90,24 +90,66 @@ def _record_adaptive_decision(config, run_id, record) -> None:
         handle.write(json.dumps(record, ensure_ascii=False, default=float) + "\n")
 
 
-def _settle_adaptive_cost(connection, run_id, decision_data, selection_cfg, *, charge=True,
+def _affordable_action_indices(indices, choices, choice_details, remaining_tokens, max_count=None):
+    selected = []
+    reserved = 0
+    for index in indices:
+        if max_count is not None and len(selected) >= max_count:
+            break
+        action = choices[index]
+        cost = int(choice_details[index][1].get(action) or 0)
+        if reserved + cost > remaining_tokens:
+            continue
+        selected.append(index)
+        reserved += cost
+    return selected
+
+
+def _release_adaptive_reservation(connection, run_id, decision_data) -> None:
+    reserved = int(decision_data.get("reserved_cost", 0))
+    if not reserved:
+        return
+    key = f"input_budget:{run_id}"
+    budget = state.run_value(connection, key)
+    budget["reserved_estimate"] = max(0, int(budget["reserved_estimate"]) - reserved)
+    state.set_run_value(connection, key, budget)
+    decision_data["reserved_cost"] = 0
+
+
+def _record_virtual_queue_update(connection, run_id, *, before, after, input_tokens, candidates):
+    key = f"adaptive_virtual_queue_history:{run_id}"
+    history = state.run_value(connection, key, [])
+    history.append({
+        "queue_before": before, "queue_after": after,
+        "input_tokens": int(input_tokens), "candidate_count": int(candidates),
+    })
+    state.set_run_value(connection, key, history)
+
+
+def _settle_adaptive_cost(connection, run_id, decision_data, selection_cfg, *,
                           actual_cost=None) -> None:
     """Release the action reservation and pace using measured proxy request cost."""
-    cost = int(decision_data.get("reserved_cost", decision_data["estimated_cost"]))
+    if decision_data.get("cost_settled"):
+        return
+    _release_adaptive_reservation(connection, run_id, decision_data)
     budget_key = f"input_budget:{run_id}"
     budget = state.run_value(connection, budget_key)
-    budget["reserved_estimate"] = max(0, int(budget["reserved_estimate"]) - cost)
     queue_spent_key = f"adaptive_queue_spent:{run_id}"
     previous_spend = int(state.run_value(connection, queue_spent_key, 0))
     spent_delta = (max(0, int(budget["spent_estimate"]) - previous_spend)
-                   if actual_cost is None and charge else int(actual_cost or 0))
-    state.set_run_value(connection, budget_key, budget)
+                   if actual_cost is None else max(0, int(actual_cost)))
     queue_key = f"adaptive_virtual_price:{run_id}"
     price = float(state.run_value(connection, queue_key, decision_data["decision"]["queue_before"]))
     target = float(selection_cfg["target_tokens_per_candidate"])
     reference = float(selection_cfg.get("cost_reference_tokens", 1000))
-    state.set_run_value(connection, queue_key, max(0.0, price + (spent_delta - target) / reference))
+    updated_price = max(0.0, price + (spent_delta - target) / reference)
+    state.set_run_value(connection, queue_key, updated_price)
     state.set_run_value(connection, queue_spent_key, int(budget["spent_estimate"]))
+    _record_virtual_queue_update(
+        connection, run_id, before=price, after=updated_price,
+        input_tokens=spent_delta, candidates=1,
+    )
+    decision_data["cost_settled"] = True
 
 
 def _settle_adaptive_skips(connection, run_id, count, selection_cfg) -> None:
@@ -120,8 +162,23 @@ def _settle_adaptive_skips(connection, run_id, count, selection_cfg) -> None:
                                   selection_cfg.get("initial_virtual_queue", 0.0)))
     target = float(selection_cfg["target_tokens_per_candidate"])
     reference = float(selection_cfg.get("cost_reference_tokens", 1000))
-    state.set_run_value(connection, queue_key, max(0.0, price + (allocated - count * target) / reference))
+    updated_price = max(0.0, price + (allocated - count * target) / reference)
+    state.set_run_value(connection, queue_key, updated_price)
     state.set_run_value(connection, queue_spent_key, int(budget["spent_estimate"]))
+    _record_virtual_queue_update(
+        connection, run_id, before=price, after=updated_price,
+        input_tokens=allocated, candidates=count,
+    )
+
+
+def _finish_adaptive_reservations(connection, run_id, decisions, selection_cfg):
+    for decision_data in decisions:
+        _release_adaptive_reservation(connection, run_id, decision_data)
+        batch_share = int(decision_data.get("batch_input_tokens", 0))
+        if batch_share and not decision_data.get("cost_settled"):
+            _settle_adaptive_cost(
+                connection, run_id, decision_data, selection_cfg, actual_cost=batch_share,
+            )
 
 
 def _quality_summary(config: dict[str, Any], summary: dict[str, Any]) -> dict[str, Any]:
@@ -482,7 +539,8 @@ def run_expand(
     adaptive_state_key = f"adaptive_model:{run_id}"
     input_budget_key = f"input_budget:{run_id}"
     budget_limit = selection_cfg.get("total_input_tokens")
-    tokenizer_model = str((config.get("llm") or {}).get("model") or "")
+    llm_config = config.get("llm") or {}
+    tokenizer_model = str(llm_config.get("tokenizer_model") or llm_config.get("model") or "")
     if adaptive and llm is None:
         raise ValueError("adaptive selection requires a configured LLM")
     budget_tokenizer = load_tokenizer(tokenizer_model) if budget_limit is not None and llm is not None else None
@@ -493,6 +551,7 @@ def run_expand(
             state.set_run_value(connection, input_budget_key, {
                 "spent_estimate": 0, "reserved_estimate": 0, "limit": int(budget_limit),
                 "requests": 0, "accounting_version": "qwen_tokenizer_v1",
+                "tokenizer_model": tokenizer_model,
             })
         else:
             budget_state = state.run_value(connection, input_budget_key)
@@ -500,10 +559,19 @@ def run_expand(
                 raise ValueError("input-token ledger uses character estimates; start a fresh EXPAND state")
             if int(budget_state["limit"]) != int(budget_limit):
                 raise ValueError("input-token budget changed; start a fresh EXPAND state")
+            if budget_state.get("tokenizer_model") not in (None, tokenizer_model):
+                raise ValueError("input-token tokenizer changed; start a fresh EXPAND state")
+            budget_state["tokenizer_model"] = tokenizer_model
+            state.set_run_value(connection, input_budget_key, budget_state)
+        budget_state = state.run_value(connection, input_budget_key)
+        if budget_state.get("reserved_estimate"):
+            budget_state["reserved_estimate"] = 0
+            state.set_run_value(connection, input_budget_key, budget_state)
         if llm is not None and not getattr(llm, "_schain_input_budget", False):
             def reserve_input_tokens(estimate):
                 budget = state.run_value(connection, input_budget_key)
-                if int(budget["spent_estimate"]) + int(estimate) > int(budget["limit"]):
+                if (int(budget["spent_estimate"]) + int(budget.get("reserved_estimate", 0))
+                        + int(estimate) > int(budget["limit"])):
                     budget["rejected_requests"] = int(budget.get("rejected_requests", 0)) + 1
                     state.set_run_value(connection, input_budget_key, budget)
                     request_log = Path(config.get("storage", {}).get("logs", REPO_ROOT / "logs"))
@@ -581,8 +649,10 @@ def run_expand(
                     parent["entity_key"], known_tier, pd.DataFrame(columns=FACT_COLUMNS))
     summary = {"entities_expanded": 0, "documents_processed": 0, "documents_skipped": 0,
                "documents_failed": 0, "facts": 0, "nodes_merged": 0,
-               "relationships_merged": 0, "discovered": {}, "documents_by_origin": {}, "stop_reason": None}
+               "relationships_merged": 0, "accepted_supply_edges": 0,
+               "discovered": {}, "documents_by_origin": {}, "stop_reason": None}
     consecutive_failures = 0
+    pending_adaptive_decisions = []
 
     def elapsed():
         return elapsed_before + time.monotonic() - started
@@ -758,6 +828,7 @@ def run_expand(
                 unfinished = usage is not None and not usage["completed"] and state.document_attempt_count(connection, doc_id) < max_attempts
                 prepared.append((not unfinished, result, direction, document, known, usage, doc_id))
             prepared.sort(key=lambda item: item[0])
+            candidate_count = len(prepared)
             if adaptive:
                 seen_key = f"adaptive_seen:{run_id}:{entity_key}"
                 seen_urls = set(state.run_value(connection, seen_key, []))
@@ -775,6 +846,7 @@ def run_expand(
                     if state.document_attempt_count(connection, item[-1]) >= max_attempts:
                         continue
                     candidates.append(item)
+                candidate_count = len(candidates)
                 prepared = []
                 if candidates:
                     known_companies = {
@@ -877,28 +949,29 @@ def run_expand(
                     action = choices[selected_index]
                     pool_exhausted = not warmup and choice_details[selected_index][0]["scores"].get(action, 0.0) <= 0
                     selected_indices = [selected_index]
-                    if not pool_exhausted and action == "snippet":
-                        if warmup:
-                            for index in candidate_indices[1:]:
-                                if choices[index] != "snippet":
-                                    break
-                                selected_indices.append(index)
-                        else:
-                            highest_other_score = max((
-                                choice_details[index][0]["scores"].get(other, float("-inf"))
-                                for index in candidate_indices
-                                for other in ("full_text", "both")
-                            ), default=float("-inf"))
-                            snippet_indices = [
-                                index for index in candidate_indices
-                                if choices[index] == "snippet"
-                                and choice_details[index][0]["scores"].get("snippet", 0.0) > 0
-                                and choice_details[index][0]["scores"].get("snippet", 0.0) >= highest_other_score
-                            ]
-                            snippet_indices.sort(key=lambda index: (
-                                -choice_details[index][0]["scores"]["snippet"], index,
-                            ))
-                            selected_indices = snippet_indices[:snippet_batch_size]
+                    if warmup:
+                        selected_indices = _affordable_action_indices(
+                            candidate_indices, choices, choice_details, remaining_tokens,
+                        )
+                    elif not pool_exhausted and action == "snippet":
+                        highest_other_score = max((
+                            choice_details[index][0]["scores"].get(other, float("-inf"))
+                            for index in candidate_indices
+                            for other in ("full_text", "both")
+                        ), default=float("-inf"))
+                        snippet_indices = [
+                            index for index in candidate_indices
+                            if choices[index] == "snippet"
+                            and choice_details[index][0]["scores"].get("snippet", 0.0) > 0
+                            and choice_details[index][0]["scores"].get("snippet", 0.0) >= highest_other_score
+                        ]
+                        snippet_indices.sort(key=lambda index: (
+                            -choice_details[index][0]["scores"]["snippet"], index,
+                        ))
+                        selected_indices = _affordable_action_indices(
+                            snippet_indices, choices, choice_details, remaining_tokens,
+                            max_count=snippet_batch_size,
+                        )
                     if pool_exhausted:
                         for skipped_index in candidate_indices:
                             skipped = candidates[skipped_index][1]
@@ -1010,12 +1083,21 @@ def run_expand(
                             remaining_budget = state.run_value(connection, budget_key)
                             remaining_budget["reserved_estimate"] += estimated_cost
                             state.set_run_value(connection, budget_key, remaining_budget)
+                            pending_adaptive_decisions.append(adaptive_decisions[doc_id])
                             reason = "adaptive_next_candidate"
                         if skipped_count:
                             state.set_run_value(connection, seen_key, sorted(seen_urls))
                             _settle_adaptive_skips(connection, run_id, skipped_count, selection_cfg)
                 else:
                     reason = "adaptive_pool_exhausted"
+            pool_sizes_key = f"candidate_pool_sizes:{run_id}"
+            pool_sizes = state.run_value(connection, pool_sizes_key, [])
+            pool_sizes.append({
+                "entity_id": entity_key, "tier": tier,
+                "retrieved_result_count": len(results),
+                "eligible_candidate_count": candidate_count,
+            })
+            state.set_run_value(connection, pool_sizes_key, pool_sizes)
             source_domains = len({
                 str(getattr(result, "source_domain", "") or "").casefold()
                 for _, result, *_ in prepared
@@ -1038,27 +1120,36 @@ def run_expand(
                 batch_jobs = []
                 batch_documents = []
                 batch_tokens = 0
-                for size in range(min(batch_limit, len(snippet_jobs)), 1, -1):
-                    possible = snippet_jobs[:size]
-                    if len({item[-1] for item in possible}) != size:
+                context_limit = llm.input_context_limit_tokens()
+                for item in snippet_jobs:
+                    if len(batch_jobs) >= batch_limit:
+                        break
+                    if item[-1] in {selected[-1] for selected in batch_jobs}:
                         continue
+                    possible = [*batch_jobs, item]
                     possible_documents = [
-                        {**item[3], "snippet": item[1].snippet} for item in possible
+                        {**selected[3], "snippet": selected[1].snippet} for selected in possible
                     ]
                     prompt = build_snippet_batch_prompt(possible_documents, ontology)
                     request_tokens = llm.count_request_tokens((prompt,), {})
                     budget_state = state.run_value(connection, input_budget_key)
                     reserved_here = sum(
-                        int(adaptive_decisions[item[-1]]["reserved_cost"]) for item in possible
+                        int(adaptive_decisions[selected[-1]]["reserved_cost"])
+                        for selected in possible
                     )
                     available_tokens = (
                         int(budget_state["limit"]) - int(budget_state["spent_estimate"])
                         - max(0, int(budget_state["reserved_estimate"]) - reserved_here)
                     )
-                    if request_tokens <= available_tokens:
-                        batch_jobs, batch_documents, batch_tokens = possible, possible_documents, request_tokens
-                        break
-                if batch_jobs:
+                    if request_tokens > available_tokens or (
+                            context_limit is not None and request_tokens > context_limit):
+                        continue
+                    batch_jobs, batch_documents, batch_tokens = possible, possible_documents, request_tokens
+                if len(batch_jobs) > 1:
+                    for item in batch_jobs:
+                        _release_adaptive_reservation(
+                            connection, run_id, adaptive_decisions[item[-1]],
+                        )
                     budget_before_batch = int(state.run_value(
                         connection, input_budget_key)["spent_estimate"])
                     try:
@@ -1077,13 +1168,6 @@ def run_expand(
                     batch_sizes = state.run_value(connection, batch_sizes_key, [])
                     batch_sizes.append(len(batch_jobs))
                     state.set_run_value(connection, batch_sizes_key, batch_sizes)
-                    batch_budget = state.run_value(connection, input_budget_key)
-                    released = sum(int(adaptive_decisions[item[-1]]["reserved_cost"])
-                                   for item in batch_jobs)
-                    batch_budget["reserved_estimate"] = max(
-                        0, int(batch_budget["reserved_estimate"]) - released,
-                    )
-                    state.set_run_value(connection, input_budget_key, batch_budget)
                     shares = [batch_input_tokens // len(batch_jobs)] * len(batch_jobs)
                     for index in range(batch_input_tokens % len(batch_jobs)):
                         shares[index] += 1
@@ -1103,10 +1187,17 @@ def run_expand(
                     })
             rescue_active = bool(int(row["rescue_mode"] or 0)) if "rescue_mode" in row.keys() else False
             for _, result, direction, document, known, usage, doc_id in prepared:
+                selected_doc_id = doc_id
+                if adaptive and selected_doc_id in adaptive_decisions:
+                    _release_adaptive_reservation(
+                        connection, run_id, adaptive_decisions[selected_doc_id],
+                    )
                 # Another result in this same batch may just have persisted identical
                 # content. Refresh before reserving so duplicates never spend twice.
                 known = state.find_document(connection, document["content_hash"], document.get("source_url"))
                 doc_id = known["doc_id"] if known else document["doc_id"]
+                if adaptive and selected_doc_id in adaptive_decisions and doc_id != selected_doc_id:
+                    adaptive_decisions[doc_id] = adaptive_decisions[selected_doc_id]
                 usage = state.document_usage(connection, doc_id, entity_key)
                 stop = time_reason(estimate=True)
                 if stop:
@@ -1199,8 +1290,7 @@ def run_expand(
                         batch_share = int(decision_data.get("batch_input_tokens", 0))
                         _settle_adaptive_cost(
                             connection, run_id, decision_data, selection_cfg,
-                            actual_cost=batch_share + max(0, current_spent - spent_before_document)
-                            if batch_share else None,
+                            actual_cost=batch_share + max(0, current_spent - spent_before_document),
                         )
                     state.finish_document_usage(connection, doc_id, entity_key, completed=False, elapsed_seconds=doc_elapsed)
                     checkpoint_time()
@@ -1229,6 +1319,7 @@ def run_expand(
                 now_keys = _origin_edge_keys(config, entity_key)
                 gained_keys = now_keys - existing_keys
                 gained = len(gained_keys)
+                summary["accepted_supply_edges"] += gained
                 existing_keys |= now_keys
                 if existing_keys and rescue_active:
                     rescue_active = False
@@ -1249,9 +1340,8 @@ def run_expand(
                         current_spent = int(state.run_value(connection, input_budget_key)["spent_estimate"])
                         batch_share = int(decision_data.get("batch_input_tokens", 0))
                         _settle_adaptive_cost(
-                            connection, run_id, decision_data, selection_cfg, charge=False,
-                            actual_cost=batch_share + max(0, current_spent - spent_before_document)
-                            if batch_share else None,
+                            connection, run_id, decision_data, selection_cfg,
+                            actual_cost=batch_share + max(0, current_spent - spent_before_document),
                         )
                     summary["documents_skipped"] += 1
                     manifest.record_document(result, doc_id, mf.SKIPPED)
@@ -1292,8 +1382,7 @@ def run_expand(
                     batch_share = int(decision_data.get("batch_input_tokens", 0))
                     _settle_adaptive_cost(
                         connection, run_id, decision_data, selection_cfg,
-                        actual_cost=batch_share + max(0, current_spent - spent_before_document)
-                        if batch_share else None,
+                        actual_cost=batch_share + max(0, current_spent - spent_before_document),
                     )
                     _record_adaptive_decision(config, run_id, {
                         **decision_data["decision"], "outcome": "processed",
@@ -1313,6 +1402,11 @@ def run_expand(
                 # Fairness soft-yield removed as an unconditional TARGET stop.
                 # Productive entities continue under _admit_above_target / diminishing returns.
                 # Zero-yield entities continue via rescue/escalation up to hard max.
+            if pending_adaptive_decisions:
+                _finish_adaptive_reservations(
+                    connection, run_id, pending_adaptive_decisions, selection_cfg,
+                )
+                pending_adaptive_decisions.clear()
             if not existing_keys and reason == "candidate_pool_exhausted" and rescue_enabled:
                 advanced = _advance_escalation(
                     connection, entity_key,
@@ -1378,10 +1472,21 @@ def run_expand(
             if summary["stop_reason"]:
                 break
     finally:
+        if pending_adaptive_decisions:
+            _finish_adaptive_reservations(
+                connection, run_id, pending_adaptive_decisions, selection_cfg,
+            )
         checkpoint_time()
         manifest.flush()
     summary["frontier"] = state.frontier_counts(connection)
     summary["frontier_by_tier"] = state.frontier_tier_counts(connection)
+    summary["discovered_suppliers_by_tier"] = {
+        str(row["tier"]): int(row["count"])
+        for row in connection.execute(
+            "SELECT tier,COUNT(DISTINCT entity_key) AS count FROM frontier "
+            "WHERE tier>0 AND expandable=1 GROUP BY tier ORDER BY tier"
+        ).fetchall()
+    }
     summary["save"] = {
         "enabled": driver is not None,
         "backend": "neo4j" if driver is not None else None,
@@ -1394,6 +1499,22 @@ def run_expand(
     summary["elapsed_seconds"] = round(time.monotonic() - started, 1)
     summary["elapsed_seconds_cumulative"] = round(elapsed(), 1)
     summary["usage"] = _usage_metrics(connection, config)
+    summary["candidate_pool_sizes"] = state.run_value(
+        connection, f"candidate_pool_sizes:{run_id}", [],
+    )
+    search_defaults = (expansion.get("search") or {}).get("defaults") or {}
+    summary["effective_settings"] = {
+        "selection_policy": selection_cfg.get("policy", "legacy"),
+        "search_defaults": search_defaults,
+        "max_candidates_per_entity": retrieval_cfg.get("max_candidates_per_entity"),
+        "max_candidates_per_domain": retrieval_cfg.get("max_candidates_per_domain"),
+        "max_documents_per_entity": retrieval_cfg.get("max_documents_per_entity"),
+        "max_documents_per_run": max_documents,
+        "snippet_batch_size": selection_cfg.get("snippet_batch_size", 10),
+        "total_input_tokens": budget_limit,
+        "target_tokens_per_candidate": selection_cfg.get("target_tokens_per_candidate"),
+        "tokenizer_model": tokenizer_model or None,
+    }
     if budget_limit is not None:
         budget_summary = state.run_value(connection, input_budget_key)
         summary["input_token_budget"] = {
@@ -1432,6 +1553,9 @@ def run_expand(
                 connection, f"adaptive_snippet_batch_calls:{run_id}", 0)),
             "snippet_batch_sizes": state.run_value(
                 connection, f"adaptive_snippet_batch_sizes:{run_id}", []),
+            "candidate_pool_sizes": summary["candidate_pool_sizes"],
+            "virtual_queue_history": state.run_value(
+                connection, f"adaptive_virtual_queue_history:{run_id}", []),
             "decision_log": str(log_dir / f"adaptive_decisions_{run_id}.jsonl"),
             "stop_reason": summary.get("stop_reason"),
         }

@@ -6,7 +6,12 @@
   const activeStates = new Set(['queued', 'running', 'pausing']);
   const limits = [
     ['max_tier', 'Discovery depth', 3, 0, 10, 'Supply-chain tiers beyond the starting companies.'],
-    ['max_documents_per_entity', 'Documents per entity', 5, 1, 100],
+    ['search_results_per_query', 'Search results per query', 30, 1, 100, 'Provider-specific limits may be lower.'],
+    ['max_candidates_per_entity', 'Maximum candidates per entity', 200, 1, 5000, 'Deduplicated candidate pool after search queries finish.'],
+    ['snippet_batch_size', 'Snippets per extraction request', 10, 1, 10, 'Adaptive policy only; maximum documents in one snippet extraction call.'],
+    ['max_documents_per_entity', 'Maximum processed documents per entity', null, 1, 1000, 'Leave blank for unlimited.'],
+    ['total_input_tokens', 'Total input token budget', 200000, 1, 100000000],
+    ['target_tokens_per_candidate', 'Target tokens per candidate', 1000, 1, 1000000, 'Adaptive policy pacing target.'],
     ['max_documents_per_run', 'Documents per run', 10, 1, 1000],
     ['max_total_documents', 'Total document budget', 100, 1, 100000],
     ['llm_max_concurrency', 'Parallel model requests', 1, 1, 8],
@@ -20,7 +25,7 @@
   for (const [key, title, value, min, max, hint] of limits) {
     const label = document.createElement('label'); label.textContent = title;
     const input = document.createElement('input');
-    Object.assign(input, { id: key, type: 'number', min, max, value, required: true, className: 'field', step: key === 'max_minutes' ? 'any' : '1' });
+    Object.assign(input, { id: key, type: 'number', min, max, value: value ?? '', required: value !== null, className: 'field', step: key === 'max_minutes' ? 'any' : '1' });
     label.append(input);
     if (hint) input.title = hint;
     $(key === 'max_tier' ? 'projectLimits' : 'advancedLimits').append(label);
@@ -95,7 +100,7 @@
     const locked = editing && !!project?.runs.length;
     if (locked) { $('projectSeeds').value = project.seeds.join('\n'); $('max_tier').value = project.limits.max_tier; }
     $('identityNote').hidden = !locked;
-    for (const input of $('projectForm').querySelectorAll('input,textarea')) input.disabled = saving || (editing && active) || (locked && ['projectSeeds', 'max_tier'].includes(input.id));
+    for (const input of $('projectForm').querySelectorAll('input,textarea,select')) input.disabled = saving || (editing && active) || (locked && ['projectSeeds', 'max_tier'].includes(input.id));
     if ($('runUntilPaused').checked) {
       for (const key of ['max_minutes', 'max_documents_per_run', 'max_total_documents']) $(key).disabled = true;
     }
@@ -282,7 +287,8 @@
     $('projectDialogTitle').textContent = edit ? project.name : 'New project';
     $('projectName').value = project?.name || ''; $('projectSeeds').value = project?.seeds.join('\n') || '';
     $('runUntilPaused').checked = project?.run_until_paused ?? false;
-    for (const [key, , value] of limits) $(key).value = project?.limits[key] ?? value;
+    for (const [key, , value] of limits) $(key).value = project?.limits[key] ?? (value ?? '');
+    $('selection_policy').value = project?.limits.selection_policy ?? 'legacy';
     $('saveProject').textContent = edit ? 'Save settings' : 'Create project';
     $('projectTabs').hidden = !edit;
     $('advancedSettings').open = false;
@@ -349,7 +355,8 @@
   $('projectForm').onsubmit = async event => {
     event.preventDefault(); if (saving) return;
     const context = current, request = session.request;
-    const payload = { name: $('projectName').value.trim(), seeds: $('projectSeeds').value.split('\n').map(x => x.trim()).filter(Boolean), limits: Object.fromEntries(limits.map(([key]) => [key, Number($(key).value)])), run_until_paused: $('runUntilPaused').checked };
+    const payload = { name: $('projectName').value.trim(), seeds: $('projectSeeds').value.split('\n').map(x => x.trim()).filter(Boolean), limits: Object.fromEntries(limits.map(([key, , value]) => [key, value === null && !$(key).value.trim() ? null : Number($(key).value)])), run_until_paused: $('runUntilPaused').checked };
+    payload.limits.selection_policy = $('selection_policy').value;
     if (!payload.name || !payload.seeds.length || new Set(payload.seeds).size !== payload.seeds.length) { $('projectError').textContent = 'Enter a name and at least one unique Tier-0 company.'; return; }
     saving = true; updateControls();
     try {

@@ -212,7 +212,7 @@
       <p id="identityNote" class="form-note" hidden>Starting companies and depth are fixed after the first run.</p>
       <label class="run-mode"><span><input id="runUntilPaused" type="checkbox"> Run until paused</span><small>No time or document budget.</small></label>
       <div id="projectLimits" class="limits-grid"></div>
-      <details id="advancedSettings" class="advanced-settings"><summary>Advanced settings</summary><div id="advancedLimits" class="limits-grid"></div></details>
+      <details id="advancedSettings" class="advanced-settings"><summary>Advanced settings</summary><div id="advancedLimits" class="limits-grid"><label>Selection policy<small>Choose the document-selection policy for expansion.</small><select id="selection_policy" class="field"><option value="legacy">Legacy</option><option value="adaptive_linucb">Adaptive LinUCB</option></select></label></div></details>
       <p id="projectError" class="form-error" role="alert"></p>
       <footer><span id="settingsNote" class="form-note" hidden>Pause the project to edit.</span><button id="saveProject" class="primary-btn">Create project</button></footer>
     </form>

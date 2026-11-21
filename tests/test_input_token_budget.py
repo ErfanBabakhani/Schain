@@ -74,3 +74,28 @@ def test_request_count_uses_configured_qwen_template_options():
     ).count_request_tokens(("prompt",), {})
 
     assert tokenizer.template_kwargs == {"enable_thinking": False}
+
+
+def test_batch_input_context_limit_leaves_room_for_configured_output():
+    class ContextTokenizer(CountingTokenizer):
+        model_max_length = 4096
+
+    class ConfiguredEchoLLM(EchoLLM):
+        model_params = {"max_tokens": 2048}
+
+    llm = InputBudgetLLM(
+        ConfiguredEchoLLM(), lambda _: None, tokenizer=ContextTokenizer(),
+        tokenizer_model="Qwen/test",
+    )
+
+    assert llm.input_context_limit_tokens() == 2048
+
+
+def test_unknown_model_context_length_is_not_treated_as_a_real_limit():
+    tokenizer = CountingTokenizer()
+    tokenizer.model_max_length = 10**30
+    llm = InputBudgetLLM(
+        EchoLLM(), lambda _: None, tokenizer=tokenizer, tokenizer_model="Qwen/test",
+    )
+
+    assert llm.input_context_limit_tokens() is None
